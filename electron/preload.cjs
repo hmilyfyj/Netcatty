@@ -1258,7 +1258,10 @@ const api = {
     return ipcRenderer.invoke("netcatty:ai:sync-web-search", { apiHost, apiKey });
   },
   aiUserSkillsGetStatus: async () => {
-    return ipcRenderer.invoke("netcatty:ai:user-skills:get-status");
+    return ipcRenderer.invoke("netcatty:ai:user-skills:status");
+  },
+  aiUserSkillsOpenFolder: async () => {
+    return ipcRenderer.invoke("netcatty:ai:user-skills:open");
   },
   aiUserSkillsBuildContext: async (prompt, selectedSkillSlugs) => {
     return ipcRenderer.invoke("netcatty:ai:user-skills:build-context", { prompt, selectedSkillSlugs });
@@ -1349,8 +1352,8 @@ const api = {
     return () => ipcRenderer.removeListener("netcatty:ai:mcp:approval-cleared", handler);
   },
   // ACP streaming
-  aiAcpStream: async (requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession) => {
-    return ipcRenderer.invoke("netcatty:ai:acp:stream", { requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession });
+  aiAcpStream: async (requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext) => {
+    return ipcRenderer.invoke("netcatty:ai:acp:stream", { requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext });
   },
   aiAcpListModels: async (acpCommand, acpArgs, cwd, providerId, chatSessionId) => {
     return ipcRenderer.invoke("netcatty:ai:acp:list-models", { acpCommand, acpArgs, cwd, providerId, chatSessionId });

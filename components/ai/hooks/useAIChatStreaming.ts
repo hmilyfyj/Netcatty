@@ -113,8 +113,6 @@ export interface PanelBridge extends NetcattyBridge {
   credentialsDecrypt?: (value: string) => Promise<string>;
   aiSyncProviders?: (providers: Array<{ id: string; providerId: string; apiKey?: string; baseURL?: string; enabled: boolean }>) => Promise<{ ok: boolean }>;
   aiSyncWebSearch?: (apiHost: string | null, apiKey: string | null) => Promise<{ ok: boolean }>;
-  aiUserSkillsGetStatus?: () => Promise<unknown>;
-  aiUserSkillsBuildContext?: (prompt: string, selectedSkillSlugs?: string[]) => Promise<unknown>;
   aiMcpUpdateSessions?: (sessions: TerminalSessionInfo[], chatSessionId?: string) => Promise<unknown>;
   aiAcpListModels?: (
     acpCommand: string,
@@ -124,6 +122,18 @@ export interface PanelBridge extends NetcattyBridge {
     chatSessionId?: string,
   ) => Promise<{ ok: boolean; models?: Array<{ id: string; name: string; description?: string }>; currentModelId?: string | null; error?: string }>;
   aiAcpCleanup?: (chatSessionId: string) => Promise<{ ok: boolean }>;
+  aiUserSkillsGetStatus?: () => Promise<{
+    ok: boolean;
+    skills?: Array<{
+      id: string;
+      slug: string;
+      name: string;
+      description: string;
+      status: 'ready' | 'warning';
+    }>;
+  }>;
+  aiUserSkillsOpenFolder?: () => Promise<unknown>;
+  aiUserSkillsBuildContext?: (prompt: string, selectedSkillSlugs?: string[]) => Promise<{ ok: boolean; context?: string; error?: string }>;
   [key: string]: ((...args: unknown[]) => unknown) | undefined;
 }
 
@@ -156,6 +166,24 @@ export function getNetcattyBridge(): PanelBridge | undefined {
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+const USER_SKILL_TOKEN_REGEX = /(^|\s)\/([a-z0-9][a-z0-9-]*)\b/g;
+
+function stripExplicitUserSkillTokens(text: string, availableSkillSlugs?: string[]): string {
+  const validSlugs = new Set((availableSkillSlugs || []).map((slug) => slug.toLowerCase()));
+  return String(text || "")
+    .replace(USER_SKILL_TOKEN_REGEX, (match, prefix, slug) => {
+      const normalizedSlug = String(slug || '').toLowerCase();
+      if (validSlugs.size === 0 || !validSlugs.has(normalizedSlug)) {
+        return match;
+      }
+      return prefix;
+    })
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 const sharedStreamingSessionIds = new Set<string>();
@@ -242,6 +270,8 @@ export interface SendToCattyContext {
   webSearchConfig?: WebSearchConfig | null;
   getExecutorContext?: () => ExecutorContext;
   autoTitleSession: (sessionId: string, text: string) => void;
+  selectedUserSkillSlugs?: string[];
+  availableUserSkillSlugs?: string[];
 }
 
 /** Context values needed by sendToExternalAgent that change frequently. */
@@ -254,6 +284,8 @@ export interface SendToExternalContext {
   providers: ProviderConfig[];
   selectedAgentModel?: string;
   toolIntegrationMode: AIToolIntegrationMode;
+  selectedUserSkillSlugs?: string[];
+  availableUserSkillSlugs?: string[];
 }
 
 // -------------------------------------------------------------------
@@ -543,6 +575,9 @@ export function useAIChatStreaming({
     context: SendToExternalContext,
   ) => {
     const bridge = getNetcattyBridge();
+    const userSkillsContext = bridge?.aiUserSkillsBuildContext
+      ? (await bridge.aiUserSkillsBuildContext(trimmed, context.selectedUserSkillSlugs).catch(() => ({ ok: false })))?.context || ''
+      : '';
 
     if (agentConfig.acpCommand && bridge) {
       const requestId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -655,12 +690,13 @@ export function useAIChatStreaming({
         attachedImages.length > 0 ? attachedImages : undefined,
         context.toolIntegrationMode,
         context.defaultTargetSession,
+        userSkillsContext,
       );
     } else {
       // Fallback: spawn as raw process
       await runExternalAgentTurn(
         agentConfig,
-        trimmed,
+        userSkillsContext ? `${userSkillsContext}\n\nUser request:\n${trimmed}` : trimmed,
         {
           onTextDelta: (text: string) => {
             updateLastMessage(sessionId, msg => ({ ...msg, content: msg.content + text }));
@@ -694,6 +730,9 @@ export function useAIChatStreaming({
     attachments?: ChatMessageAttachment[],
   ) => {
     const bridge = getNetcattyBridge();
+    const userSkillsContext = bridge?.aiUserSkillsBuildContext
+      ? (await bridge.aiUserSkillsBuildContext(trimmed, context.selectedUserSkillSlugs).catch(() => ({ ok: false })))?.context || ''
+      : '';
     const getExecutorContext = context.getExecutorContext ?? (() => ({
       sessions: context.terminalSessions,
       workspaceId: context.scopeType === 'workspace' ? context.scopeTargetId : undefined,
@@ -721,6 +760,7 @@ export function useAIChatStreaming({
       })),
       permissionMode: context.globalPermissionMode,
       webSearchEnabled: isWebSearchReady(context.webSearchConfig),
+      userSkillsContext,
     });
 
     // Guard: activeProvider must exist for Catty agent path
@@ -775,7 +815,7 @@ export function useAIChatStreaming({
           const messageAttachments = m.attachments ?? m.images;
           if (messageAttachments?.length) {
             const parts: Array<{ type: 'text'; text: string } | { type: 'image'; image: string; mediaType?: string } | { type: 'file'; data: string; mediaType: string; filename?: string }> = [];
-            parts.push({ type: 'text', text: m.content });
+            parts.push({ type: 'text', text: stripExplicitUserSkillTokens(m.content, context.availableUserSkillSlugs) });
             for (const att of messageAttachments) {
               if (att.mediaType.startsWith('image/')) {
                 parts.push({ type: 'image', image: att.base64Data, mediaType: att.mediaType });
@@ -785,7 +825,7 @@ export function useAIChatStreaming({
             }
             sdkMessages.push({ role: 'user', content: parts });
           } else {
-            sdkMessages.push({ role: 'user', content: m.content });
+            sdkMessages.push({ role: 'user', content: stripExplicitUserSkillTokens(m.content, context.availableUserSkillSlugs) });
           }
         } else if (m.role === 'assistant') {
           if (m.toolCalls?.length) {
@@ -828,7 +868,7 @@ export function useAIChatStreaming({
       // Build the current user message — include attachments as multimodal content
       if (attachments?.length) {
         const parts: Array<{ type: 'text'; text: string } | { type: 'image'; image: string; mediaType?: string } | { type: 'file'; data: string; mediaType: string; filename?: string }> = [];
-        parts.push({ type: 'text', text: trimmed });
+        parts.push({ type: 'text', text: stripExplicitUserSkillTokens(trimmed, context.availableUserSkillSlugs) });
         for (const att of attachments) {
           if (att.mediaType.startsWith('image/')) {
             parts.push({ type: 'image', image: att.base64Data, mediaType: att.mediaType });
@@ -838,7 +878,7 @@ export function useAIChatStreaming({
         }
         sdkMessages.push({ role: 'user', content: parts });
       } else {
-        sdkMessages.push({ role: 'user', content: trimmed });
+        sdkMessages.push({ role: 'user', content: stripExplicitUserSkillTokens(trimmed, context.availableUserSkillSlugs) });
       }
 
       await processCattyStream(sessionId, model, systemPrompt, tools, sdkMessages, abortController.signal, assistantMsgId, context.activeProvider?.advancedParams);

@@ -178,6 +178,34 @@ interface AIChatSidePanelProps {
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
+
+const USER_SKILL_TOKEN_REGEX = /(^|\s)\/([a-z0-9][a-z0-9-]*)\b/g;
+
+function extractExplicitUserSkills(
+  input: string,
+  availableSkills: UserSkillOption[],
+): { cleanedText: string; selectedSkillSlugs: string[] } {
+  const validSlugs = new Set(availableSkills.map((skill) => skill.slug.toLowerCase()));
+  const selectedSkillSlugs: string[] = [];
+
+  const cleanedText = String(input || "")
+    .replace(USER_SKILL_TOKEN_REGEX, (match, prefix, slug) => {
+      const normalizedSlug = String(slug || "").toLowerCase();
+      if (!validSlugs.has(normalizedSlug)) {
+        return match;
+      }
+      if (!selectedSkillSlugs.includes(normalizedSlug)) {
+        selectedSkillSlugs.push(normalizedSlug);
+      }
+      return prefix;
+    })
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return { cleanedText, selectedSkillSlugs };
+}
 // -------------------------------------------------------------------
 // Component
 // -------------------------------------------------------------------
@@ -766,7 +794,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     // immediately after the first send path starts; `isStreaming` alone does
     // not protect the initial draft->session transition.
     if (!trimmed || isStreaming) return;
-    const selectedSkillSlugs = draft?.selectedUserSkillSlugs ?? [];
+    const draftSelectedSkillSlugs = draft?.selectedUserSkillSlugs ?? [];
     const attachments = (draft?.attachments ?? []).map((file) => ({
       base64Data: file.base64Data,
       mediaType: file.mediaType,
@@ -774,6 +802,9 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
       filePath: file.filePath,
     }));
     const isDraftMode = currentPanelView.mode === 'draft';
+    const { cleanedText, selectedSkillSlugs: explicitSelectedSkillSlugs } = extractExplicitUserSkills(trimmed, userSkillOptions);
+    const selectedSkillSlugs = [...new Set([...draftSelectedSkillSlugs, ...explicitSelectedSkillSlugs])];
+    const promptText = cleanedText || trimmed;
 
     if (isDraftMode && !tryBeginDraftSend(draftSendInFlightRef)) {
       return;
@@ -801,7 +832,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
       const isExternalAgent = sendAgentId !== 'catty';
 
       if (!isExternalAgent && !activeProvider) {
-        addMessageToSession(sessionId, { id: generateId(), role: 'user', content: trimmed, timestamp: Date.now() });
+        addMessageToSession(sessionId, { id: generateId(), role: 'user', content: promptText, timestamp: Date.now() });
         addMessageToSession(sessionId, { id: generateId(), role: 'assistant', content: t('ai.chat.noProvider'), timestamp: Date.now() });
         if (currentPanelView.mode === 'session') {
           clearScopeDraft();
@@ -811,7 +842,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
       }
 
       addMessageToSession(sessionId, {
-        id: generateId(), role: 'user', content: trimmed,
+        id: generateId(), role: 'user', content: promptText,
         ...(attachments.length > 0 ? { attachments } : {}),
         timestamp: Date.now(),
       });
@@ -841,7 +872,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
           return;
         }
         try {
-          await sendToExternalAgent(sessionId, trimmed, agentConfig, abortController, attachments, {
+          await sendToExternalAgent(sessionId, promptText, agentConfig, abortController, attachments, {
             existingSessionId: currentSession?.externalSessionId,
             updateExternalSessionId: updateSessionExternalSessionId,
             historyMessages: buildAcpHistoryMessagesForBridge(
@@ -861,14 +892,14 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
         updateLastMessage(sessionId, msg => msg.statusText ? { ...msg, statusText: '' } : msg);
         setStreamingForScope(sessionId, false);
         abortControllersRef.current.delete(sessionId);
-        autoTitleSession(sessionId, trimmed);
+        autoTitleSession(sessionId, promptText);
       } else {
         const toolScope = {
           type: scopeType,
           targetId: scopeTargetId,
           label: scopeLabel,
         } as const;
-        await sendToCattyAgent(sessionId, sendScopeKey, trimmed, abortController, currentSession ?? undefined, assistantMsgId, {
+        await sendToCattyAgent(sessionId, sendScopeKey, promptText, abortController, currentSession ?? undefined, assistantMsgId, {
           activeProvider,
           activeModelId,
           scopeType,
@@ -897,7 +928,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     abortControllersRef, terminalSessions, defaultTargetSession, providers, selectedAgentModel, updateSessionExternalSessionId,
     scopeType, scopeTargetId, scopeHostIds, scopeLabel, globalPermissionMode, commandBlocklist, webSearchConfig, buildExecutorContextForScope,
     toolIntegrationMode,
-    clearScopeDraft, showScopeSessionView, setActiveSessionId,
+    clearScopeDraft, showScopeSessionView, setActiveSessionId, userSkillOptions,
   ]);
 
   const handleStop = useCallback(() => {
