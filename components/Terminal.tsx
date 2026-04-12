@@ -260,6 +260,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const sessionRef = useRef<string | null>(null);
   const hasConnectedRef = useRef(false);
   const hasRunStartupCommandRef = useRef(false);
+  // Token for an in-flight retry chain. Cancel/close/teardown/new retry will
+  // invalidate it so queued xterm.write callbacks can't start a ghost session.
+  const retryTokenRef = useRef<symbol | null>(null);
   const terminalDataCapturedRef = useRef(false);
   const onTerminalDataCaptureRef = useRef(onTerminalDataCapture);
   const commandBufferRef = useRef<string>("");
@@ -831,6 +834,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   };
 
   const teardown = () => {
+    retryTokenRef.current = null;
     cleanupSession();
     xtermRuntimeRef.current?.dispose();
     xtermRuntimeRef.current = null;
@@ -1558,6 +1562,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   };
 
   const handleCancelConnect = () => {
+    retryTokenRef.current = null;
     setIsCancelling(true);
     auth.setNeedsAuth(false);
     auth.setAuthRetryMessage(null);
@@ -1577,6 +1582,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   };
 
   const handleCloseDisconnectedSession = () => {
+    retryTokenRef.current = null;
     onCloseSession?.(sessionId);
   };
 
@@ -1618,10 +1624,10 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const handleRetry = () => {
     if (!termRef.current) return;
     cleanupSession();
-    // Reset terminal state: disable mouse tracking modes and clear screen so
-    // stale SGR mouse sequences don't leak into the new session as text input.
-    termRef.current.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
-    termRef.current.reset();
+    const term = termRef.current;
+    const retryToken = Symbol("retry");
+    retryTokenRef.current = retryToken;
+    const retryStillActive = () => retryTokenRef.current === retryToken && termRef.current === term;
     auth.resetForRetry();
     terminalDataCapturedRef.current = false;
     hasRunStartupCommandRef.current = false;
@@ -1630,17 +1636,32 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     setError(null);
     setProgressLogs(["Retrying secure channel..."]);
     setShowLogs(true);
-    if (host.protocol === "serial") {
-      sessionStarters.startSerial(termRef.current);
-    } else if (host.protocol === "local" || host.hostname === "localhost") {
-      sessionStarters.startLocal(termRef.current);
-    } else if (host.protocol === "telnet") {
-      sessionStarters.startTelnet(termRef.current);
-    } else if (host.moshEnabled) {
-      sessionStarters.startMosh(termRef.current);
-    } else {
-      sessionStarters.startSSH(termRef.current);
-    }
+
+    const startNewSession = () => {
+      if (!retryStillActive()) return;
+      if (host.protocol === "serial") {
+        sessionStarters.startSerial(term);
+      } else if (host.protocol === "local" || host.hostname === "localhost") {
+        sessionStarters.startLocal(term);
+      } else if (host.protocol === "telnet") {
+        sessionStarters.startTelnet(term);
+      } else if (host.moshEnabled) {
+        sessionStarters.startMosh(term);
+      } else {
+        sessionStarters.startSSH(term);
+      }
+    };
+
+    // Keep the reset sequence ordered: leave alt screen, preserve viewport,
+    // then soft-reset modes before the new session starts emitting output.
+    term.write('\x1b[?1049l', () => {
+      if (!retryStillActive()) return;
+      preserveTerminalViewportInScrollback(term);
+      term.write(
+        '\x1b[!p\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[H',
+        startNewSession,
+      );
+    });
   };
 
   const shouldShowConnectionDialog = status !== "connected"
