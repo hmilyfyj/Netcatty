@@ -451,7 +451,13 @@ const SettingsAITab: React.FC<SettingsAITabProps> = ({
   }, [t]);
 
   useEffect(() => {
-    void refreshUserSkillsStatus();
+    let cancelled = false;
+    void refreshUserSkillsStatus().then(() => {
+      if (cancelled) return;
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [refreshUserSkillsStatus]);
 
   const handleOpenUserSkillsFolder = useCallback(async () => {
