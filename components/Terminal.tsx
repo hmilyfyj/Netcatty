@@ -260,8 +260,10 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const sessionRef = useRef<string | null>(null);
   const hasConnectedRef = useRef(false);
   const hasRunStartupCommandRef = useRef(false);
-  // Token for an in-flight retry chain. Cancel/close/teardown/new retry will
-  // invalidate it so queued xterm.write callbacks can't start a ghost session.
+  // Token for an in-flight retry chain. handleRetry sets this to a fresh
+  // symbol; any cancel/close/teardown/subsequent-retry invalidates it. The
+  // chained xterm.write callbacks verify the token before proceeding so a
+  // cancelled retry can't fire a startNewSession after the fact.
   const retryTokenRef = useRef<symbol | null>(null);
   const terminalDataCapturedRef = useRef(false);
   const onTerminalDataCaptureRef = useRef(onTerminalDataCapture);
@@ -1625,6 +1627,10 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     if (!termRef.current) return;
     cleanupSession();
     const term = termRef.current;
+    // Claim a fresh retry token. If the user cancels / closes / unmounts /
+    // kicks off another retry while the chained writes below are still
+    // queued, the token will be invalidated and our callbacks will abort
+    // before opening a ghost backend session with no owning UI.
     const retryToken = Symbol("retry");
     retryTokenRef.current = retryToken;
     const retryStillActive = () => retryTokenRef.current === retryToken && termRef.current === term;
@@ -1663,6 +1669,8 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     //    we must be on the normal buffer before preserving.
     term.write('\x1b[?1049l', () => {
       if (!retryStillActive()) return;
+      // 2. Push the previous session's viewport into scrollback so the user
+      //    can still read it after reconnect.
       preserveTerminalViewportInScrollback(term);
       term.write(
         '\x1b[!p\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[H',
