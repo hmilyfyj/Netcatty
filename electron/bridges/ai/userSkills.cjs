@@ -145,6 +145,7 @@ async function ensureUserSkillsDir(electronApp) {
 
 async function ensureUserSkillsReadme(electronApp) {
   const skillsDir = await ensureUserSkillsDir(electronApp);
+<<<<<<< HEAD
   const dirEntries = await fsPromises.readdir(skillsDir);
   if (dirEntries.length === 0) {
     await fsPromises.writeFile(
@@ -152,6 +153,20 @@ async function ensureUserSkillsReadme(electronApp) {
       USER_SKILLS_README_CONTENT,
       "utf8",
     );
+=======
+  const dirEntries = await fsPromises.readdir(skillsDir, { withFileTypes: true });
+  if (dirEntries.length > 0) return skillsDir;
+
+  const sourceDir = getBundledExampleSkillDir();
+  const targetDir = path.join(skillsDir, EXAMPLE_SKILL_DIR_NAME);
+  try {
+    await fsPromises.access(sourceDir);
+    // fs.cp is experimental in some node versions, using synchronous version for stability in bridge context
+    // or we can use async if node version is guaranteed
+    await fsPromises.cp(sourceDir, targetDir, { recursive: true, force: false, errorOnExist: false });
+  } catch (err) {
+    // sourceDir not found, skip
+>>>>>>> 3ab42bf (chore: final hardening of User Skills logic and async IO)
   }
   return skillsDir;
 }
@@ -404,7 +419,11 @@ async function buildUserSkillsContext(electronApp, prompt, selectedSkillSlugs = 
   }
 
   const matchedSkills = readySkills
+<<<<<<< HEAD
     .filter((skill) => !explicitSlugSet.has(skill.slug))
+=======
+    .filter((skill) => !explicitSlugs.has(skill.slug))
+>>>>>>> 3ab42bf (chore: final hardening of User Skills logic and async IO)
     .map((skill) => ({ skill, score: scoreSkillMatch(trimmedPrompt, skill) }))
     .filter((entry) => entry.score >= 2)
     .sort((left, right) => right.score - left.score)
