@@ -1652,8 +1652,15 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       }
     };
 
-    // Keep the reset sequence ordered: leave alt screen, preserve viewport,
-    // then soft-reset modes before the new session starts emitting output.
+    // Chain the whole preparation through xterm.write callbacks so everything
+    // lands in strict order — see #695. xterm.write is async, so without
+    // chaining, a fast reconnect path (local/serial especially) can interleave
+    // the new session's first bytes with our reset sequence, corrupting the
+    // first screen.
+    //
+    // 1. Exit the alternate screen first. preserveTerminalViewportInScrollback
+    //    is a no-op on the alt buffer (disconnect while in vim/less/top), so
+    //    we must be on the normal buffer before preserving.
     term.write('\x1b[?1049l', () => {
       if (!retryStillActive()) return;
       preserveTerminalViewportInScrollback(term);
