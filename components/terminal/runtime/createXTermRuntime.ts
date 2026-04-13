@@ -564,7 +564,6 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
   term.focus();
 
   term.onData((data) => {
-    console.log("[XTermRuntime] onData received", { data, dataLength: data.length, dataCharCode: data.charCodeAt(0), isBracketedPaste: data.startsWith("\x1b[200~") });
     const id = ctx.sessionRef.current;
     if (id) {
       // Serial line mode: buffer input and send on Enter
@@ -643,7 +642,6 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       ctx.onAutocompleteInput?.(data);
 
       if (ctx.statusRef.current === "connected" && ctx.onCommandExecuted) {
-        console.log("[XTermRuntime] onData - checking command", { data, status: ctx.statusRef.current, commandBuffer: ctx.commandBufferRef.current, dataCharCode: data.charCodeAt(0), dataLength: data.length });
         if (data === "\r" || data === "\n") {
           // Always try to get command from terminal buffer first
           // This handles all cases: typed input, pasted input, history navigation (up/down arrows), mixed input
@@ -659,19 +657,15 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
               const promptMatch = lineText.match(/[#$>]\s*(.*)$/);
               if (promptMatch && promptMatch[1]) {
                 cmd = promptMatch[1].trim();
-                console.log("[XTermRuntime] Command extracted from buffer:", { lineText, cmd });
               } else {
                 // Fallback: use the whole line (trim whitespace)
                 cmd = lineText.trim();
-                console.log("[XTermRuntime] Command from buffer (fallback):", { lineText, cmd });
               }
             }
-          } catch (err) {
-            console.log("[XTermRuntime] Failed to get line from buffer:", err);
+          } catch {
             // Fallback to commandBuffer if buffer access fails
             cmd = ctx.commandBufferRef.current.trim();
           }
-          console.log("[XTermRuntime] Enter pressed, command:", { cmd });
           if (cmd) ctx.onCommandExecuted(cmd, ctx.host.id, ctx.host.label, ctx.sessionId);
           ctx.commandBufferRef.current = "";
         } else if (data === "\x7f" || data === "\b") {
@@ -681,16 +675,11 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         } else if (data === "\x15") {
           ctx.commandBufferRef.current = "";
         } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
-          console.log("[XTermRuntime] Adding char to buffer:", { char: data, charCode: data.charCodeAt(0) });
           ctx.commandBufferRef.current += data;
         } else if (data.length > 1 && !data.startsWith("\x1b")) {
-          console.log("[XTermRuntime] Adding multi-char to buffer:", { data });
           ctx.commandBufferRef.current += data;
-        } else {
-          console.log("[XTermRuntime] Data not added to buffer:", { data, startsWithEscape: data.startsWith("\x1b") });
         }
       } else {
-        console.log("[XTermRuntime] onData - skipping command tracking", { data, status: ctx.statusRef.current, hasOnCommandExecuted: !!ctx.onCommandExecuted });
       }
     }
   });

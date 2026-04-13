@@ -617,7 +617,6 @@ const TerminalComponent: React.FC<TerminalProps> = ({
 
   const handleTrackedCommandExecuted = useCallback((command: string) => {
     if (!command) return;
-    console.log("[Terminal] handleTrackedCommandExecuted", { command, hostId: host.id, sessionId });
     onCommandExecuted?.(command, host.id, host.label, sessionId);
     maybeRefreshCwdAfterCommand(command);
   }, [host.id, host.label, maybeRefreshCwdAfterCommand, onCommandExecuted, sessionId]);
