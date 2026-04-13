@@ -386,6 +386,21 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     // Uses buildCacheKey to stay consistent with the key recorded on upload tasks.
     const connectionKey = remoteConnectionKey;
     if (!connectionKey) return;
+    const currentConn = s.leftPane.connection;
+
+    // When the user is browsing a Docker container opened from the current
+    // terminal session, keep that container tab active instead of auto-switching
+    // back to the host SFTP tab after transient UI like the text editor closes.
+    if (
+      currentConn?.backendType === "docker-container"
+      && currentConn.hostId === activeHost.id
+      && currentConn.sourceSessionId === sourceSessionId
+    ) {
+      connectedKeyRef.current = connectionKey;
+      connectedHostObjRef.current = activeHost;
+      return;
+    }
+
     if (connectedKeyRef.current === connectionKey) return;
 
     // Don't switch connections while transfers or editor are active
@@ -420,7 +435,6 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     // This covers both different hosts AND same host with different
     // session-time overrides (port/protocol), preventing the old SFTP
     // session from being closed while it may have in-flight transfers.
-    const currentConn = s.leftPane.connection;
     const needsNewTab = !!(currentConn && currentConn.status === "connected");
 
     connectedKeyRef.current = connectionKey;
