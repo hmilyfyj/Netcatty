@@ -72,6 +72,7 @@ interface QuickSwitcherProps {
   onCreateLocalTerminal?: (shell?: { command: string; args?: string[]; name?: string; icon?: string }) => void;
   // onCreateWorkspace removed - feature not currently used
   keyBindings?: KeyBinding[];
+  showSftpTab: boolean;
 }
 
 const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
@@ -87,6 +88,7 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
   onClose,
   onCreateLocalTerminal,
   keyBindings,
+  showSftpTab,
 }) => {
   const { t } = useI18n();
   const discoveredShells = useDiscoveredShells();
@@ -164,7 +166,7 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
       );
       // Tabs (built-in + sessions + workspaces)
       items.push({ type: "tab", id: "vault" });
-      items.push({ type: "tab", id: "sftp" });
+      if (showSftpTab) items.push({ type: "tab", id: "sftp" });
       groups.forEach((group) =>
         items.push({ type: "group", id: group.id, data: group }),
       );
@@ -200,7 +202,7 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
     });
 
     return { flatItems: items, itemIndexMap: indexMap };
-  }, [showCategorized, results, orphanSessions, groups, workspaces, filteredShells]);
+}, [showCategorized, results, orphanSessions, groups, workspaces, filteredShells, showSftpTab]);
 
   // O(1) index lookup
   const getItemIndex = useCallback((type: string, id: string) => {
@@ -324,7 +326,7 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
               </div>
 
               {/* Built-in tabs */}
-              {["vault", "sftp"].map((tabId) => {
+              {(showSftpTab ? ["vault", "sftp"] : ["vault"]).map((tabId) => {
                 const idx = getItemIndex("tab", tabId);
                 const isSelected = idx === selectedIndex;
                 const icon =

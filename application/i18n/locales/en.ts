@@ -202,6 +202,10 @@ const en: Messages = {
   'settings.vault.title': 'Vault',
   'settings.vault.showRecentHosts': 'Show recently connected hosts',
   'settings.vault.showRecentHostsDesc': 'Display a section of recently connected hosts at the top of the vault',
+  'settings.vault.showOnlyUngroupedHostsInRoot': 'Only show ungrouped hosts at root',
+  'settings.vault.showOnlyUngroupedHostsInRootDesc': 'When enabled, the root host list only shows hosts without a group. Open a group from the sidebar to see grouped hosts.',
+  'settings.vault.showSftpTab': 'Show SFTP tab',
+  'settings.vault.showSftpTabDesc': 'Display the standalone SFTP view in the top tab bar. When hidden, use the in-session SFTP side panel instead.',
 
   // Update notifications
   'update.available.title': 'Update Available',
@@ -1152,7 +1156,7 @@ const en: Messages = {
   'terminal.toolbar.library': 'Library',
   'terminal.toolbar.noSnippets': 'No snippets available',
   'terminal.toolbar.terminalSettings': 'Terminal settings',
-  'terminal.toolbar.searchTerminal': 'Search terminal (Ctrl+F)',
+  'terminal.toolbar.searchTerminal': 'Search terminal',
   'terminal.toolbar.search': 'Search',
   'terminal.toolbar.broadcast': 'Broadcast',
   'terminal.toolbar.broadcastEnable': 'Enable Broadcast Mode',
@@ -1740,12 +1744,16 @@ const en: Messages = {
   // AI Codex
   'ai.codex': 'Codex',
   'ai.codex.title': 'Codex CLI',
-  'ai.codex.description': 'Uses codex + codex-acp for ACP protocol streaming. Login with ChatGPT subscription here, or configure an OpenAI provider API key (passed as CODEX_API_KEY).',
+  'ai.codex.description': 'Uses codex + codex-acp for ACP protocol streaming. Login with ChatGPT here, or enable an OpenAI-compatible provider API key and custom endpoint in Settings.',
   'ai.codex.detecting': 'Detecting...',
   'ai.codex.notFound': 'Not found',
   'ai.codex.awaitingLogin': 'Awaiting login',
   'ai.codex.connectedChatGPT': 'Connected via ChatGPT',
   'ai.codex.connectedApiKey': 'Connected via API key',
+  'ai.codex.connectedCustomConfig': 'Connected via ~/.codex/config.toml',
+  'ai.codex.customConfigIncomplete': 'Custom config detected (env var missing)',
+  'ai.codex.customConfigHint': 'Using custom provider "{provider}" configured in ~/.codex/config.toml — no ChatGPT login needed.',
+  'ai.codex.customConfigMissingEnvKey': 'Warning: {envKey} is not set in your shell environment. Export it (or launch netcatty from a shell that has it) so Codex can authenticate.',
   'ai.codex.notConnected': 'Not connected',
   'ai.codex.statusUnknown': 'Status unknown',
   'ai.codex.path': 'Path:',
@@ -1756,7 +1764,7 @@ const en: Messages = {
   'ai.codex.logout': 'Logout',
   'ai.codex.connectChatGPT': 'Connect ChatGPT',
   'ai.codex.refreshStatus': 'Refresh Status',
-  'ai.codex.apiKeyHint': 'Enabled OpenAI provider API key detected. Codex ACP can also authenticate without ChatGPT login.',
+  'ai.codex.apiKeyHint': 'Detected an enabled OpenAI-compatible provider API key. Codex ACP can use it without ChatGPT login.',
 
   // AI Claude Code
   'ai.claude.title': 'Claude Code',
