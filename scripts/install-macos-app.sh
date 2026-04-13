@@ -14,7 +14,19 @@ fi
 cd "${PROJECT_ROOT}"
 
 echo "==> 构建目录版 macOS 应用"
-CSC_IDENTITY_AUTO_DISCOVERY=false npm run pack:dir
+#
+# 本地安装场景固定使用 ad-hoc 签名，并明确关闭 notarization，
+# 避免 electron-builder 在每次构建时探测系统钥匙串中的开发者证书。
+#
+npm run build
+CSC_IDENTITY_AUTO_DISCOVERY=false \
+NODE_OPTIONS=--disable-warning=DEP0190 \
+./node_modules/.bin/electron-builder \
+  --config electron-builder.config.cjs \
+  --dir \
+  --publish=never \
+  -c.mac.identity=- \
+  -c.mac.notarize=false
 
 SOURCE_APP="$(find "${PROJECT_ROOT}/release" -maxdepth 2 -type d -name "${APP_NAME}" | head -n 1)"
 
