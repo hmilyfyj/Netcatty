@@ -1,4 +1,4 @@
-import { Circle, FolderTree, LayoutGrid, MessageSquare, PanelLeft, PanelRight, Palette, Server, X, Zap } from 'lucide-react';
+import { Circle, FolderTree, LayoutGrid, MessageSquare, PanelLeft, PanelRight, Palette, Plus, Server, X, Zap } from 'lucide-react';
 import React, { createContext, memo, startTransition, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useActiveTabId } from '../application/state/activeTabStore';
 import {
@@ -32,13 +32,16 @@ import { useStoredNumber } from '../application/state/useStoredNumber';
 import { STORAGE_KEY_SIDE_PANEL_WIDTH } from '../infrastructure/config/storageKeys';
 import { buildCacheKey } from '../application/state/sftp/sharedRemoteHostCache';
 import type { DropEntry } from '../lib/sftpFileUtils';
-import { GroupConfig, Host, Identity, KnownHost, SSHKey, Snippet, TerminalSession, TerminalTheme, Workspace, WorkspaceNode } from '../types';
+import { GroupConfig, Host, Identity, KnownHost, SSHKey, Snippet, TerminalGroup, TerminalSession, TerminalTheme, Workspace, WorkspaceNode } from '../types';
 import { resolveGroupDefaults, applyGroupDefaults } from '../domain/groupConfig';
 import { DistroAvatar } from './DistroAvatar';
 import Terminal from './Terminal';
 import { SftpSidePanel } from './SftpSidePanel';
 import { ScriptsSidePanel } from './ScriptsSidePanel';
+import { ServerStatsBar } from './terminal/ServerStatsBar';
 import { ThemeSidePanel } from './terminal/ThemeSidePanel';
+import { useServerStats } from './terminal/hooks/useServerStats';
+import { isServerStatsSupportedHost } from './terminal/serverStatsSupport';
 import { AIChatSidePanel } from './AIChatSidePanel';
 import { cleanupOrphanedAISessions, useAIState } from '../application/state/useAIState';
 import { TerminalComposeBar } from './terminal/TerminalComposeBar';
@@ -349,6 +352,7 @@ interface TerminalLayerProps {
   snippets: Snippet[];
   snippetPackages: string[];
   sessions: TerminalSession[];
+  groups: TerminalGroup[];
   workspaces: Workspace[];
   knownHosts?: KnownHost[];
   draggingSessionId: string | null;
@@ -365,6 +369,9 @@ interface TerminalLayerProps {
   onUpdateTerminalFontSize?: (fontSize: number) => void;
   onUpdateTerminalFontWeight?: (fontWeight: number) => void;
   onCloseSession: (sessionId: string, e?: React.MouseEvent) => void;
+  onCreateConsoleInGroup?: (groupId: string) => string | null;
+  onSelectConsoleInGroup?: (groupId: string, sessionId: string) => void;
+  onCloseConsoleInGroup?: (groupId: string, sessionId: string) => void;
   onUpdateSessionStatus: (sessionId: string, status: TerminalSession['status']) => void;
   onUpdateHostDistro: (hostId: string, distro: string) => void;
   onUpdateHost: (host: Host) => void;
@@ -405,6 +412,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   snippets,
   snippetPackages,
   sessions,
+  groups,
   workspaces,
   knownHosts = [],
   draggingSessionId,
@@ -421,6 +429,9 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   onUpdateTerminalFontSize,
   onUpdateTerminalFontWeight,
   onCloseSession,
+  onCreateConsoleInGroup,
+  onSelectConsoleInGroup,
+  onCloseConsoleInGroup,
   onUpdateSessionStatus,
   onUpdateHostDistro,
   onUpdateHost,
@@ -477,7 +488,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       const host = hostsRef.current.find(h => h.id === session.hostId);
 
       // Determine the tab ID (workspace or solo session)
-      const tabId = session.workspaceId || sessionId;
+      const tabId = session.workspaceId || session.groupId || sessionId;
 
       // Only open if the sidebar is not already open for this tab
       if (sidePanelOpenTabsRef.current.has(tabId)) return;
@@ -496,7 +507,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
             username: session.username,
             port: session.port ?? 22,
             protocol: proto,
-            label: session.label || session.hostname,
+            label: session.hostLabel || session.hostname,
           } as Host;
 
       setSidePanelOpenTabs(prev => {
@@ -578,7 +589,24 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   } | null>(null);
 
   const activeWorkspace = useMemo(() => workspaces.find(w => w.id === activeTabId), [workspaces, activeTabId]);
-  const activeSession = useMemo(() => sessions.find(s => s.id === activeTabId), [sessions, activeTabId]);
+  const activeGroup = useMemo(() => groups.find(group => group.id === activeTabId), [groups, activeTabId]);
+  const activeGroupSessions = useMemo(
+    () => activeGroup
+      ? sessions
+          .filter((session) => session.groupId === activeGroup.id)
+          .sort((a, b) => (a.groupConsoleIndex ?? 0) - (b.groupConsoleIndex ?? 0))
+      : [],
+    [activeGroup, sessions],
+  );
+  const activeSession = useMemo(() => {
+    if (activeGroup) {
+      const preferred = activeGroup.activeSessionId
+        ? activeGroupSessions.find((session) => session.id === activeGroup.activeSessionId)
+        : undefined;
+      return preferred ?? activeGroupSessions[0];
+    }
+    return sessions.find(s => s.id === activeTabId);
+  }, [activeGroup, activeGroupSessions, sessions, activeTabId]);
 
   // Handle broadcast input - write to all other sessions in the same workspace
   const handleBroadcastInput = useCallback((data: string, sourceSessionId: string) => {
@@ -603,6 +631,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   activeWorkspaceRef.current = activeWorkspace;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+  const groupsRef = useRef(groups);
+  groupsRef.current = groups;
   const workspacesRef = useRef(workspaces);
   workspacesRef.current = workspaces;
   const hostsRef = useRef(hosts);
@@ -830,6 +860,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
     return map;
   }, [sessions, hostMap, groupConfigs]);
+  const activeSessionHost = useMemo(() => {
+    if (!activeSession) return null;
+    return sessionHostsMap.get(activeSession.id) ?? null;
+  }, [activeSession, sessionHostsMap]);
   const sessionChainHostsMap = useMemo(() => {
     const map = new Map<string, Host[]>();
     for (const session of sessions) {
@@ -855,9 +889,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const validTerminalTabIds = useMemo(() => {
     const ids = new Set<string>();
     for (const session of sessions) ids.add(session.id);
+    for (const group of groups) ids.add(group.id);
     for (const workspace of workspaces) ids.add(workspace.id);
     return ids;
-  }, [sessions, workspaces]);
+  }, [sessions, groups, workspaces]);
 
   const validSessionActivityIds = useMemo(() => {
     return getValidSessionActivityIds(sessions);
@@ -1169,10 +1204,22 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   };
 
   const isTerminalLayerVisible = isVisible || !!draggingSessionId;
+  const activeGroupSupportsServerStats = useMemo(
+    () => isServerStatsSupportedHost(activeSessionHost),
+    [activeSessionHost],
+  );
+  const { stats: activeGroupServerStats } = useServerStats({
+    sessionId: activeSession?.id ?? '',
+    enabled: !!activeGroup && (terminalSettings?.showServerStats ?? true),
+    refreshInterval: terminalSettings?.serverStatsRefreshInterval ?? 5,
+    isSupportedOs: activeGroupSupportsServerStats,
+    isConnected: activeSession?.status === 'connected',
+    isVisible: isTerminalLayerVisible && !!activeGroup,
+  });
 
   // Check if active workspace is in focus mode
   const isFocusMode = activeWorkspace?.viewMode === 'focus';
-  const focusedSessionId = activeWorkspace?.focusedSessionId;
+  const focusedSessionId = activeWorkspace?.focusedSessionId ?? activeSession?.id;
 
   // Resolve the SFTP host for the current tab.
   // Uses the stored host from when the user opened SFTP, but updates when
@@ -1318,7 +1365,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   }, [handleOpenAI]);
 
   useEffect(() => {
-    const sessionIdsToClear = getSessionActivityIdsToClear(activeTabId, sessions);
+    const sessionIdsToClear = getSessionActivityIdsToClear(activeTabId, sessions, activeSession?.id);
     if (sessionIdsToClear.length === 1) {
       sessionActivityStore.clearTab(sessionIdsToClear[0]);
       return;
@@ -1326,7 +1373,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (sessionIdsToClear.length > 1) {
       sessionActivityStore.clearTabs(sessionIdsToClear);
     }
-  }, [activeTabId, sessions]);
+  }, [activeSession?.id, activeTabId, sessions]);
 
   useEffect(() => {
     const unsubscribers = activityTrackedSessions.map((session) => {
@@ -1334,7 +1381,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       return onSessionData(session.id, (chunk) => {
         if (!hasNotifiableTerminalOutput(filter, chunk)) return;
 
-        if (!shouldMarkSessionActivity(activeTabIdRef.current, session)) {
+        const currentActiveTabId = activeTabIdRef.current;
+        const activeGroupedSessionId = (() => {
+          const grouped = groupsRef.current.find((group) => group.id === currentActiveTabId);
+          return grouped?.activeSessionId ?? null;
+        })();
+
+        if (!shouldMarkSessionActivity(currentActiveTabId, session, activeGroupedSessionId)) {
           return;
         }
 
@@ -1647,6 +1700,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const aiContextsByTabId = useMemo(() => {
     const localOs = detectLocalOs(navigator.userAgent || navigator.platform);
     const sessionById = new Map(sessions.map((session) => [session.id, session]));
+    const groupById = new Map(groups.map((group) => [group.id, group]));
     const workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
     const tabIds = new Set<string>(mountedAiTabIds);
     if (activeTabId) tabIds.add(activeTabId);
@@ -1654,6 +1708,28 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     const contexts = new Map<string, AIPanelContext>();
 
     for (const tabId of tabIds) {
+      const group = groupById.get(tabId);
+      if (group) {
+        const session = (group.activeSessionId ? sessionById.get(group.activeSessionId) : undefined)
+          ?? group.sessionIds.map((sessionId) => sessionById.get(sessionId)).find(Boolean);
+        if (!session) continue;
+
+        contexts.set(tabId, {
+          scopeType: 'terminal',
+          scopeTargetId: session.id,
+          scopeHostIds: session.hostId ? [session.hostId] : [],
+          scopeLabel: group.title,
+          terminalSessions: [
+            buildAITerminalSessionInfo(
+              session,
+              sessionHostsMap.get(session.id),
+              localOs,
+            ),
+          ],
+        });
+        continue;
+      }
+
       const workspace = workspaceById.get(tabId);
       if (workspace) {
         const sessionIds = collectSessionIds(workspace.root);
@@ -1694,7 +1770,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
 
     return contexts;
-  }, [sessions, workspaces, mountedAiTabIds, activeTabId, sessionHostsMap]);
+  }, [sessions, groups, workspaces, mountedAiTabIds, activeTabId, sessionHostsMap]);
 
   const resolveAIExecutorContext = useCallback((scope: {
     type: 'terminal' | 'workspace';
@@ -1702,15 +1778,23 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     label?: string;
   }) => {
     const latestWorkspaces = workspacesRef.current;
+    const latestGroups = groupsRef.current;
     const latestSessions = sessionsRef.current;
     const latestHosts = hostsRef.current;
     const localOs = detectLocalOs(navigator.userAgent || navigator.platform);
+    const groupedSessionIds = scope.type === 'terminal'
+      ? (() => {
+          const group = scope.targetId ? latestGroups.find((item) => item.id === scope.targetId) : undefined;
+          if (!group) return null;
+          return group.activeSessionId ? [group.activeSessionId] : group.sessionIds.slice(0, 1);
+        })()
+      : null;
     const sessionIds = scope.type === 'workspace'
       ? (() => {
           const workspace = scope.targetId ? latestWorkspaces.find((w) => w.id === scope.targetId) : undefined;
           return workspace?.root ? collectSessionIds(workspace.root) : [];
         })()
-      : scope.targetId ? [scope.targetId] : [];
+      : groupedSessionIds ?? (scope.targetId ? [scope.targetId] : []);
 
     const workspaceName = scope.type === 'workspace'
       ? latestWorkspaces.find((w) => w.id === scope.targetId)?.title ?? scope.label
@@ -1843,6 +1927,90 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     return sessions.filter(s => idSet.has(s.id));
   }, [sessions, workspaceSessionIds]);
 
+  const renderGroupConsoleTabs = () => {
+    if (!activeGroup || activeGroupSessions.length === 0) return null;
+
+    return (
+      <div className="shrink-0 border-b border-border/50 bg-background/95" data-section="terminal-group-tabs">
+        <div className="h-10 flex items-center gap-1 px-3">
+          <div className="flex items-center gap-1 min-w-0 flex-1 overflow-x-auto scrollbar-none">
+            {activeGroupSessions.map((session) => {
+              const isActiveConsole = session.id === activeSession?.id;
+              const statusColor = session.status === 'connected'
+                ? 'text-emerald-500'
+                : session.status === 'connecting'
+                  ? 'text-amber-500'
+                  : 'text-rose-500';
+              return (
+                <button
+                  key={session.id}
+                  type="button"
+                  className={cn(
+                    "h-7 px-3 rounded-md text-xs font-medium inline-flex items-center gap-2 shrink-0 border transition-colors",
+                    isActiveConsole
+                      ? "bg-primary/12 border-primary/30 text-foreground"
+                      : "bg-transparent border-border/50 text-muted-foreground hover:text-foreground hover:bg-muted/60",
+                  )}
+                  onClick={() => onSelectConsoleInGroup?.(activeGroup.id, session.id)}
+                >
+                  <span>{`控制台 ${session.groupConsoleIndex ?? 1}`}</span>
+                  <Circle size={8} className={cn("flex-shrink-0 fill-current", statusColor)} />
+                  <span
+                    className="rounded-full p-0.5 hover:bg-destructive/10 hover:text-destructive"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onCloseConsoleInGroup?.(activeGroup.id, session.id);
+                    }}
+                  >
+                    <X size={12} />
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7 shrink-0"
+            onClick={() => onCreateConsoleInGroup?.(activeGroup.id)}
+            title="新建控制台"
+          >
+            <Plus size={14} />
+          </Button>
+        </div>
+        <div className="flex items-center gap-3 px-3 py-2 border-t border-border/40 bg-muted/20">
+          <div className="flex items-center gap-2 min-w-0 shrink-0">
+            {activeSessionHost ? (
+              <DistroAvatar host={activeSessionHost} fallback={activeGroup.hostLabel} size="sm" />
+            ) : (
+              <Server size={16} className="text-muted-foreground" />
+            )}
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-xs font-medium truncate">{activeGroup.hostLabel}</span>
+                <Circle
+                  size={8}
+                  className={cn(
+                    'shrink-0 fill-current',
+                    activeSession?.status === 'connected'
+                      ? 'text-emerald-500'
+                      : activeSession?.status === 'connecting'
+                        ? 'text-amber-500'
+                        : 'text-rose-500',
+                  )}
+                />
+              </div>
+              <div className="text-[10px] text-muted-foreground truncate">
+                {[activeGroup.username, activeGroup.hostname].filter(Boolean).join('@')}
+              </div>
+            </div>
+          </div>
+          <ServerStatsBar stats={activeGroupServerStats} className="min-w-0 flex-1 justify-end" />
+        </div>
+      </div>
+    );
+  };
+
   // Render focus mode sidebar
   const renderFocusModeSidebar = () => {
     if (!activeWorkspace || !isFocusMode) return null;
@@ -1929,6 +2097,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
           zIndex: isTerminalLayerVisible ? 10 : 0,
         }}
       >
+        {renderGroupConsoleTabs()}
         <div className={cn("flex-1 flex min-h-0 relative", sidePanelPosition === 'right' && "flex-row-reverse")}>
         {/* Side panel with tab header + content (SFTP / Scripts / Theme) */}
         {(isSidePanelOpenForCurrentTab || mountedSftpTabIds.length > 0 || mountedAiTabIds.length > 0) && (
@@ -2187,13 +2356,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
             // Use pre-computed host to avoid creating new objects on every render
             const host = sessionHostsMap.get(session.id)!;
             const inActiveWorkspace = !!activeWorkspace && session.workspaceId === activeWorkspace.id;
+            const inActiveGroup = !!activeGroup && session.groupId === activeGroup.id;
             const isActiveSolo = activeTabId === session.id && !activeWorkspace && isTerminalLayerVisible;
+            const isActiveGroupedSession = inActiveGroup && session.id === activeSession?.id;
 
             // In focus mode, only the focused session is visible
             const isFocusedInWorkspace = isFocusMode && inActiveWorkspace && session.id === focusedSessionId;
             const isSplitViewVisible = !isFocusMode && inActiveWorkspace;
 
-            const isVisible = ((isFocusedInWorkspace || isSplitViewVisible || isActiveSolo) && isTerminalLayerVisible);
+            const isVisible = ((isFocusedInWorkspace || isSplitViewVisible || isActiveSolo || isActiveGroupedSession) && isTerminalLayerVisible);
 
             // In focus mode, use full area; in split mode, use computed rects
             const rect = (isSplitViewVisible && !isFocusMode) ? activeWorkspaceRects[session.id] : null;
@@ -2245,6 +2416,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   // Set focused session when clicking on a pane in split view
                   if (inActiveWorkspace && !isFocusMode && activeWorkspace) {
                     onSetWorkspaceFocusedSession?.(activeWorkspace.id, session.id);
+                  } else if (inActiveGroup && activeGroup) {
+                    onSelectConsoleInGroup?.(activeGroup.id, session.id);
                   }
                 }}
               >
@@ -2266,6 +2439,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   terminalTheme={terminalTheme}
                   followAppTerminalTheme={followAppTerminalTheme}
                   terminalSettings={terminalSettings}
+                  showServerStatsInHeader={!session.groupId}
                   sessionId={session.id}
                   startupCommand={session.startupCommand}
                   noAutoRun={session.noAutoRun}
@@ -2285,8 +2459,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   onAddKnownHost={handleAddKnownHost}
                   onCommandExecuted={handleCommandExecuted}
                   onExpandToFocus={inActiveWorkspace && !isFocusMode ? workspaceFocusHandler : undefined}
-                  onSplitHorizontal={onSplitSession ? splitHorizontalHandler : undefined}
-                  onSplitVertical={onSplitSession ? splitVerticalHandler : undefined}
+                  onSplitHorizontal={onSplitSession && !session.groupId ? splitHorizontalHandler : undefined}
+                  onSplitVertical={onSplitSession && !session.groupId ? splitVerticalHandler : undefined}
                   isBroadcastEnabled={inActiveWorkspace && activeWorkspace ? isBroadcastEnabled?.(activeWorkspace.id) : false}
                   onToggleBroadcast={inActiveWorkspace ? workspaceBroadcastHandler : undefined}
                   onToggleComposeBar={inActiveWorkspace ? handleToggleWorkspaceComposeBar : undefined}
@@ -2381,6 +2555,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 const terminalLayerAreEqual = (prev: TerminalLayerProps, next: TerminalLayerProps): boolean => {
   return (
     prev.hosts === next.hosts &&
+    prev.groups === next.groups &&
     prev.keys === next.keys &&
     prev.snippets === next.snippets &&
     prev.snippetPackages === next.snippetPackages &&

@@ -3,19 +3,20 @@ import {
   LayoutGrid,
   Search,
   FolderLock,
+  Server,
   Terminal,
   TerminalSquare,
 } from "lucide-react";
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
-import { Host, TerminalSession, Workspace } from "../types";
+import { Host, TerminalGroup, TerminalSession, Workspace } from "../types";
 import { KeyBinding } from "../domain/models";
 import { useDiscoveredShells, getShellIconPath, isMonochromeShellIcon } from "../lib/useDiscoveredShells";
 
 type QuickSwitcherItem = {
-  type: "host" | "tab" | "workspace" | "action" | "shell";
+  type: "host" | "tab" | "group" | "workspace" | "action" | "shell";
   id: string;
-  data?: Host | TerminalSession | Workspace;
+  data?: Host | TerminalGroup | TerminalSession | Workspace;
 };
 import { DistroAvatar } from "./DistroAvatar";
 import { Input } from "./ui/input";
@@ -62,6 +63,7 @@ interface QuickSwitcherProps {
   query: string;
   results: Host[];
   sessions: TerminalSession[];
+  groups: TerminalGroup[];
   workspaces: Workspace[];
   onQueryChange: (value: string) => void;
   onSelect: (host: Host) => void;
@@ -77,6 +79,7 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
   query,
   results,
   sessions,
+  groups,
   workspaces,
   onQueryChange,
   onSelect,
@@ -162,6 +165,9 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
       // Tabs (built-in + sessions + workspaces)
       items.push({ type: "tab", id: "vault" });
       items.push({ type: "tab", id: "sftp" });
+      groups.forEach((group) =>
+        items.push({ type: "group", id: group.id, data: group }),
+      );
       orphanSessions.forEach((s) =>
         items.push({ type: "tab", id: s.id, data: s }),
       );
@@ -194,7 +200,7 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
     });
 
     return { flatItems: items, itemIndexMap: indexMap };
-  }, [showCategorized, results, orphanSessions, workspaces, filteredShells]);
+  }, [showCategorized, results, orphanSessions, groups, workspaces, filteredShells]);
 
   // O(1) index lookup
   const getItemIndex = useCallback((type: string, id: string) => {
@@ -223,6 +229,7 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
         onSelect(item.data as Host);
         break;
       case "tab":
+      case "group":
       case "workspace":
         onSelectTab(item.id);
         onClose();
@@ -369,6 +376,28 @@ const QuickSwitcherInner: React.FC<QuickSwitcherProps> = ({
                     <span className="text-sm font-medium">
                       {workspace.title}
                     </span>
+                  </div>
+                );
+              })}
+
+              {/* Remote groups */}
+              {groups.map((group) => {
+                const index = getItemIndex("group", group.id);
+                const isSelected = index === selectedIndex;
+                return (
+                  <div
+                    key={group.id}
+                    className={`flex items-center justify-between px-4 py-2.5 cursor-pointer transition-colors ${isSelected ? "bg-primary/15" : "hover:bg-muted/50"}`}
+                    onClick={() => handleItemSelect({ type: "group", id: group.id, data: group })}
+                    onMouseEnter={() => setSelectedIndex(index)}
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <Server size={16} className="text-muted-foreground" />
+                      <span className="text-sm font-medium truncate">{group.title}</span>
+                    </div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {group.sessionIds.length}
+                    </div>
                   </div>
                 );
               })}

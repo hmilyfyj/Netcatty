@@ -256,6 +256,7 @@ function App({ settings }: { settings: SettingsState }) {
 
   const {
     sessions,
+    groups,
     workspaces,
     setActiveTabId,
     draggingSessionId,
@@ -275,7 +276,11 @@ function App({ settings }: { settings: SettingsState }) {
     createLocalTerminal,
     createSerialSession,
     connectToHost,
+    createConsoleInGroup,
+    selectConsoleInGroup,
+    closeConsoleInGroup,
     closeSession,
+    closeGroup,
     closeWorkspace,
     updateSessionStatus,
     createWorkspaceWithHosts,
@@ -322,6 +327,10 @@ function App({ settings }: { settings: SettingsState }) {
     () => new Map(workspaces.map((workspace) => [workspace.id, workspace])),
     [workspaces],
   );
+  const groupById = useMemo(
+    () => new Map(groups.map((group) => [group.id, group])),
+    [groups],
+  );
   const themeById = useMemo(
     () => new Map([...customThemes, ...TERMINAL_THEMES].map((theme) => [theme.id, theme])),
     [customThemes],
@@ -363,11 +372,20 @@ function App({ settings }: { settings: SettingsState }) {
       return allSame ? firstTheme : null;
     }
 
+    const group = groupById.get(activeTabId);
+    if (group) {
+      const activeGroupedSession = (group.activeSessionId
+        ? sessionById.get(group.activeSessionId)
+        : undefined)
+        ?? group.sessionIds.map((id) => sessionById.get(id)).find(Boolean);
+      return activeGroupedSession ? resolveTheme(activeGroupedSession) : null;
+    }
+
     // Single session tab
     const session = sessionById.get(activeTabId);
     if (!session) return null;
     return resolveTheme(session);
-  }, [activeTabId, currentTerminalTheme, followAppTerminalTheme, hostById, sessionById, themeById, workspaceById]);
+  }, [activeTabId, currentTerminalTheme, followAppTerminalTheme, groupById, hostById, sessionById, themeById, workspaceById]);
 
   useImmersiveMode({
     activeTabId,
@@ -430,6 +448,11 @@ function App({ settings }: { settings: SettingsState }) {
     if (session?.workspaceId) {
       setActiveTabId(session.workspaceId);
       setWorkspaceFocusedSession(session.workspaceId, sessionId);
+      return;
+    }
+    if (session?.groupId) {
+      setActiveTabId(session.groupId);
+      selectConsoleInGroup(session.groupId, sessionId);
       return;
     }
     setActiveTabId(sessionId);
@@ -665,6 +688,7 @@ function App({ settings }: { settings: SettingsState }) {
 
       const sessionsForTray = sessions.map((s) => {
         const ws = s.workspaceId ? workspaces.find((w) => w.id === s.workspaceId) : undefined;
+        const group = s.groupId ? groups.find((item) => item.id === s.groupId) : undefined;
         return {
           id: s.id,
           label: s.hostname,
@@ -672,6 +696,8 @@ function App({ settings }: { settings: SettingsState }) {
           status: s.status,
           workspaceId: s.workspaceId,
           workspaceTitle: ws?.title,
+          groupId: s.groupId,
+          groupTitle: group?.title,
         };
       });
 
@@ -685,7 +711,7 @@ function App({ settings }: { settings: SettingsState }) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [sessions, portForwardingRules, workspaces]);
+  }, [groups, sessions, portForwardingRules, workspaces]);
 
   useEffect(() => {
     const bridge = netcattyBridge.get();
@@ -935,6 +961,15 @@ function App({ settings }: { settings: SettingsState }) {
       case 'closeTab': {
         const currentId = activeTabStore.getActiveTabId();
         if (currentId !== 'vault' && currentId !== 'sftp') {
+          const group = groups.find(g => g.id === currentId);
+          if (group) {
+            if (group.activeSessionId && group.sessionIds.length > 1) {
+              closeConsoleInGroup(group.id, group.activeSessionId);
+            } else {
+              closeGroup(group.id);
+            }
+            break;
+          }
           // Find if it's a session or workspace
           const session = sessions.find(s => s.id === currentId);
           if (session) {
@@ -1056,7 +1091,7 @@ function App({ settings }: { settings: SettingsState }) {
         break;
       }
     }
-  }, [orderedTabs, sessions, workspaces, setActiveTabId, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast]);
+  }, [orderedTabs, groups, sessions, workspaces, setActiveTabId, closeConsoleInGroup, closeGroup, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast]);
 
   // Callback for terminal to invoke app-level hotkey actions
   const handleHotkeyAction = useCallback((action: string, e: KeyboardEvent) => {
@@ -1403,6 +1438,7 @@ function App({ settings }: { settings: SettingsState }) {
         theme={resolvedTheme}
         followAppTerminalTheme={followAppTerminalTheme}
         hosts={hosts}
+        groups={groups}
         sessions={sessions}
         orphanSessions={orphanSessions}
         workspaces={workspaces}
@@ -1413,7 +1449,9 @@ function App({ settings }: { settings: SettingsState }) {
         onCloseSession={closeSession}
         onRenameSession={startSessionRename}
         onCopySession={copySessionWithCurrentShell}
+        onCreateConsoleInGroup={createConsoleInGroup}
         onRenameWorkspace={startWorkspaceRename}
+        onCloseGroup={closeGroup}
         onCloseWorkspace={closeWorkspace}
         onCloseLogView={closeLogView}
         onOpenQuickSwitcher={handleOpenQuickSwitcher}
@@ -1499,6 +1537,7 @@ function App({ settings }: { settings: SettingsState }) {
           snippets={snippets}
           snippetPackages={snippetPackages}
           sessions={sessions}
+          groups={groups}
           workspaces={workspaces}
           knownHosts={knownHosts}
           draggingSessionId={draggingSessionId}
@@ -1515,6 +1554,9 @@ function App({ settings }: { settings: SettingsState }) {
           onUpdateTerminalFontSize={setTerminalFontSize}
           onUpdateTerminalFontWeight={(w) => updateTerminalSetting('fontWeight', w)}
           onCloseSession={closeSession}
+          onCreateConsoleInGroup={createConsoleInGroup}
+          onSelectConsoleInGroup={selectConsoleInGroup}
+          onCloseConsoleInGroup={closeConsoleInGroup}
           onUpdateSessionStatus={handleSessionStatusChange}
           onUpdateHostDistro={updateHostDistro}
           onUpdateHost={(host) => updateHosts(hosts.map(h => h.id === host.id ? host : h))}
@@ -1581,6 +1623,7 @@ function App({ settings }: { settings: SettingsState }) {
             query={quickSearch}
             results={quickResults}
             sessions={sessions}
+            groups={groups}
             workspaces={workspaces}
             onQueryChange={setQuickSearch}
             onSelect={handleHostConnectWithProtocolCheck}

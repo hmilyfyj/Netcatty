@@ -44,6 +44,8 @@ type TraySession = {
   label: string;
   hostLabel: string;
   status: "connecting" | "connected" | "disconnected";
+  groupId?: string;
+  groupTitle?: string;
   workspaceId?: string;
   workspaceTitle?: string;
 };
@@ -229,12 +231,23 @@ const TrayPanelContent: React.FC = () => {
       <div className="p-2 space-y-3 text-sm flex-1 overflow-y-auto min-h-0">
 
         {jumpableSessions.length > 0 && (() => {
-          // Group sessions by workspace
+          // Group sessions by remote group or workspace
+          const remoteGroups = new Map<string, { title: string; sessions: typeof jumpableSessions }>();
           const workspaceGroups = new Map<string, { title: string; sessions: typeof jumpableSessions }>();
           const soloSessions: typeof jumpableSessions = [];
 
           jumpableSessions.forEach((s) => {
-            if (s.workspaceId) {
+            if (s.groupId) {
+              const existing = remoteGroups.get(s.groupId);
+              if (existing) {
+                existing.sessions.push(s);
+              } else {
+                remoteGroups.set(s.groupId, {
+                  title: s.groupTitle || s.hostLabel || "Remote Host",
+                  sessions: [s],
+                });
+              }
+            } else if (s.workspaceId) {
               const existing = workspaceGroups.get(s.workspaceId);
               if (existing) {
                 existing.sessions.push(s);
@@ -253,6 +266,18 @@ const TrayPanelContent: React.FC = () => {
             <div>
               <div className="px-2 py-1 text-xs text-muted-foreground">{t("tray.sessions")}</div>
               <div className="space-y-1">
+                {/* Remote console groups */}
+                {Array.from(remoteGroups.entries()).map(([groupId, group]) => (
+                  <WorkspaceGroup
+                    key={groupId}
+                    workspaceId={groupId}
+                    title={group.title}
+                    sessions={group.sessions}
+                    activeTabId={activeTabId}
+                    jumpToSession={jumpToSession}
+                    t={t}
+                  />
+                ))}
                 {/* Workspace groups */}
                 {Array.from(workspaceGroups.entries()).map(([wsId, group]) => (
                   <WorkspaceGroup

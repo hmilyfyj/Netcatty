@@ -1,14 +1,14 @@
 import { Bell, Copy, FileText, Folder, FolderLock, LayoutGrid, Minus, Moon, MoreHorizontal, Plus, Server, Sparkles, Square, Sun, TerminalSquare, Usb, X } from 'lucide-react';
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { activeTabStore, useActiveTabId } from '../application/state/activeTabStore';
-import { buildWorkspaceActivityMap } from '../application/state/sessionActivity';
+import { buildGroupActivityMap, buildWorkspaceActivityMap } from '../application/state/sessionActivity';
 import { useSessionActivityMap } from '../application/state/sessionActivityStore';
 import { LogView } from '../application/state/useSessionState';
 import { useWindowControls } from '../application/state/useWindowControls';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { getEffectiveHostDistro } from '../domain/host';
 import { cn } from '../lib/utils';
-import { Host, TerminalSession, Workspace } from '../types';
+import { Host, TerminalGroup, TerminalSession, Workspace } from '../types';
 import { DISTRO_LOGOS, DISTRO_COLORS } from './DistroAvatar';
 import { getShellIconPath, isMonochromeShellIcon } from '../lib/useDiscoveredShells';
 import { Button } from './ui/button';
@@ -23,6 +23,7 @@ interface TopTabsProps {
   theme: 'dark' | 'light';
   followAppTerminalTheme?: boolean;
   hosts: Host[];
+  groups: TerminalGroup[];
   sessions: TerminalSession[];
   orphanSessions: TerminalSession[];
   workspaces: Workspace[];
@@ -33,6 +34,8 @@ interface TopTabsProps {
   onCloseSession: (sessionId: string, e?: React.MouseEvent) => void;
   onRenameSession: (sessionId: string) => void;
   onCopySession: (sessionId: string) => void;
+  onCreateConsoleInGroup: (groupId: string) => string | null;
+  onCloseGroup: (groupId: string) => void;
   onRenameWorkspace: (workspaceId: string) => void;
   onCloseWorkspace: (workspaceId: string) => void;
   onCloseLogView: (logViewId: string) => void;
@@ -230,6 +233,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   theme,
   followAppTerminalTheme = false,
   hosts,
+  groups,
   sessions,
   orphanSessions,
   workspaces,
@@ -240,6 +244,8 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   onCloseSession,
   onRenameSession,
   onCopySession,
+  onCreateConsoleInGroup,
+  onCloseGroup,
   onRenameWorkspace,
   onCloseWorkspace,
   onCloseLogView,
@@ -342,6 +348,12 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
     return map;
   }, [orphanSessions]);
 
+  const groupMap = useMemo(() => {
+    const map = new Map<string, TerminalGroup>();
+    for (const group of groups) map.set(group.id, group);
+    return map;
+  }, [groups]);
+
   const workspaceMap = useMemo(() => {
     const map = new Map<string, Workspace>();
     for (const w of workspaces) map.set(w.id, w);
@@ -363,6 +375,9 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   const workspaceActivityMap = useMemo(() => {
     return buildWorkspaceActivityMap(sessions, sessionActivityMap);
   }, [sessionActivityMap, sessions]);
+  const groupActivityMap = useMemo(() => {
+    return buildGroupActivityMap(sessions, sessionActivityMap);
+  }, [sessionActivityMap, sessions]);
 
   // Pre-compute session counts per workspace for O(1) access
   const workspacePaneCounts = useMemo(() => {
@@ -370,6 +385,16 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
     for (const s of sessions) {
       if (s.workspaceId) {
         counts.set(s.workspaceId, (counts.get(s.workspaceId) || 0) + 1);
+      }
+    }
+    return counts;
+  }, [sessions]);
+
+  const groupSessionCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const session of sessions) {
+      if (session.groupId) {
+        counts.set(session.groupId, (counts.get(session.groupId) || 0) + 1);
       }
     }
     return counts;
@@ -464,9 +489,13 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   // Build ordered tab items using pre-computed maps for O(1) lookups
   const orderedTabItems = useMemo(() => {
     return orderedTabs.map((tabId) => {
+      const group = groupMap.get(tabId);
       const session = orphanSessionMap.get(tabId);
       const workspace = workspaceMap.get(tabId);
       const logView = logViewMap.get(tabId);
+      if (group) {
+        return { type: 'group' as const, id: tabId, group, sessionCount: groupSessionCounts.get(tabId) || 0 };
+      }
       if (session) {
         return { type: 'session' as const, id: tabId, session };
       }
@@ -478,12 +507,111 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
       }
       return null;
     }).filter(Boolean);
-  }, [orderedTabs, orphanSessionMap, workspaceMap, logViewMap, workspacePaneCounts]);
+  }, [orderedTabs, groupMap, orphanSessionMap, workspaceMap, logViewMap, workspacePaneCounts, groupSessionCounts]);
 
   // Render the tabs
   const renderOrderedTabs = () => {
     return orderedTabItems.map((item) => {
       if (!item) return null;
+
+      if (item.type === 'group') {
+        const group = item.group;
+        const sessionCount = item.sessionCount;
+        const activeSession = group.activeSessionId
+          ? sessions.find((session) => session.id === group.activeSessionId)
+          : sessions.find((session) => session.groupId === group.id);
+        const groupStatus = activeSession?.status || 'disconnected';
+        const hasActivity = !!groupActivityMap.get(group.id);
+        const isBeingDragged = draggingSessionId === group.id;
+        const shiftStyle = tabShiftStyles[group.id] || {};
+        const showDropIndicatorBefore = dropIndicator?.tabId === group.id && dropIndicator.position === 'before';
+        const showDropIndicatorAfter = dropIndicator?.tabId === group.id && dropIndicator.position === 'after';
+        const isActive = activeTabId === group.id;
+
+        return (
+          <ContextMenu key={group.id}>
+            <ContextMenuTrigger asChild>
+              <div
+                data-tab-id={group.id}
+                onClick={() => onSelectTab(group.id)}
+                draggable
+                onDragStart={(e) => handleTabDragStart(e, group.id)}
+                onDragEnd={handleTabDragEnd}
+                onDragOver={(e) => handleTabDragOver(e, group.id)}
+                onDragLeave={handleTabDragLeave}
+                onDrop={(e) => handleTabDrop(e, group.id)}
+                className={cn(
+                  "relative h-7 pl-3 pr-2 min-w-[150px] max-w-[260px] rounded-none text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
+                  "transition-transform duration-150",
+                  isBeingDragged && isDraggingForReorder ? "opacity-40 scale-95" : "",
+                )}
+                style={{
+                  ...shiftStyle,
+                  backgroundColor: isActive
+                    ? 'var(--top-tabs-active-bg, hsl(var(--background)))'
+                    : 'transparent',
+                  color: isActive
+                    ? 'var(--top-tabs-fg, hsl(var(--foreground)))'
+                    : 'var(--top-tabs-muted, hsl(var(--muted-foreground)))',
+                }}
+                onMouseEnter={(e) => {
+                  if (!isActive) {
+                    e.currentTarget.style.backgroundColor = 'color-mix(in srgb, var(--top-tabs-active-bg, hsl(var(--background))) 40%, transparent)';
+                    e.currentTarget.style.color = 'var(--top-tabs-fg, hsl(var(--foreground)))';
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (!isActive) {
+                    e.currentTarget.style.backgroundColor = 'transparent';
+                    e.currentTarget.style.color = 'var(--top-tabs-muted, hsl(var(--muted-foreground)))';
+                  }
+                }}
+              >
+                {isActive && (
+                  <div
+                    className="absolute top-0 left-0 right-0 h-[2px]"
+                    style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))' }}
+                  />
+                )}
+                {showDropIndicatorBefore && isDraggingForReorder && (
+                  <div
+                    className="absolute -left-0.5 top-1 bottom-1 w-0.5 rounded-full animate-pulse"
+                    style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))', boxShadow: '0 0 8px 2px color-mix(in srgb, var(--top-tabs-accent, hsl(var(--accent))) 50%, transparent)' }}
+                  />
+                )}
+                {showDropIndicatorAfter && isDraggingForReorder && (
+                  <div
+                    className="absolute -right-0.5 top-1 bottom-1 w-0.5 rounded-full animate-pulse"
+                    style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))', boxShadow: '0 0 8px 2px color-mix(in srgb, var(--top-tabs-accent, hsl(var(--accent))) 50%, transparent)' }}
+                  />
+                )}
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <SessionTabIcon host={hostMap.get(group.hostId)} isActive={isActive} protocol={activeSession?.protocol} shellIcon={activeSession?.localShellIcon} />
+                  <span className="truncate">{group.title}</span>
+                  <div className="flex-shrink-0">{sessionStatusDot(groupStatus, hasActivity)}</div>
+                </div>
+                <div
+                  className="text-[10px] px-1.5 py-0.5 rounded-full min-w-[22px] text-center shrink-0"
+                  style={{
+                    border: '1px solid color-mix(in srgb, var(--top-tabs-fg, hsl(var(--foreground))) 18%, transparent)',
+                    backgroundColor: 'color-mix(in srgb, var(--top-tabs-active-bg, hsl(var(--background))) 60%, transparent)',
+                  }}
+                >
+                  {sessionCount}
+                </div>
+              </div>
+            </ContextMenuTrigger>
+            <ContextMenuContent>
+              <ContextMenuItem onClick={() => onCreateConsoleInGroup(group.id)}>
+                新建控制台
+              </ContextMenuItem>
+              <ContextMenuItem className="text-destructive" onClick={() => onCloseGroup(group.id)}>
+                {t('common.close')}
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
+        );
+      }
 
       if (item.type === 'session') {
         const session = item.session;
@@ -958,6 +1086,7 @@ const topTabsAreEqual = (prev: TopTabsProps, next: TopTabsProps): boolean => {
   return (
     prev.theme === next.theme &&
     prev.hosts === next.hosts &&
+    prev.groups === next.groups &&
     prev.sessions === next.sessions &&
     prev.orphanSessions === next.orphanSessions &&
     prev.workspaces === next.workspaces &&

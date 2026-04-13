@@ -671,6 +671,10 @@ export interface TerminalSession {
   hostname: string;
   status: 'connecting' | 'connected' | 'disconnected';
   workspaceId?: string;
+  groupId?: string; // Remote host console group ID
+  groupConsoleIndex?: number; // Default sub-tab ordering/index for remote groups
+  transportId?: string; // Reserved for shared-transport phase
+  channelId?: string; // Reserved for shared-transport phase
   startupCommand?: string; // Command to run after connection (for snippet runner)
   noAutoRun?: boolean;     // If true, paste command without auto-executing
   // Connection-time protocol overrides (used instead of looking up from hosts)
@@ -685,6 +689,19 @@ export interface TerminalSession {
   localShellArgs?: string[]; // Shell args for local terminals (from discovery)
   localShellName?: string;   // Display name for local shell (e.g., "Zsh", "Ubuntu (WSL)")
   localShellIcon?: string;   // Icon identifier for local shell (e.g., "zsh", "ubuntu")
+}
+
+export interface TerminalGroup {
+  id: string;
+  title: string;
+  hostId: string;
+  hostLabel: string;
+  hostname: string;
+  username: string;
+  protocol?: HostProtocol;
+  activeSessionId?: string;
+  sessionIds: string[];
+  nextConsoleIndex: number;
 }
 
 export interface RemoteFile {

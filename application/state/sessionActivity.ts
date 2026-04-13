@@ -8,14 +8,19 @@ export const getValidSessionActivityIds = (sessions: TerminalSession[]): Set<str
 
 export const shouldMarkSessionActivity = (
   activeTabId: string | null,
-  session: Pick<TerminalSession, 'id' | 'workspaceId'>,
+  session: Pick<TerminalSession, 'id' | 'workspaceId' | 'groupId'>,
+  activeGroupedSessionId?: string | null,
 ): boolean => {
-  return activeTabId !== session.id && activeTabId !== session.workspaceId;
+  if (activeGroupedSessionId && session.id === activeGroupedSessionId) {
+    return false;
+  }
+  return activeTabId !== session.id && activeTabId !== session.workspaceId && activeTabId !== session.groupId;
 };
 
 export const getSessionActivityIdsToClear = (
   activeTabId: string | null,
   sessions: TerminalSession[],
+  activeGroupedSessionId?: string | null,
 ): string[] => {
   if (!activeTabId || activeTabId === 'vault' || activeTabId === 'sftp') {
     return [];
@@ -24,6 +29,10 @@ export const getSessionActivityIdsToClear = (
   const activeSession = sessions.find((session) => session.id === activeTabId);
   if (activeSession) {
     return [activeSession.id];
+  }
+
+  if (activeGroupedSessionId && sessions.some((session) => session.groupId === activeTabId)) {
+    return [activeGroupedSessionId];
   }
 
   return sessions
@@ -43,4 +52,18 @@ export const buildWorkspaceActivityMap = (
   }
 
   return workspaceActivityMap;
+};
+
+export const buildGroupActivityMap = (
+  sessions: TerminalSession[],
+  sessionActivityMap: SessionActivityMap,
+): Map<string, boolean> => {
+  const groupActivityMap = new Map<string, boolean>();
+
+  for (const session of sessions) {
+    if (!session.groupId || !sessionActivityMap[session.id]) continue;
+    groupActivityMap.set(session.groupId, true);
+  }
+
+  return groupActivityMap;
 };
