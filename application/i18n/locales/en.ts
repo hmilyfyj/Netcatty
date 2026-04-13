@@ -1834,7 +1834,6 @@ const en: Messages = {
   'ai.codex.logout': 'Logout',
   'ai.codex.connectChatGPT': 'Connect ChatGPT',
   'ai.codex.refreshStatus': 'Refresh Status',
-  'ai.codex.apiKeyHint': 'Detected an enabled OpenAI-compatible provider API key. Codex ACP can use it without ChatGPT login.',
 
   // AI Claude Code
   'ai.claude.title': 'Claude Code',
