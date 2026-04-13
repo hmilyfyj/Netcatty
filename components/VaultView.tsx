@@ -93,7 +93,7 @@ import {
 import { Dropdown, DropdownContent, DropdownTrigger } from "./ui/dropdown";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
-import { SortDropdown, SortMode } from "./ui/sort-dropdown";
+import { SortDropdown } from "./ui/sort-dropdown";
 import { TagFilterDropdown } from "./ui/tag-filter-dropdown";
 import { toast } from "./ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "./ui/tooltip";
@@ -153,6 +153,8 @@ interface VaultViewProps {
   onUpdateGroupConfigs: (configs: GroupConfig[]) => void;
   showRecentHosts: boolean;
   showOnlyUngroupedHostsInRoot: boolean;
+  vaultHostsSortMode: 'az' | 'za' | 'newest' | 'oldest' | 'group';
+  onSetVaultHostsSortMode: (mode: 'az' | 'za' | 'newest' | 'oldest' | 'group') => void;
   // Optional: navigate to a specific section on mount or when changed
   navigateToSection?: VaultSection | null;
   onNavigateToSectionHandled?: () => void;
@@ -201,6 +203,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   onUpdateGroupConfigs,
   showRecentHosts,
   showOnlyUngroupedHostsInRoot,
+  vaultHostsSortMode,
+  onSetVaultHostsSortMode,
   navigateToSection,
   onNavigateToSectionHandled,
 }) => {
@@ -260,7 +264,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     "grid",
   );
   const treeExpandedState = useTreeExpandedState(STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED);
-  const [sortMode, setSortMode] = useState<SortMode>("az");
+  const sortMode = vaultHostsSortMode;
+  const setSortMode = onSetVaultHostsSortMode;
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(new Set());
   const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
@@ -3210,7 +3215,8 @@ const vaultViewAreEqual = (
     prev.managedSources === next.managedSources &&
     prev.groupConfigs === next.groupConfigs &&
     prev.terminalThemeId === next.terminalThemeId &&
-    prev.terminalFontSize === next.terminalFontSize;
+    prev.terminalFontSize === next.terminalFontSize &&
+    prev.vaultHostsSortMode === next.vaultHostsSortMode;
 
   return isEqual;
 };

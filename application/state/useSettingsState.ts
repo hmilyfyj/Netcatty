@@ -37,6 +37,7 @@ import {
   STORAGE_KEY_SHOW_RECENT_HOSTS,
   STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT,
   STORAGE_KEY_SHOW_SFTP_TAB,
+  STORAGE_KEY_VAULT_HOSTS_SORT_MODE,
 } from '../../infrastructure/config/storageKeys';
 import { DEFAULT_UI_LOCALE, resolveSupportedLocale } from '../../infrastructure/config/i18n';
 import { TERMINAL_THEMES } from '../../infrastructure/config/terminalThemes';
@@ -76,6 +77,7 @@ const DEFAULT_SFTP_DEFAULT_VIEW_MODE: 'list' | 'tree' = 'list';
 const DEFAULT_SHOW_RECENT_HOSTS = true;
 const DEFAULT_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT = false;
 const DEFAULT_SHOW_SFTP_TAB = true;
+const DEFAULT_VAULT_HOSTS_SORT_MODE: 'az' | 'za' | 'newest' | 'oldest' | 'group' = 'az';
 
 // Editor defaults
 const DEFAULT_EDITOR_WORD_WRAP = false;
@@ -117,6 +119,9 @@ const isValidUiFontId = (value: string): boolean => {
   return UI_FONTS.some((font) => font.id === value) ||
     uiFontStore.getAvailableFonts().some((font) => font.id === value);
 };
+
+const isValidSortMode = (value: unknown): value is 'az' | 'za' | 'newest' | 'oldest' | 'group' =>
+  value === 'az' || value === 'za' || value === 'newest' || value === 'oldest' || value === 'group';
 
 const serializeTerminalSettings = (settings: TerminalSettings): string =>
   JSON.stringify(settings);
@@ -276,6 +281,10 @@ export const useSettingsState = () => {
   const [showSftpTab, setShowSftpTabState] = useState<boolean>(() => {
     const stored = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_SFTP_TAB);
     return stored ?? DEFAULT_SHOW_SFTP_TAB;
+  });
+  const [vaultHostsSortMode, setVaultHostsSortModeState] = useState<'az' | 'za' | 'newest' | 'oldest' | 'group'>(() => {
+    const stored = readStoredString(STORAGE_KEY_VAULT_HOSTS_SORT_MODE);
+    return stored && isValidSortMode(stored) ? stored : DEFAULT_VAULT_HOSTS_SORT_MODE;
   });
   const [sftpTransferConcurrency, setSftpTransferConcurrencyState] = useState<number>(() => {
     const stored = localStorageAdapter.readNumber(STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY);
@@ -487,6 +496,10 @@ export const useSettingsState = () => {
     const storedShowSftpTab = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_SFTP_TAB);
     setShowSftpTabState(storedShowSftpTab ?? DEFAULT_SHOW_SFTP_TAB);
 
+    // Vault hosts sort mode
+    const storedSortMode = readStoredString(STORAGE_KEY_VAULT_HOSTS_SORT_MODE);
+    if (storedSortMode && isValidSortMode(storedSortMode)) setVaultHostsSortModeState(storedSortMode);
+
     // Workspace focus style
     const storedFocusStyle = readStoredString(STORAGE_KEY_WORKSPACE_FOCUS_STYLE);
     if (storedFocusStyle === 'dim' || storedFocusStyle === 'border') setWorkspaceFocusStyleState(storedFocusStyle);
@@ -649,6 +662,11 @@ export const useSettingsState = () => {
       if (key === STORAGE_KEY_SFTP_TRANSFER_CONCURRENCY && typeof value === 'number') {
         setSftpTransferConcurrencyState((prev) => (prev === value ? prev : value));
       }
+      if (key === STORAGE_KEY_VAULT_HOSTS_SORT_MODE && typeof value === 'string') {
+        if (isValidSortMode(value)) {
+          setVaultHostsSortModeState((prev) => (prev === value ? prev : value));
+        }
+      }
     });
     return () => {
       try {
@@ -688,6 +706,7 @@ export const useSettingsState = () => {
     showRecentHosts, showOnlyUngroupedHostsInRoot, showSftpTab,
     editorWordWrap, sessionLogsEnabled, sessionLogsDir, sessionLogsFormat,
     globalHotkeyEnabled, autoUpdateEnabled,
+    vaultHostsSortMode,
   });
   settingsSnapshotRef.current = {
     theme, lightUiThemeId, darkUiThemeId, accentMode, customAccent,
@@ -698,6 +717,7 @@ export const useSettingsState = () => {
     showRecentHosts, showOnlyUngroupedHostsInRoot, showSftpTab,
     editorWordWrap, sessionLogsEnabled, sessionLogsDir, sessionLogsFormat,
     globalHotkeyEnabled, autoUpdateEnabled,
+    vaultHostsSortMode,
   };
 
   // Listen for storage changes from other windows (cross-window sync)
@@ -904,6 +924,12 @@ export const useSettingsState = () => {
           setSftpTransferConcurrencyState(num);
         }
       }
+      // Sync vault hosts sort mode from other windows
+      if (e.key === STORAGE_KEY_VAULT_HOSTS_SORT_MODE && e.newValue !== null) {
+        if (isValidSortMode(e.newValue) && e.newValue !== s.vaultHostsSortMode) {
+          setVaultHostsSortModeState(e.newValue);
+        }
+      }
     };
 
     window.addEventListener('storage', handleStorageChange);
@@ -985,6 +1011,13 @@ export const useSettingsState = () => {
     localStorageAdapter.writeBoolean(STORAGE_KEY_SHOW_SFTP_TAB, enabled);
     if (!persistMountedRef.current) return;
     notifySettingsChanged(STORAGE_KEY_SHOW_SFTP_TAB, enabled);
+  }, [notifySettingsChanged]);
+
+  const setVaultHostsSortMode = useCallback((mode: 'az' | 'za' | 'newest' | 'oldest' | 'group') => {
+    setVaultHostsSortModeState(mode);
+    localStorageAdapter.writeString(STORAGE_KEY_VAULT_HOSTS_SORT_MODE, mode);
+    if (!persistMountedRef.current) return;
+    notifySettingsChanged(STORAGE_KEY_VAULT_HOSTS_SORT_MODE, mode);
   }, [notifySettingsChanged]);
 
   // Apply and persist custom CSS
@@ -1298,6 +1331,8 @@ export const useSettingsState = () => {
     setShowOnlyUngroupedHostsInRoot,
     showSftpTab,
     setShowSftpTab,
+    vaultHostsSortMode,
+    setVaultHostsSortMode,
     sftpTransferConcurrency,
     setSftpTransferConcurrency,
     // Editor Settings
@@ -1336,7 +1371,7 @@ export const useSettingsState = () => {
       terminalThemeId, terminalFontFamilyId, terminalFontSize, terminalSettings,
       customKeyBindings, editorWordWrap,
       sftpDoubleClickBehavior, sftpAutoSync, sftpShowHiddenFiles, sftpUseCompressedUpload, sftpAutoOpenSidebar, sftpDefaultViewMode,
-      showRecentHosts, showOnlyUngroupedHostsInRoot, showSftpTab,
+      showRecentHosts, showOnlyUngroupedHostsInRoot, showSftpTab, vaultHostsSortMode,
       customThemes, workspaceFocusStyle,
     ]),
   };

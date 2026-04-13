@@ -1520,6 +1520,8 @@ function App({ settings }: { settings: SettingsState }) {
             onOpenLogView={openLogView}
             showRecentHosts={settings.showRecentHosts}
             showOnlyUngroupedHostsInRoot={settings.showOnlyUngroupedHostsInRoot}
+            vaultHostsSortMode={settings.vaultHostsSortMode}
+            onSetVaultHostsSortMode={settings.setVaultHostsSortMode}
             navigateToSection={navigateToSection}
             onNavigateToSectionHandled={() => setNavigateToSection(null)}
           />
