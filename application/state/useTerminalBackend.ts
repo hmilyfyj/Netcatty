@@ -162,6 +162,18 @@ export const useTerminalBackend = () => {
     return bridge.getServerStats(sessionId);
   }, []);
 
+  const getDockerContainerPwd = useCallback(async (sessionId: string, containerId: string) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.dockerGetContainerPwd) return { success: false, error: 'dockerGetContainerPwd unavailable' };
+    return bridge.dockerGetContainerPwd(sessionId, containerId);
+  }, []);
+
+  const listDockerContainers = useCallback(async (sessionId: string) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.dockerListContainersForSession) return [];
+    return bridge.dockerListContainersForSession(sessionId);
+  }, []);
+
   return {
     backendAvailable,
     telnetAvailable,
@@ -183,6 +195,8 @@ export const useTerminalBackend = () => {
     getSessionRemoteInfo,
     getSessionDistroInfo,
     getServerStats,
+    getDockerContainerPwd,
+    listDockerContainers,
     writeToSession,
     resizeSession,
     closeSession,

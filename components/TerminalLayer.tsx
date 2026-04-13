@@ -27,6 +27,7 @@ import {
 } from '../domain/terminalAppearance';
 import { cn, normalizeLineEndings } from '../lib/utils';
 import { detectLocalOs } from '../lib/localShell';
+import { logger } from '../lib/logger';
 import { useStoredString } from '../application/state/useStoredString';
 import { useStoredNumber } from '../application/state/useStoredNumber';
 import { STORAGE_KEY_SIDE_PANEL_WIDTH } from '../infrastructure/config/storageKeys';
@@ -49,6 +50,13 @@ import { useCustomThemes } from '../application/state/customThemeStore';
 import { Button } from './ui/button';
 import { ScrollArea } from './ui/scroll-area';
 import { setupMcpApprovalBridge } from '../infrastructure/ai/shared/approvalGate';
+import {
+  isShellExitCommand,
+  parseDockerExecCommand,
+  matchDockerContainerForContext,
+  type TerminalFileContext,
+  type TerminalDockerFileContext,
+} from '../domain/terminalFileContext';
 
 type SidePanelTab = 'sftp' | 'scripts' | 'theme' | 'ai';
 
@@ -554,16 +562,12 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     onAddKnownHost?.(knownHost);
   }, [onAddKnownHost]);
 
-  const handleCommandExecuted = useCallback((command: string, hostId: string, hostLabel: string, sessionId: string) => {
-    onCommandExecuted?.(command, hostId, hostLabel, sessionId);
-  }, [onCommandExecuted]);
+  // Terminal backend for broadcast writes
+  const terminalBackend = useTerminalBackend();
 
   const handleTerminalDataCapture = useCallback((sessionId: string, data: string) => {
     onTerminalDataCapture?.(sessionId, data);
   }, [onTerminalDataCapture]);
-
-  // Terminal backend for broadcast writes
-  const terminalBackend = useTerminalBackend();
   const snippetExecutorsRef = useRef<Map<string, SnippetExecutor>>(new Map());
 
   const handleSnippetExecutorChange = useCallback((sessionId: string, executor: SnippetExecutor | null) => {
@@ -681,6 +685,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     Map<string, { hostId: string; path: string }>
   >(new Map());
   const [sessionCwdById, setSessionCwdById] = useState<Map<string, string>>(new Map());
+  const [sessionFileContextById, setSessionFileContextById] = useState<Map<string, TerminalFileContext>>(new Map());
   const [sftpPendingUploadsForTab, setSftpPendingUploadsForTab] = useState<
     Map<string, PendingSftpUpload>
   >(new Map());
@@ -688,6 +693,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   sftpHostForTabRef.current = sftpHostForTab;
   const sessionCwdByIdRef = useRef(sessionCwdById);
   sessionCwdByIdRef.current = sessionCwdById;
+  const sessionFileContextByIdRef = useRef(sessionFileContextById);
+  sessionFileContextByIdRef.current = sessionFileContextById;
 
   useEffect(() => {
     const validSessionIds = new Set(sessions.map((session) => session.id));
@@ -697,6 +704,18 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       prev.forEach((cwd, sessionId) => {
         if (validSessionIds.has(sessionId)) {
           next.set(sessionId, cwd);
+          return;
+        }
+        changed = true;
+      });
+      return changed ? next : prev;
+    });
+    setSessionFileContextById((prev) => {
+      let changed = false;
+      const next = new Map<string, TerminalFileContext>();
+      prev.forEach((context, sessionId) => {
+        if (validSessionIds.has(sessionId)) {
+          next.set(sessionId, context);
           return;
         }
         changed = true;
@@ -742,6 +761,22 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     });
   }, [isSessionDrivingTab]);
 
+  const updateSessionFileContext = useCallback((
+    sessionId: string,
+    updater: (current: TerminalFileContext | undefined) => TerminalFileContext,
+  ) => {
+    setSessionFileContextById((prev) => {
+      const current = prev.get(sessionId);
+      const nextContext = updater(current);
+      if (current && JSON.stringify(current) === JSON.stringify(nextContext)) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.set(sessionId, nextContext);
+      return next;
+    });
+  }, []);
+
   const handleSessionCwdResolved = useCallback((
     sessionId: string,
     cwd: string,
@@ -756,8 +791,96 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       next.set(sessionId, cwd);
       return next;
     });
+    updateSessionFileContext(sessionId, (current) => {
+      const updatedAt = Date.now();
+      if (current?.kind === "docker") {
+        return {
+          ...current,
+          cwd,
+          updatedAt,
+        };
+      }
+      return {
+        kind: "host",
+        cwd,
+        updatedAt,
+      };
+    });
     syncSftpLocationToSessionCwd(sessionId, cwd);
-  }, [syncSftpLocationToSessionCwd]);
+  }, [syncSftpLocationToSessionCwd, updateSessionFileContext]);
+
+  const handleCommandExecuted = useCallback((command: string, hostId: string, hostLabel: string, sessionId: string) => {
+    const parsedDockerExec = parseDockerExecCommand(command);
+    logger.info("[TerminalLayer] handleCommandExecuted", { command, parsedDockerExec, sessionId });
+    if (parsedDockerExec) {
+      updateSessionFileContext(sessionId, (current) => ({
+        kind: "docker",
+        containerRef: parsedDockerExec.containerRef,
+        containerId: current?.kind === "docker" && current.containerRef === parsedDockerExec.containerRef ? current.containerId : undefined,
+        containerName: current?.kind === "docker" && current.containerRef === parsedDockerExec.containerRef ? current.containerName : undefined,
+        cwd: parsedDockerExec.cwd,
+        updatedAt: Date.now(),
+      }));
+      logger.info("[TerminalLayer] Docker context updated", { containerRef: parsedDockerExec.containerRef, cwd: parsedDockerExec.cwd });
+      if (!parsedDockerExec.cwd) {
+        window.setTimeout(async () => {
+          try {
+            const currentContext = sessionFileContextByIdRef.current.get(sessionId);
+            logger.info("[TerminalLayer] Fetching container cwd", { sessionId, currentContext });
+            if (currentContext?.kind !== "docker") {
+              logger.warn("[TerminalLayer] Context is not docker", { currentContext });
+              return;
+            }
+            const containers = await terminalBackend.listDockerContainers(sessionId);
+            logger.info("[TerminalLayer] Containers fetched", { containersCount: containers?.length, containers });
+            if (!containers) return;
+            const container = containers.find((item) => matchDockerContainerForContext(item, currentContext));
+            logger.info("[TerminalLayer] Container matched", { container, currentContext });
+            if (!container?.id) {
+              logger.warn("[TerminalLayer] No container matched", { currentContext });
+              return;
+            }
+            const result = await terminalBackend.getDockerContainerPwd(sessionId, container.id);
+            logger.info("[TerminalLayer] Container pwd result", { result, containerId: container.id });
+            if (result.success && result.cwd) {
+              updateSessionFileContext(sessionId, (prev) => {
+                if (prev?.kind !== "docker" || prev.containerRef !== currentContext.containerRef) return prev;
+                return {
+                  ...prev,
+                  cwd: result.cwd,
+                  updatedAt: Date.now(),
+                };
+              });
+              logger.info("[TerminalLayer] Syncing SFTP to cwd", { cwd: result.cwd });
+              syncSftpLocationToSessionCwd(sessionId, result.cwd);
+            }
+          } catch (err) {
+            logger.error("[TerminalLayer] Error fetching container cwd", err);
+          }
+        }, 300);
+      }
+    } else if (isShellExitCommand(command)) {
+      const currentContext = sessionFileContextByIdRef.current.get(sessionId);
+      if (currentContext?.kind === "docker") {
+        updateSessionFileContext(sessionId, () => ({
+          kind: "host",
+          cwd: sessionCwdByIdRef.current.get(sessionId),
+          updatedAt: Date.now(),
+        }));
+        window.setTimeout(async () => {
+          try {
+            const result = await terminalBackend.getSessionPwd(sessionId);
+            if (result.success && result.cwd) {
+              handleSessionCwdResolved(sessionId, result.cwd, "command");
+            }
+          } catch {
+            // Best effort only.
+          }
+        }, 120);
+      }
+    }
+    onCommandExecuted?.(command, hostId, hostLabel, sessionId);
+  }, [handleSessionCwdResolved, onCommandExecuted, syncSftpLocationToSessionCwd, terminalBackend, updateSessionFileContext]);
 
   const handleToggleWorkspaceComposeBar = useCallback(() => {
     setIsComposeBarOpen(prev => !prev);
@@ -1424,6 +1547,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const getTerminalCwd = useCallback(async (): Promise<string | null> => {
     const sessionId = activeWorkspace?.focusedSessionId ?? activeSession?.id;
     if (!sessionId) return null;
+    const currentContext = sessionFileContextByIdRef.current.get(sessionId);
+    if (currentContext?.cwd) {
+      return currentContext.cwd;
+    }
     try {
       const result = await terminalBackend.getSessionPwd(sessionId);
       if (result.success && result.cwd) {
@@ -2399,6 +2526,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                               ? (sftpInitialLocationForTab.get(tabId) ?? null)
                               : null
                           }
+                          terminalFileContext={
+                            isVisibleSftpPanel
+                              ? ((sftpSourceSessionIdForTab.get(tabId) && sessionFileContextById.get(sftpSourceSessionIdForTab.get(tabId) as string)) ?? null)
+                              : null
+                          }
                           showWorkspaceHostHeader={isVisibleSftpPanel && !!activeWorkspace}
                           isVisible={isVisibleSftpPanel}
                           renderOverlays={isVisibleSftpPanel}
@@ -2622,6 +2754,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   onAddKnownHost={handleAddKnownHost}
                   onCommandExecuted={handleCommandExecuted}
                   onSessionCwdResolved={handleSessionCwdResolved}
+                  dockerFileContext={sessionFileContextById.get(session.id)?.kind === "docker" ? sessionFileContextById.get(session.id) as TerminalDockerFileContext : null}
                   onExpandToFocus={inActiveWorkspace && !isFocusMode ? workspaceFocusHandler : undefined}
                   onSplitHorizontal={onSplitSession && !session.groupId ? splitHorizontalHandler : undefined}
                   onSplitVertical={onSplitSession && !session.groupId ? splitVerticalHandler : undefined}

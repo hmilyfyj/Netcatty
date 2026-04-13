@@ -723,6 +723,9 @@ const api = {
       newPath,
     });
   },
+  dockerGetContainerPwd: async (sessionId, containerId) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:pwd", { sessionId, containerId });
+  },
   listSftp: async (sftpId, path, encoding) => {
     return ipcRenderer.invoke("netcatty:sftp:list", { sftpId, path, encoding });
   },

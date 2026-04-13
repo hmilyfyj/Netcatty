@@ -1998,6 +1998,20 @@ async function listDockerFilesForSession(_event, { sessionId, containerId, path:
   return parseDockerEntries(String(result.stdout));
 }
 
+async function getDockerContainerPwd(_event, { sessionId, containerId }) {
+  const script = 'pwd';
+  const command = buildDockerShellCommand(containerId, script, []);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 8000 });
+  if (result.code !== 0) {
+    return { success: false, error: normalizeDockerError(result.stderr || result.stdout, "无法获取容器工作目录").message };
+  }
+  const cwd = String(result.stdout).trim();
+  if (!cwd || !cwd.startsWith("/")) {
+    return { success: false, error: "无法获取有效的容器工作目录" };
+  }
+  return { success: true, cwd };
+}
+
 async function readDockerTextFile(_event, { sessionId, containerId, path: targetPath }) {
   const script = [
     'target="$1"',
@@ -3047,6 +3061,7 @@ function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:ssh:docker:createFile", createDockerFile);
   ipcMain.handle("netcatty:ssh:docker:delete", deleteDockerPath);
   ipcMain.handle("netcatty:ssh:docker:rename", renameDockerPath);
+  ipcMain.handle("netcatty:ssh:docker:pwd", getDockerContainerPwd);
   ipcMain.handle("netcatty:ssh:stats", getServerStats);
   ipcMain.handle("netcatty:key:generate", generateKeyPair);
   ipcMain.handle("netcatty:ssh:setEncoding", setSessionEncoding);

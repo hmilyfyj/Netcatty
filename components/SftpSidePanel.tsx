@@ -36,6 +36,10 @@ import {
 import { ScrollArea } from "./ui/scroll-area";
 import { toast } from "./ui/toast";
 import { DistroAvatar } from "./DistroAvatar";
+import {
+  matchDockerContainerForContext,
+  type TerminalFileContext,
+} from "../domain/terminalFileContext";
 
 import { SftpPaneView } from "./sftp/SftpPaneView";
 import { SftpOverlays } from "./sftp/SftpOverlays";
@@ -58,6 +62,7 @@ interface SftpSidePanelProps {
   activeHost: Host | null;
   sourceSessionId?: string | null;
   initialLocation?: { hostId: string; path: string } | null;
+  terminalFileContext?: TerminalFileContext | null;
   showWorkspaceHostHeader?: boolean;
   isVisible?: boolean;
   renderOverlays?: boolean;
@@ -89,6 +94,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   activeHost,
   sourceSessionId = null,
   initialLocation,
+  terminalFileContext = null,
   showWorkspaceHostHeader = false,
   isVisible = true,
   renderOverlays = true,
@@ -287,10 +293,16 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   // can show session-time overrides even during deferred host switches.
   const connectedHostObjRef = useRef<Host | null>(null);
   const lastAppliedInitialLocationKeyRef = useRef<string | null>(null);
+  const lastAppliedDockerContextKeyRef = useRef<string | null>(null);
   const handledPendingUploadIdRef = useRef<string | null>(null);
   // Maps tab IDs to the connectionKey used to create them, so we can
   // correctly identify tabs when the same host ID has different overrides.
   const tabConnectionKeyMapRef = useRef<Map<string, string>>(new Map());
+  // Tracks whether the user manually switched away from a Docker tab.
+  // When true, the docker-following effect should not auto-switch back.
+  const userManuallySwitchedFromDockerRef = useRef(false);
+  // Tracks the previous docker context to detect when user exits container.
+  const prevDockerContextRef = useRef<typeof terminalDockerContext>(null);
 
   const remoteConnectionKey = useMemo(() => {
     if (!activeHost || activeHost.protocol === "local" || activeHost.id?.startsWith("local-")) {
@@ -306,6 +318,9 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     );
     return `${hostKey}::${sourceSessionId ?? "standalone"}`;
   }, [activeHost, sourceSessionId]);
+  const terminalDockerContext = sourceSessionId && terminalFileContext?.kind === "docker"
+    ? terminalFileContext
+    : null;
 
   // NOTE: We intentionally do NOT reset lastAppliedInitialLocationKeyRef on
   // visibility changes. When the user switches terminal tabs, the panel
@@ -336,6 +351,9 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     if (!activeHost) return;
 
     const s = sftpRef.current;
+    if (terminalDockerContext && sourceSessionId && activeHost.protocol === "ssh") {
+      return;
+    }
 
     // Serial terminals don't support SFTP — disconnect any existing
     // connection (remote or local) so the panel doesn't remain bound to
@@ -387,18 +405,8 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     const connectionKey = remoteConnectionKey;
     if (!connectionKey) return;
     const currentConn = s.leftPane.connection;
-
-    // When the user is browsing a Docker container opened from the current
-    // terminal session, keep that container tab active instead of auto-switching
-    // back to the host SFTP tab after transient UI like the text editor closes.
-    if (
-      currentConn?.backendType === "docker-container"
-      && currentConn.hostId === activeHost.id
-      && currentConn.sourceSessionId === sourceSessionId
-    ) {
-      connectedKeyRef.current = connectionKey;
-      connectedHostObjRef.current = activeHost;
-      return;
+    if (currentConn?.backendType === "docker-container" && currentConn.sourceSessionId === sourceSessionId) {
+      connectedKeyRef.current = null;
     }
 
     if (connectedKeyRef.current === connectionKey) return;
@@ -446,12 +454,160 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
         tabConnectionKeyMapRef.current.set(tabId, connectionKey);
       },
     });
-  }, [activeHost, hasActiveWork, remoteConnectionKey, sourceSessionId]); // Re-evaluate when work finishes so deferred switch can proceed
+  }, [activeHost, hasActiveWork, remoteConnectionKey, sourceSessionId, terminalDockerContext]); // Re-evaluate when work finishes so deferred switch can proceed
+
+  useEffect(() => {
+    if (!activeHost || !sourceSessionId || !terminalDockerContext) return;
+    if (activeHost.protocol !== "ssh") return;
+    if (hasActiveWork) return;
+
+    // If user manually switched away from Docker tab, don't auto-switch back.
+    // The ref will be reset when terminalDockerContext changes (see below).
+    if (userManuallySwitchedFromDockerRef.current) {
+      return;
+    }
+
+    const s = sftpRef.current;
+    const activeConnection = s.leftPane.connection;
+    const dockerContextKey = [
+      sourceSessionId,
+      terminalDockerContext.containerId ?? "",
+      terminalDockerContext.containerName ?? "",
+      terminalDockerContext.containerRef,
+      terminalDockerContext.cwd ?? "",
+    ].join("::");
+
+    const currentMatches = activeConnection
+      && activeConnection.backendType === "docker-container"
+      && activeConnection.sourceSessionId === sourceSessionId
+      && matchDockerContainerForContext(
+        {
+          id: activeConnection.containerId || "",
+          name: activeConnection.containerName || "",
+          status: "running",
+          workingDir: activeConnection.containerWorkingDir,
+        },
+        terminalDockerContext,
+      );
+
+    if (currentMatches && activeConnection.status === "connected") {
+      if (
+        terminalDockerContext.cwd
+        && activeConnection.currentPath !== terminalDockerContext.cwd
+        && lastAppliedDockerContextKeyRef.current !== dockerContextKey
+      ) {
+        lastAppliedDockerContextKeyRef.current = dockerContextKey;
+        void s.navigateTo("left", terminalDockerContext.cwd);
+      }
+      return;
+    }
+
+    const existingDockerTab = s.leftTabs.tabs.find((tab) => {
+      const connection = tab.connection;
+      if (!connection || connection.backendType !== "docker-container") return false;
+      if (connection.sourceSessionId !== sourceSessionId) return false;
+      return matchDockerContainerForContext(
+        {
+          id: connection.containerId || "",
+          name: connection.containerName || "",
+          status: "running",
+          workingDir: connection.containerWorkingDir,
+        },
+        terminalDockerContext,
+      );
+    });
+
+    if (existingDockerTab) {
+      if (s.leftTabs.activeTabId !== existingDockerTab.id) {
+        s.selectTab("left", existingDockerTab.id);
+      }
+      return;
+    }
+
+    let cancelled = false;
+    const run = async () => {
+      try {
+        const support = await s.checkDockerForSession(sourceSessionId);
+        if (!support.supported || cancelled) return;
+
+        const containers = await s.listDockerContainers(sourceSessionId);
+        if (cancelled) return;
+
+        setDockerContainers(containers);
+        const container = containers.find((item) => matchDockerContainerForContext(item, terminalDockerContext));
+        if (!container) return;
+
+        await s.connectDockerContainer(
+          "left",
+          {
+            host: activeHost,
+            sourceSessionId,
+            container,
+          },
+          {
+            forceNewTab: !!(activeConnection && activeConnection.status === "connected"),
+          },
+        );
+      } catch (error) {
+        logger.warn("[SftpSidePanel] Failed to follow terminal Docker context", error);
+      }
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeHost,
+    hasActiveWork,
+    sourceSessionId,
+    terminalDockerContext,
+    sftp.leftPane.connection,
+    sftp.leftTabs.activeTabId,
+    sftp.leftTabs.tabs,
+    sftp,
+  ]);
 
   // Clear the remembered connection key when the pane disconnects or the
   // session is lost, so re-opening SFTP for the same terminal reconnects.
   // Also reset the file-watch counter — watches are bound to the SFTP session,
   // so they stop when the session disconnects.
+  // Also reset the manual-switch flag so a new Docker context can be followed.
+  // Also detect when user exits container (docker context becomes null) and
+  // auto-switch to host tab.
+  useEffect(() => {
+    const prevDockerContext = prevDockerContextRef.current;
+    prevDockerContextRef.current = terminalDockerContext;
+
+    if (!terminalDockerContext) {
+      lastAppliedDockerContextKeyRef.current = null;
+    }
+
+    // Reset manual switch flag when Docker context changes,
+    // allowing the new context to be auto-followed.
+    userManuallySwitchedFromDockerRef.current = false;
+
+    // Detect container exit: previous context was docker, now it's null.
+    // Auto-switch to host tab (same logic as handleReturnToHostFiles).
+    if (prevDockerContext && !terminalDockerContext && activeHost && sourceSessionId) {
+      const s = sftpRef.current;
+      const existingHostTab = s.leftTabs.tabs.find((tab) =>
+        tab.connection?.backendType === "sftp"
+        && tab.connection.hostId === activeHost.id
+        && (tab.connection.sourceSessionId === sourceSessionId
+          || tab.connection.sourceSessionId === undefined
+          || sourceSessionId === null),
+      );
+      if (existingHostTab) {
+        logger.info("[SftpSidePanel] Auto-switching to host tab after container exit", {
+          hostTabId: existingHostTab.id,
+          hostId: activeHost.id,
+        });
+        s.selectTab("left", existingHostTab.id);
+      }
+    }
+  }, [terminalDockerContext, activeHost, sourceSessionId]);
+
   useEffect(() => {
     const connection = sftp.leftPane.connection;
     if (!connection || connection.status === "error" || connection.status === "disconnected") {
@@ -679,16 +835,40 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   }, [activeHost, dockerContainers, sftp, sourceSessionId]);
 
   const handleReturnToHostFiles = useCallback(() => {
-    if (!activeHost) return;
+    logger.info("[SftpSidePanel] handleReturnToHostFiles called", {
+      activeHost: activeHost?.id,
+      sourceSessionId,
+      tabsCount: sftp.leftTabs.tabs.length,
+      currentActiveTabId: sftp.leftTabs.activeTabId,
+      tabs: sftp.leftTabs.tabs.map(t => ({
+        id: t.id,
+        backendType: t.connection?.backendType,
+        hostId: t.connection?.hostId,
+        sourceSessionId: t.connection?.sourceSessionId,
+      })),
+    });
+    if (!activeHost) {
+      logger.warn("[SftpSidePanel] handleReturnToHostFiles: no activeHost, returning early");
+      return;
+    }
+    // Mark that user manually switched away from Docker tab
+    // so the docker-following effect won't auto-switch back.
+    userManuallySwitchedFromDockerRef.current = true;
     const existingHostTab = sftp.leftTabs.tabs.find((tab) =>
       tab.connection?.backendType === "sftp"
       && tab.connection.hostId === activeHost.id
-      && tab.connection.sourceSessionId === sourceSessionId,
+      && (tab.connection.sourceSessionId === sourceSessionId
+        || tab.connection.sourceSessionId === undefined
+        || sourceSessionId === null),
     );
+    logger.info("[SftpSidePanel] handleReturnToHostFiles: existingHostTab found?", !!existingHostTab, existingHostTab?.id);
     if (existingHostTab) {
+      logger.info("[SftpSidePanel] handleReturnToHostFiles: calling selectTab with", existingHostTab.id);
       sftp.selectTab("left", existingHostTab.id);
+      logger.info("[SftpSidePanel] handleReturnToHostFiles: selectTab called, new activeTabId should be", existingHostTab.id);
       return;
     }
+    logger.info("[SftpSidePanel] handleReturnToHostFiles: creating new connection");
     void sftp.connect("left", activeHost, { forceNewTab: true, sourceSessionId });
   }, [activeHost, sftp, sourceSessionId]);
 
@@ -931,7 +1111,15 @@ const sidePanelAreEqual = (prev: SftpSidePanelProps, next: SftpSidePanelProps): 
   prev.setEditorWordWrap === next.setEditorWordWrap &&
   prev.onGetTerminalCwd === next.onGetTerminalCwd &&
   prev.initialLocation?.hostId === next.initialLocation?.hostId &&
-  prev.initialLocation?.path === next.initialLocation?.path;
+  prev.initialLocation?.path === next.initialLocation?.path &&
+  prev.terminalFileContext?.kind === next.terminalFileContext?.kind &&
+  prev.terminalFileContext?.cwd === next.terminalFileContext?.cwd &&
+  prev.terminalFileContext?.updatedAt === next.terminalFileContext?.updatedAt &&
+  (prev.terminalFileContext?.kind !== "docker" || next.terminalFileContext?.kind !== "docker" || (
+    prev.terminalFileContext.containerRef === next.terminalFileContext.containerRef
+    && prev.terminalFileContext.containerId === next.terminalFileContext.containerId
+    && prev.terminalFileContext.containerName === next.terminalFileContext.containerName
+  ));
 
 export const SftpSidePanel = memo(SftpSidePanelInner, sidePanelAreEqual);
 SftpSidePanel.displayName = "SftpSidePanel";

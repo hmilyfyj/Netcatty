@@ -29,6 +29,7 @@ import {
   resolveHostTerminalThemeId,
 } from "../domain/terminalAppearance";
 import { resolveHostAuth } from "../domain/sshAuth";
+import type { TerminalDockerFileContext } from "../domain/terminalFileContext";
 import { useTerminalBackend } from "../application/state/useTerminalBackend";
 import KnownHostConfirmDialog, { HostKeyInfo } from "./KnownHostConfirmDialog";
 // SFTPModal removed - SFTP is now handled by SftpSidePanel in TerminalLayer
@@ -56,6 +57,9 @@ import { ServerStatsBar } from "./terminal/ServerStatsBar";
 import { isServerStatsSupportedHost } from "./terminal/serverStatsSupport";
 import { extractDropEntries, getPathForFile, DropEntry } from "../lib/sftpFileUtils";
 import { useTerminalAutocomplete, AutocompletePopup } from "./terminal/autocomplete";
+import { detectPrompt } from "./terminal/autocomplete/promptDetector";
+import { extractPosixCwdFromPrompt } from "./terminal/autocomplete/useTerminalAutocomplete";
+import { resolveTerminalPathCandidate } from "../domain/terminalFileContext";
 
 /**
  * Extract unique root paths from drop entries for local terminal path insertion.
@@ -177,10 +181,10 @@ interface TerminalProps {
     sessionId: string,
     executor: ((command: string, noAutoRun?: boolean) => void) | null,
   ) => void;
-  // Session log configuration for real-time streaming
   sessionLog?: { enabled: boolean; directory: string; format: string };
   showServerStatsInHeader?: boolean;
   serverStatsOverride?: ServerStats | null;
+  dockerFileContext?: TerminalDockerFileContext | null;
 }
 
 const TerminalComponent: React.FC<TerminalProps> = ({
@@ -236,6 +240,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   sessionLog,
   showServerStatsInHeader = true,
   serverStatsOverride = null,
+  dockerFileContext = null,
 }) => {
   // Timeout for connection - increased to 120s to allow time for keyboard-interactive (2FA) authentication
   const CONNECTION_TIMEOUT = 120000;
@@ -503,20 +508,71 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     onSessionCwdResolved?.(sessionId, cwd, reason);
   }, [onSessionCwdResolved, sessionId]);
 
+  const resolveVisibleTerminalCwd = useCallback((preferRecentOutput: boolean): string | null => {
+    const term = termRef.current;
+    if (!term) return null;
+
+    const buffer = term.buffer.active;
+    const cursorAbsoluteY = buffer.baseY + buffer.cursorY;
+
+    const normalizeCandidate = (candidate: string | undefined) =>
+      resolveTerminalPathCandidate(candidate, knownCwdRef.current);
+
+    const readRecentPwdOutput = (): string | null => {
+      for (let row = cursorAbsoluteY - 1, inspected = 0; row >= 0 && inspected < 8; row -= 1, inspected += 1) {
+        const line = buffer.getLine(row);
+        if (!line) continue;
+
+        let text = line.translateToString(true);
+        let startRow = row;
+        while (startRow > 0) {
+          const previousLine = buffer.getLine(startRow - 1);
+          if (!previousLine?.isWrapped) break;
+          startRow -= 1;
+          text = `${previousLine.translateToString(false)}${text}`;
+        }
+
+        const trimmed = text.trim();
+        if (!trimmed) continue;
+
+        const resolved = normalizeCandidate(trimmed);
+        if (resolved) return resolved;
+      }
+      return null;
+    };
+
+    if (preferRecentOutput) {
+      const pwdOutputPath = readRecentPwdOutput();
+      if (pwdOutputPath) return pwdOutputPath;
+    }
+
+    const prompt = detectPrompt(term);
+    if (!prompt.isAtPrompt) return null;
+
+    return normalizeCandidate(extractPosixCwdFromPrompt(prompt.promptText));
+  }, []);
+
   const refreshRemoteCwd = useCallback(async (reason: "initial" | "command") => {
     if (host.protocol === "local" || host.protocol === "serial" || host.protocol === "telnet") {
       return;
     }
     if (!sessionRef.current) return;
     try {
-      const result = await terminalBackend.getSessionPwd(sessionRef.current);
-      if (result.success && result.cwd) {
-        reportResolvedCwd(result.cwd, reason);
+      if (dockerFileContext?.kind === "docker" && dockerFileContext.containerId) {
+        const result = await terminalBackend.getDockerContainerPwd(sessionRef.current, dockerFileContext.containerId);
+        if (result.success && result.cwd) {
+          reportResolvedCwd(result.cwd, reason);
+        }
+      } else {
+        const result = await terminalBackend.getSessionPwd(sessionRef.current);
+        if (result.success && result.cwd) {
+          reportResolvedCwd(result.cwd, reason);
+        }
       }
     } catch {
       // Best effort only.
     }
-  }, [host.protocol, reportResolvedCwd, terminalBackend]);
+  }, [host.protocol, reportResolvedCwd, terminalBackend, dockerFileContext]);
 
   const maybeRefreshCwdAfterCommand = useCallback((command: string) => {
     if (
@@ -529,14 +585,39 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     }
     if (cwdRefreshTimerRef.current !== null) {
       window.clearTimeout(cwdRefreshTimerRef.current);
+      cwdRefreshTimerRef.current = null;
     }
+
+    const prefersRecentOutput = /^pwd(?=$|\s|;|&&|\|\|)/.test(command);
+    const isCdCommand = /^cd(?=$|\s|;|&&|\|\|)/.test(command);
+
+    const attemptResolveCwd = (attempt: number, maxAttempts: number) => {
+      const visibleCwd = resolveVisibleTerminalCwd(prefersRecentOutput);
+      if (visibleCwd) {
+        reportResolvedCwd(visibleCwd, "command");
+        return;
+      }
+
+      if (attempt < maxAttempts) {
+        cwdRefreshTimerRef.current = window.setTimeout(() => {
+          cwdRefreshTimerRef.current = null;
+          attemptResolveCwd(attempt + 1, maxAttempts);
+        }, isCdCommand ? 200 : 150);
+      } else {
+        void refreshRemoteCwd("command");
+      }
+    };
+
+    const initialDelay = isCdCommand ? 350 : 120;
     cwdRefreshTimerRef.current = window.setTimeout(() => {
-      void refreshRemoteCwd("command");
-    }, 120);
-  }, [host.protocol, refreshRemoteCwd]);
+      cwdRefreshTimerRef.current = null;
+      attemptResolveCwd(1, isCdCommand ? 4 : 2);
+    }, initialDelay);
+  }, [host.protocol, refreshRemoteCwd, reportResolvedCwd, resolveVisibleTerminalCwd]);
 
   const handleTrackedCommandExecuted = useCallback((command: string) => {
     if (!command) return;
+    console.log("[Terminal] handleTrackedCommandExecuted", { command, hostId: host.id, sessionId });
     onCommandExecuted?.(command, host.id, host.label, sessionId);
     maybeRefreshCwdAfterCommand(command);
   }, [host.id, host.label, maybeRefreshCwdAfterCommand, onCommandExecuted, sessionId]);

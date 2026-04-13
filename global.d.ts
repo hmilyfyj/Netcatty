@@ -405,6 +405,7 @@ declare global {
     dockerCreateFile?(sessionId: string, containerId: string, path: string): Promise<void>;
     dockerDeletePath?(sessionId: string, containerId: string, path: string): Promise<void>;
     dockerRenamePath?(sessionId: string, containerId: string, oldPath: string, newPath: string): Promise<void>;
+    dockerGetContainerPwd?(sessionId: string, containerId: string): Promise<{ success: boolean; cwd?: string; error?: string }>;
     listSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<RemoteFile[]>;
     readSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<string>;
     readSftpBinary?(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<ArrayBuffer>;
