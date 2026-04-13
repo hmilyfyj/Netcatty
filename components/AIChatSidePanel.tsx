@@ -490,8 +490,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
         applyUserSkillsStatus(result);
       })
       .catch(() => {
-        if (cancelled) return;
-        applyUserSkillsStatus(null);
+        // Keep the last known options and selections when refresh fails.
       });
 
     return () => {
