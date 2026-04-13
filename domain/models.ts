@@ -671,6 +671,10 @@ export interface TerminalSession {
   hostname: string;
   status: 'connecting' | 'connected' | 'disconnected';
   workspaceId?: string;
+  groupId?: string; // Remote host console group ID
+  groupConsoleIndex?: number; // Default sub-tab ordering/index for remote groups
+  transportId?: string; // Reserved for shared-transport phase
+  channelId?: string; // Reserved for shared-transport phase
   startupCommand?: string; // Command to run after connection (for snippet runner)
   noAutoRun?: boolean;     // If true, paste command without auto-executing
   // Connection-time protocol overrides (used instead of looking up from hosts)
@@ -685,6 +689,19 @@ export interface TerminalSession {
   localShellArgs?: string[]; // Shell args for local terminals (from discovery)
   localShellName?: string;   // Display name for local shell (e.g., "Zsh", "Ubuntu (WSL)")
   localShellIcon?: string;   // Icon identifier for local shell (e.g., "zsh", "ubuntu")
+}
+
+export interface TerminalGroup {
+  id: string;
+  title: string;
+  hostId: string;
+  hostLabel: string;
+  hostname: string;
+  username: string;
+  protocol?: HostProtocol;
+  activeSessionId?: string;
+  sessionIds: string[];
+  nextConsoleIndex: number;
 }
 
 export interface RemoteFile {
@@ -739,15 +756,41 @@ export interface SftpFileEntry {
   hidden?: boolean; // Windows hidden attribute (only set for local Windows filesystem)
 }
 
+export type SftpBackendType = 'local' | 'sftp' | 'docker-container';
+
+export interface DockerContainerSummary {
+  id: string;
+  name: string;
+  status: string;
+  workingDir?: string;
+}
+
+export interface DockerSessionSupportResult {
+  supported: boolean;
+  reason?:
+    | 'session-unavailable'
+    | 'unsupported-session'
+    | 'docker-missing'
+    | 'permission-denied'
+    | 'docker-unavailable'
+    | 'unknown';
+  error?: string;
+}
+
 export interface SftpConnection {
   id: string;
   hostId: string;
   hostLabel: string;
   isLocal: boolean;
+  backendType: SftpBackendType;
   status: 'connecting' | 'connected' | 'disconnected' | 'error';
   error?: string;
   currentPath: string;
   homeDir?: string;
+  sourceSessionId?: string;
+  containerId?: string;
+  containerName?: string;
+  containerWorkingDir?: string;
 }
 
 export type TransferStatus = 'pending' | 'transferring' | 'completed' | 'failed' | 'cancelled';

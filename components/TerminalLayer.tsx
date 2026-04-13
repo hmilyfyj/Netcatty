@@ -1,4 +1,4 @@
-import { Circle, FolderTree, LayoutGrid, MessageSquare, PanelLeft, PanelRight, Palette, Server, X, Zap } from 'lucide-react';
+import { Circle, FolderTree, LayoutGrid, MessageSquare, PanelLeft, PanelRight, Palette, Plus, Server, X, Zap } from 'lucide-react';
 import React, { createContext, memo, startTransition, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useActiveTabId } from '../application/state/activeTabStore';
 import {
@@ -32,13 +32,15 @@ import { useStoredNumber } from '../application/state/useStoredNumber';
 import { STORAGE_KEY_SIDE_PANEL_WIDTH } from '../infrastructure/config/storageKeys';
 import { buildCacheKey } from '../application/state/sftp/sharedRemoteHostCache';
 import type { DropEntry } from '../lib/sftpFileUtils';
-import { GroupConfig, Host, Identity, KnownHost, SSHKey, Snippet, TerminalSession, TerminalTheme, Workspace, WorkspaceNode } from '../types';
+import { GroupConfig, Host, Identity, KnownHost, SSHKey, Snippet, TerminalGroup, TerminalSession, TerminalTheme, Workspace, WorkspaceNode } from '../types';
 import { resolveGroupDefaults, applyGroupDefaults } from '../domain/groupConfig';
 import { DistroAvatar } from './DistroAvatar';
 import Terminal from './Terminal';
 import { SftpSidePanel } from './SftpSidePanel';
 import { ScriptsSidePanel } from './ScriptsSidePanel';
 import { ThemeSidePanel } from './terminal/ThemeSidePanel';
+import { useServerStats } from './terminal/hooks/useServerStats';
+import { isServerStatsSupportedHost } from './terminal/serverStatsSupport';
 import { AIChatSidePanel } from './AIChatSidePanel';
 import { cleanupOrphanedAISessions, useAIState } from '../application/state/useAIState';
 import { TerminalComposeBar } from './terminal/TerminalComposeBar';
@@ -47,6 +49,13 @@ import { useCustomThemes } from '../application/state/customThemeStore';
 import { Button } from './ui/button';
 import { ScrollArea } from './ui/scroll-area';
 import { setupMcpApprovalBridge } from '../infrastructure/ai/shared/approvalGate';
+import {
+  isShellExitCommand,
+  parseDockerExecCommand,
+  matchDockerContainerForContext,
+  type TerminalFileContext,
+  type TerminalDockerFileContext,
+} from '../domain/terminalFileContext';
 
 type SidePanelTab = 'sftp' | 'scripts' | 'theme' | 'ai';
 
@@ -349,6 +358,7 @@ interface TerminalLayerProps {
   snippets: Snippet[];
   snippetPackages: string[];
   sessions: TerminalSession[];
+  groups: TerminalGroup[];
   workspaces: Workspace[];
   knownHosts?: KnownHost[];
   draggingSessionId: string | null;
@@ -365,7 +375,14 @@ interface TerminalLayerProps {
   onUpdateTerminalFontSize?: (fontSize: number) => void;
   onUpdateTerminalFontWeight?: (fontWeight: number) => void;
   onCloseSession: (sessionId: string, e?: React.MouseEvent) => void;
+  onCreateConsoleInGroup?: (groupId: string) => string | null;
+  onSelectConsoleInGroup?: (groupId: string, sessionId: string) => void;
+  onCloseConsoleInGroup?: (groupId: string, sessionId: string) => void;
   onUpdateSessionStatus: (sessionId: string, status: TerminalSession['status']) => void;
+  onUpdateSessionConnectionMeta?: (
+    sessionId: string,
+    meta: Pick<TerminalSession, 'transportId' | 'channelId'>,
+  ) => void;
   onUpdateHostDistro: (hostId: string, distro: string) => void;
   onUpdateHost: (host: Host) => void;
   onAddKnownHost?: (knownHost: KnownHost) => void;
@@ -405,6 +422,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   snippets,
   snippetPackages,
   sessions,
+  groups,
   workspaces,
   knownHosts = [],
   draggingSessionId,
@@ -421,7 +439,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   onUpdateTerminalFontSize,
   onUpdateTerminalFontWeight,
   onCloseSession,
+  onCreateConsoleInGroup,
+  onSelectConsoleInGroup,
+  onCloseConsoleInGroup,
   onUpdateSessionStatus,
+  onUpdateSessionConnectionMeta,
   onUpdateHostDistro,
   onUpdateHost,
   onAddKnownHost,
@@ -477,7 +499,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       const host = hostsRef.current.find(h => h.id === session.hostId);
 
       // Determine the tab ID (workspace or solo session)
-      const tabId = session.workspaceId || sessionId;
+      const tabId = session.workspaceId || session.groupId || sessionId;
 
       // Only open if the sidebar is not already open for this tab
       if (sidePanelOpenTabsRef.current.has(tabId)) return;
@@ -496,7 +518,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
             username: session.username,
             port: session.port ?? 22,
             protocol: proto,
-            label: session.label || session.hostname,
+            label: session.hostLabel || session.hostname,
           } as Host;
 
       setSidePanelOpenTabs(prev => {
@@ -519,9 +541,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (evt.reason === "exited") {
       onCloseSession(sessionId);
     } else {
+      onUpdateSessionConnectionMeta?.(sessionId, {
+        transportId: undefined,
+        channelId: undefined,
+      });
       onUpdateSessionStatus(sessionId, 'disconnected');
     }
-  }, [onUpdateSessionStatus, onCloseSession]);
+  }, [onCloseSession, onUpdateSessionConnectionMeta, onUpdateSessionStatus]);
 
   const handleOsDetected = useCallback((hostId: string, distro: string) => {
     onUpdateHostDistro(hostId, distro);
@@ -535,16 +561,12 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     onAddKnownHost?.(knownHost);
   }, [onAddKnownHost]);
 
-  const handleCommandExecuted = useCallback((command: string, hostId: string, hostLabel: string, sessionId: string) => {
-    onCommandExecuted?.(command, hostId, hostLabel, sessionId);
-  }, [onCommandExecuted]);
+  // Terminal backend for broadcast writes
+  const terminalBackend = useTerminalBackend();
 
   const handleTerminalDataCapture = useCallback((sessionId: string, data: string) => {
     onTerminalDataCapture?.(sessionId, data);
   }, [onTerminalDataCapture]);
-
-  // Terminal backend for broadcast writes
-  const terminalBackend = useTerminalBackend();
   const snippetExecutorsRef = useRef<Map<string, SnippetExecutor>>(new Map());
 
   const handleSnippetExecutorChange = useCallback((sessionId: string, executor: SnippetExecutor | null) => {
@@ -578,7 +600,28 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   } | null>(null);
 
   const activeWorkspace = useMemo(() => workspaces.find(w => w.id === activeTabId), [workspaces, activeTabId]);
-  const activeSession = useMemo(() => sessions.find(s => s.id === activeTabId), [sessions, activeTabId]);
+  const activeGroup = useMemo(() => groups.find(group => group.id === activeTabId), [groups, activeTabId]);
+  const activeGroupSessions = useMemo(
+    () => activeGroup
+      ? sessions
+          .filter((session) => session.groupId === activeGroup.id)
+          .sort((a, b) => (a.groupConsoleIndex ?? 0) - (b.groupConsoleIndex ?? 0))
+      : [],
+    [activeGroup, sessions],
+  );
+  const activeSession = useMemo(() => {
+    if (activeGroup) {
+      const preferred = activeGroup.activeSessionId
+        ? activeGroupSessions.find((session) => session.id === activeGroup.activeSessionId)
+        : undefined;
+      return preferred ?? activeGroupSessions[0];
+    }
+    return sessions.find(s => s.id === activeTabId);
+  }, [activeGroup, activeGroupSessions, sessions, activeTabId]);
+  const groupStatsSourceSession = useMemo(() => {
+    if (!activeGroup || activeGroupSessions.length === 0) return null;
+    return activeGroupSessions.find((session) => session.status === 'connected') ?? activeGroupSessions[0];
+  }, [activeGroup, activeGroupSessions]);
 
   // Handle broadcast input - write to all other sessions in the same workspace
   const handleBroadcastInput = useCallback((data: string, sourceSessionId: string) => {
@@ -603,6 +646,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   activeWorkspaceRef.current = activeWorkspace;
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+  const groupsRef = useRef(groups);
+  groupsRef.current = groups;
   const workspacesRef = useRef(workspaces);
   workspacesRef.current = workspaces;
   const hostsRef = useRef(hosts);
@@ -634,14 +679,194 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   // The host to pass to the SFTP panel - stored when the user opens SFTP
   const [sftpHostForTab, setSftpHostForTab] = useState<Map<string, Host>>(new Map());
+  const [sftpSourceSessionIdForTab, setSftpSourceSessionIdForTab] = useState<Map<string, string>>(new Map());
   const [sftpInitialLocationForTab, setSftpInitialLocationForTab] = useState<
     Map<string, { hostId: string; path: string }>
   >(new Map());
+  const [sessionCwdById, setSessionCwdById] = useState<Map<string, string>>(new Map());
+  const [sessionFileContextById, setSessionFileContextById] = useState<Map<string, TerminalFileContext>>(new Map());
   const [sftpPendingUploadsForTab, setSftpPendingUploadsForTab] = useState<
     Map<string, PendingSftpUpload>
   >(new Map());
   const sftpHostForTabRef = useRef(sftpHostForTab);
   sftpHostForTabRef.current = sftpHostForTab;
+  const sessionCwdByIdRef = useRef(sessionCwdById);
+  sessionCwdByIdRef.current = sessionCwdById;
+  const sessionFileContextByIdRef = useRef(sessionFileContextById);
+  sessionFileContextByIdRef.current = sessionFileContextById;
+
+  useEffect(() => {
+    const validSessionIds = new Set(sessions.map((session) => session.id));
+    setSessionCwdById((prev) => {
+      let changed = false;
+      const next = new Map<string, string>();
+      prev.forEach((cwd, sessionId) => {
+        if (validSessionIds.has(sessionId)) {
+          next.set(sessionId, cwd);
+          return;
+        }
+        changed = true;
+      });
+      return changed ? next : prev;
+    });
+    setSessionFileContextById((prev) => {
+      let changed = false;
+      const next = new Map<string, TerminalFileContext>();
+      prev.forEach((context, sessionId) => {
+        if (validSessionIds.has(sessionId)) {
+          next.set(sessionId, context);
+          return;
+        }
+        changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [sessions]);
+
+  const isSessionDrivingTab = useCallback((session: TerminalSession, tabId: string): boolean => {
+    if (session.workspaceId === tabId) {
+      return workspacesRef.current.find((workspace) => workspace.id === tabId)?.focusedSessionId === session.id;
+    }
+    if (session.groupId === tabId) {
+      const group = groupsRef.current.find((entry) => entry.id === tabId);
+      if (!group) return false;
+      if (group.activeSessionId) {
+        return group.activeSessionId === session.id;
+      }
+      const groupSessions = sessionsRef.current
+        .filter((entry) => entry.groupId === tabId)
+        .sort((a, b) => (a.groupConsoleIndex ?? 0) - (b.groupConsoleIndex ?? 0));
+      return groupSessions[0]?.id === session.id;
+    }
+    return tabId === session.id;
+  }, []);
+
+  const syncSftpLocationToSessionCwd = useCallback((sessionId: string, cwd: string) => {
+    const session = sessionsRef.current.find((entry) => entry.id === sessionId);
+    if (!session || !cwd) return;
+
+    const tabId = session.workspaceId || session.groupId || session.id;
+    if (!isSessionDrivingTab(session, tabId)) return;
+
+    const hostId = session.hostId || session.id;
+    setSftpInitialLocationForTab((prev) => {
+      const current = prev.get(tabId);
+      if (current?.hostId === hostId && current.path === cwd) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.set(tabId, { hostId, path: cwd });
+      return next;
+    });
+  }, [isSessionDrivingTab]);
+
+  const updateSessionFileContext = useCallback((
+    sessionId: string,
+    updater: (current: TerminalFileContext | undefined) => TerminalFileContext,
+  ) => {
+    setSessionFileContextById((prev) => {
+      const current = prev.get(sessionId);
+      const nextContext = updater(current);
+      if (current && JSON.stringify(current) === JSON.stringify(nextContext)) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.set(sessionId, nextContext);
+      return next;
+    });
+  }, []);
+
+  const handleSessionCwdResolved = useCallback((
+    sessionId: string,
+    cwd: string,
+    _reason: "initial" | "command" | "osc",
+  ) => {
+    setSessionCwdById((prev) => {
+      const current = prev.get(sessionId);
+      if (current === cwd) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.set(sessionId, cwd);
+      return next;
+    });
+    updateSessionFileContext(sessionId, (current) => {
+      const updatedAt = Date.now();
+      if (current?.kind === "docker") {
+        return {
+          ...current,
+          cwd,
+          updatedAt,
+        };
+      }
+      return {
+        kind: "host",
+        cwd,
+        updatedAt,
+      };
+    });
+    syncSftpLocationToSessionCwd(sessionId, cwd);
+  }, [syncSftpLocationToSessionCwd, updateSessionFileContext]);
+
+  const handleCommandExecuted = useCallback((command: string, hostId: string, hostLabel: string, sessionId: string) => {
+    const parsedDockerExec = parseDockerExecCommand(command);
+    if (parsedDockerExec) {
+      updateSessionFileContext(sessionId, (current) => ({
+        kind: "docker",
+        containerRef: parsedDockerExec.containerRef,
+        containerId: current?.kind === "docker" && current.containerRef === parsedDockerExec.containerRef ? current.containerId : undefined,
+        containerName: current?.kind === "docker" && current.containerRef === parsedDockerExec.containerRef ? current.containerName : undefined,
+        cwd: parsedDockerExec.cwd,
+        updatedAt: Date.now(),
+      }));
+      if (!parsedDockerExec.cwd) {
+        window.setTimeout(async () => {
+          try {
+            const currentContext = sessionFileContextByIdRef.current.get(sessionId);
+            if (currentContext?.kind !== "docker") return;
+            const containers = await terminalBackend.listDockerContainers(sessionId);
+            if (!containers) return;
+            const container = containers.find((item) => matchDockerContainerForContext(item, currentContext));
+            if (!container?.id) return;
+            const result = await terminalBackend.getDockerContainerPwd(sessionId, container.id);
+            if (result.success && result.cwd) {
+              updateSessionFileContext(sessionId, (prev) => {
+                if (prev?.kind !== "docker" || prev.containerRef !== currentContext.containerRef) return prev;
+                return {
+                  ...prev,
+                  cwd: result.cwd,
+                  updatedAt: Date.now(),
+                };
+              });
+              syncSftpLocationToSessionCwd(sessionId, result.cwd);
+            }
+          } catch {
+            // Best effort only.
+          }
+        }, 300);
+      }
+    } else if (isShellExitCommand(command)) {
+      const currentContext = sessionFileContextByIdRef.current.get(sessionId);
+      if (currentContext?.kind === "docker") {
+        updateSessionFileContext(sessionId, () => ({
+          kind: "host",
+          cwd: sessionCwdByIdRef.current.get(sessionId),
+          updatedAt: Date.now(),
+        }));
+        window.setTimeout(async () => {
+          try {
+            const result = await terminalBackend.getSessionPwd(sessionId);
+            if (result.success && result.cwd) {
+              handleSessionCwdResolved(sessionId, result.cwd, "command");
+            }
+          } catch {
+            // Best effort only.
+          }
+        }, 120);
+      }
+    }
+    onCommandExecuted?.(command, hostId, hostLabel, sessionId);
+  }, [handleSessionCwdResolved, onCommandExecuted, syncSftpLocationToSessionCwd, terminalBackend, updateSessionFileContext]);
 
   const handleToggleWorkspaceComposeBar = useCallback(() => {
     setIsComposeBarOpen(prev => !prev);
@@ -696,6 +921,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
         next.delete(tabId);
       } else {
         next.set(tabId, host);
+      }
+      return next;
+    });
+    setSftpSourceSessionIdForTab(prev => {
+      const next = new Map(prev);
+      if (isClosing || !sourceSessionId) {
+        next.delete(tabId);
+      } else {
+        next.set(tabId, sourceSessionId);
       }
       return next;
     });
@@ -830,6 +1064,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
     return map;
   }, [sessions, hostMap, groupConfigs]);
+  const groupStatsSourceHost = useMemo(() => {
+    if (!groupStatsSourceSession) return null;
+    return sessionHostsMap.get(groupStatsSourceSession.id) ?? null;
+  }, [groupStatsSourceSession, sessionHostsMap]);
   const sessionChainHostsMap = useMemo(() => {
     const map = new Map<string, Host[]>();
     for (const session of sessions) {
@@ -855,9 +1093,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const validTerminalTabIds = useMemo(() => {
     const ids = new Set<string>();
     for (const session of sessions) ids.add(session.id);
+    for (const group of groups) ids.add(group.id);
     for (const workspace of workspaces) ids.add(workspace.id);
     return ids;
-  }, [sessions, workspaces]);
+  }, [sessions, groups, workspaces]);
 
   const validSessionActivityIds = useMemo(() => {
     return getValidSessionActivityIds(sessions);
@@ -942,6 +1181,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   useEffect(() => {
     setSidePanelOpenTabs(prev => filterTabsMap(prev, validTerminalTabIds));
     setSftpHostForTab(prev => filterTabsMap(prev, validTerminalTabIds));
+    setSftpSourceSessionIdForTab(prev => filterTabsMap(prev, validTerminalTabIds));
     setSftpInitialLocationForTab(prev => filterTabsMap(prev, validTerminalTabIds));
     setSftpPendingUploadsForTab(prev => filterTabsMap(prev, validTerminalTabIds));
     sessionActivityStore.prune(validSessionActivityIds);
@@ -1169,10 +1409,22 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   };
 
   const isTerminalLayerVisible = isVisible || !!draggingSessionId;
+  const activeGroupSupportsServerStats = useMemo(
+    () => isServerStatsSupportedHost(groupStatsSourceHost),
+    [groupStatsSourceHost],
+  );
+  const { stats: activeGroupServerStats } = useServerStats({
+    sessionId: groupStatsSourceSession?.id ?? '',
+    enabled: !!activeGroup && (terminalSettings?.showServerStats ?? true),
+    refreshInterval: terminalSettings?.serverStatsRefreshInterval ?? 5,
+    isSupportedOs: activeGroupSupportsServerStats,
+    isConnected: groupStatsSourceSession?.status === 'connected',
+    isVisible: isTerminalLayerVisible && !!activeGroup,
+  });
 
   // Check if active workspace is in focus mode
   const isFocusMode = activeWorkspace?.viewMode === 'focus';
-  const focusedSessionId = activeWorkspace?.focusedSessionId;
+  const focusedSessionId = activeWorkspace?.focusedSessionId ?? activeSession?.id;
 
   // Resolve the SFTP host for the current tab.
   // Uses the stored host from when the user opened SFTP, but updates when
@@ -1186,6 +1438,56 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     // For solo session: use stored host (from when SFTP was opened)
     return sftpHostForTab.get(activeTabId) ?? null;
   }, [isSftpOpenForCurrentTab, activeTabId, activeWorkspace, focusedSessionId, sessionHostsMap, sftpHostForTab]);
+
+  const sftpActiveSourceSessionId = useMemo((): string | null => {
+    if (!isSftpOpenForCurrentTab || !activeTabId) return null;
+
+    const storedSessionId = sftpSourceSessionIdForTab.get(activeTabId) ?? null;
+    const isConnected = (sessionId: string | null | undefined) => (
+      !!sessionId && sessions.some((session) => session.id === sessionId && session.status === 'connected')
+    );
+
+    if (activeWorkspace) {
+      if (isConnected(focusedSessionId)) {
+        return focusedSessionId ?? null;
+      }
+      if (isConnected(storedSessionId)) {
+        return storedSessionId;
+      }
+      return sessions
+        .filter((session) => session.workspaceId === activeWorkspace.id)
+        .find((session) => session.status === 'connected')
+        ?.id ?? storedSessionId ?? focusedSessionId ?? null;
+    }
+
+    if (activeGroup) {
+      if (activeSession?.status === 'connected') {
+        return activeSession.id;
+      }
+      if (isConnected(storedSessionId)) {
+        return storedSessionId;
+      }
+      return activeGroupSessions.find((session) => session.status === 'connected')?.id
+        ?? storedSessionId
+        ?? activeSession?.id
+        ?? null;
+    }
+
+    if (activeSession?.status === 'connected') {
+      return activeSession.id;
+    }
+    return storedSessionId ?? activeSession?.id ?? null;
+  }, [
+    activeGroup,
+    activeGroupSessions,
+    activeSession,
+    activeTabId,
+    activeWorkspace,
+    focusedSessionId,
+    isSftpOpenForCurrentTab,
+    sessions,
+    sftpSourceSessionIdForTab,
+  ]);
 
   // Keep sftpHostForTab in sync with focus changes in workspace mode
   // so that the toggle check uses the currently displayed host.
@@ -1204,6 +1506,17 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     });
   }, [activeTabId, sftpActiveHost, sidePanelOpenTabs, sftpHostForTab]);
 
+  useEffect(() => {
+    if (!activeTabId || !sftpActiveSourceSessionId) return;
+    if (sidePanelOpenTabs.get(activeTabId) !== 'sftp') return;
+    if (sftpSourceSessionIdForTab.get(activeTabId) === sftpActiveSourceSessionId) return;
+    setSftpSourceSessionIdForTab(prev => {
+      const next = new Map(prev);
+      next.set(activeTabId, sftpActiveSourceSessionId);
+      return next;
+    });
+  }, [activeTabId, sftpActiveSourceSessionId, sidePanelOpenTabs, sftpSourceSessionIdForTab]);
+
   const mountedSftpTabIds = useMemo(
     () => Array.from(sftpHostForTab.keys()),
     [sftpHostForTab],
@@ -1220,13 +1533,27 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const getTerminalCwd = useCallback(async (): Promise<string | null> => {
     const sessionId = activeWorkspace?.focusedSessionId ?? activeSession?.id;
     if (!sessionId) return null;
+    const currentContext = sessionFileContextByIdRef.current.get(sessionId);
+    if (currentContext?.cwd) {
+      return currentContext.cwd;
+    }
     try {
       const result = await terminalBackend.getSessionPwd(sessionId);
-      return result.success && result.cwd ? result.cwd : null;
+      if (result.success && result.cwd) {
+        setSessionCwdById((prev) => {
+          if (prev.get(sessionId) === result.cwd) return prev;
+          const next = new Map(prev);
+          next.set(sessionId, result.cwd);
+          return next;
+        });
+        syncSftpLocationToSessionCwd(sessionId, result.cwd);
+        return result.cwd;
+      }
+      return sessionCwdByIdRef.current.get(sessionId) ?? null;
     } catch {
-      return null;
+      return sessionCwdByIdRef.current.get(sessionId) ?? null;
     }
-  }, [activeWorkspace?.focusedSessionId, activeSession?.id, terminalBackend]);
+  }, [activeWorkspace?.focusedSessionId, activeSession?.id, syncSftpLocationToSessionCwd, terminalBackend]);
 
   // Close the entire side panel for the current tab
   const handleCloseSidePanel = useCallback(() => {
@@ -1239,6 +1566,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     // Always clean up SFTP state (it may be mounted in the background
     // while scripts/theme tab was active)
     setSftpHostForTab(prev => {
+      const next = new Map(prev);
+      next.delete(activeTabId);
+      return next;
+    });
+    setSftpSourceSessionIdForTab(prev => {
       const next = new Map(prev);
       next.delete(activeTabId);
       return next;
@@ -1266,10 +1598,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     // If switching to SFTP and no host is stored yet, resolve it
     if (tab === 'sftp' && !sftpHostForTabRef.current.has(activeTabId)) {
       let host: Host | null = null;
+      let sourceSessionId: string | null = null;
       if (activeWorkspace && focusedSessionId) {
         host = sessionHostsMap.get(focusedSessionId) ?? null;
+        sourceSessionId = focusedSessionId;
       } else if (activeSession) {
         host = sessionHostsMap.get(activeSession.id) ?? null;
+        sourceSessionId = activeSession.id;
       }
       if (!host) return;
       setSftpHostForTab(prev => {
@@ -1277,6 +1612,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
         next.set(activeTabId, host);
         return next;
       });
+      if (sourceSessionId) {
+        setSftpSourceSessionIdForTab(prev => {
+          const next = new Map(prev);
+          next.set(activeTabId, sourceSessionId);
+          return next;
+        });
+      }
     }
 
     // Note: When switching away from SFTP, we keep the SFTP host state
@@ -1318,7 +1660,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   }, [handleOpenAI]);
 
   useEffect(() => {
-    const sessionIdsToClear = getSessionActivityIdsToClear(activeTabId, sessions);
+    const sessionIdsToClear = getSessionActivityIdsToClear(activeTabId, sessions, activeSession?.id);
     if (sessionIdsToClear.length === 1) {
       sessionActivityStore.clearTab(sessionIdsToClear[0]);
       return;
@@ -1326,7 +1668,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (sessionIdsToClear.length > 1) {
       sessionActivityStore.clearTabs(sessionIdsToClear);
     }
-  }, [activeTabId, sessions]);
+  }, [activeSession?.id, activeTabId, sessions]);
 
   useEffect(() => {
     const unsubscribers = activityTrackedSessions.map((session) => {
@@ -1334,7 +1676,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       return onSessionData(session.id, (chunk) => {
         if (!hasNotifiableTerminalOutput(filter, chunk)) return;
 
-        if (!shouldMarkSessionActivity(activeTabIdRef.current, session)) {
+        const currentActiveTabId = activeTabIdRef.current;
+        const activeGroupedSessionId = (() => {
+          const grouped = groupsRef.current.find((group) => group.id === currentActiveTabId);
+          return grouped?.activeSessionId ?? null;
+        })();
+
+        if (!shouldMarkSessionActivity(currentActiveTabId, session, activeGroupedSessionId)) {
           return;
         }
 
@@ -1647,6 +1995,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const aiContextsByTabId = useMemo(() => {
     const localOs = detectLocalOs(navigator.userAgent || navigator.platform);
     const sessionById = new Map(sessions.map((session) => [session.id, session]));
+    const groupById = new Map(groups.map((group) => [group.id, group]));
     const workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
     const tabIds = new Set<string>(mountedAiTabIds);
     if (activeTabId) tabIds.add(activeTabId);
@@ -1654,6 +2003,28 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     const contexts = new Map<string, AIPanelContext>();
 
     for (const tabId of tabIds) {
+      const group = groupById.get(tabId);
+      if (group) {
+        const session = (group.activeSessionId ? sessionById.get(group.activeSessionId) : undefined)
+          ?? group.sessionIds.map((sessionId) => sessionById.get(sessionId)).find(Boolean);
+        if (!session) continue;
+
+        contexts.set(tabId, {
+          scopeType: 'terminal',
+          scopeTargetId: session.id,
+          scopeHostIds: session.hostId ? [session.hostId] : [],
+          scopeLabel: group.title,
+          terminalSessions: [
+            buildAITerminalSessionInfo(
+              session,
+              sessionHostsMap.get(session.id),
+              localOs,
+            ),
+          ],
+        });
+        continue;
+      }
+
       const workspace = workspaceById.get(tabId);
       if (workspace) {
         const sessionIds = collectSessionIds(workspace.root);
@@ -1694,7 +2065,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
 
     return contexts;
-  }, [sessions, workspaces, mountedAiTabIds, activeTabId, sessionHostsMap]);
+  }, [sessions, groups, workspaces, mountedAiTabIds, activeTabId, sessionHostsMap]);
 
   const resolveAIExecutorContext = useCallback((scope: {
     type: 'terminal' | 'workspace';
@@ -1702,15 +2073,23 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     label?: string;
   }) => {
     const latestWorkspaces = workspacesRef.current;
+    const latestGroups = groupsRef.current;
     const latestSessions = sessionsRef.current;
     const latestHosts = hostsRef.current;
     const localOs = detectLocalOs(navigator.userAgent || navigator.platform);
+    const groupedSessionIds = scope.type === 'terminal'
+      ? (() => {
+          const group = scope.targetId ? latestGroups.find((item) => item.id === scope.targetId) : undefined;
+          if (!group) return null;
+          return group.activeSessionId ? [group.activeSessionId] : group.sessionIds.slice(0, 1);
+        })()
+      : null;
     const sessionIds = scope.type === 'workspace'
       ? (() => {
           const workspace = scope.targetId ? latestWorkspaces.find((w) => w.id === scope.targetId) : undefined;
           return workspace?.root ? collectSessionIds(workspace.root) : [];
         })()
-      : scope.targetId ? [scope.targetId] : [];
+      : groupedSessionIds ?? (scope.targetId ? [scope.targetId] : []);
 
     const workspaceName = scope.type === 'workspace'
       ? latestWorkspaces.find((w) => w.id === scope.targetId)?.title ?? scope.label
@@ -1843,6 +2222,62 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     return sessions.filter(s => idSet.has(s.id));
   }, [sessions, workspaceSessionIds]);
 
+  const renderGroupConsoleTabs = () => {
+    if (!activeGroup || activeGroupSessions.length === 0) return null;
+
+    return (
+      <div
+        className="h-10 shrink-0 flex items-center gap-1 px-3 border-b border-border/50 bg-background/95"
+        data-section="terminal-group-tabs"
+      >
+        <div className="flex items-center gap-1 min-w-0 flex-1 overflow-x-auto scrollbar-none">
+          {activeGroupSessions.map((session) => {
+            const isActiveConsole = session.id === activeSession?.id;
+            const statusColor = session.status === 'connected'
+              ? 'text-emerald-500'
+              : session.status === 'connecting'
+                ? 'text-amber-500'
+                : 'text-rose-500';
+            return (
+              <button
+                key={session.id}
+                type="button"
+                className={cn(
+                  "h-7 px-3 rounded-md text-xs font-medium inline-flex items-center gap-2 shrink-0 border transition-colors",
+                  isActiveConsole
+                    ? "bg-primary/12 border-primary/30 text-foreground"
+                    : "bg-transparent border-border/50 text-muted-foreground hover:text-foreground hover:bg-muted/60",
+                )}
+                onClick={() => onSelectConsoleInGroup?.(activeGroup.id, session.id)}
+              >
+                <span>{`控制台 ${session.groupConsoleIndex ?? 1}`}</span>
+                <Circle size={8} className={cn("flex-shrink-0 fill-current", statusColor)} />
+                <span
+                  className="rounded-full p-0.5 hover:bg-destructive/10 hover:text-destructive"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onCloseConsoleInGroup?.(activeGroup.id, session.id);
+                  }}
+                >
+                  <X size={12} />
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 shrink-0"
+          onClick={() => onCreateConsoleInGroup?.(activeGroup.id)}
+          title="新建控制台"
+        >
+          <Plus size={14} />
+        </Button>
+      </div>
+    );
+  };
+
   // Render focus mode sidebar
   const renderFocusModeSidebar = () => {
     if (!activeWorkspace || !isFocusMode) return null;
@@ -1929,6 +2364,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
           zIndex: isTerminalLayerVisible ? 10 : 0,
         }}
       >
+        {renderGroupConsoleTabs()}
         <div className={cn("flex-1 flex min-h-0 relative", sidePanelPosition === 'right' && "flex-row-reverse")}>
         {/* Side panel with tab header + content (SFTP / Scripts / Theme) */}
         {(isSidePanelOpenForCurrentTab || mountedSftpTabIds.length > 0 || mountedAiTabIds.length > 0) && (
@@ -2066,9 +2502,19 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                           updateHosts={updateHosts}
                           sftpDefaultViewMode={sftpDefaultViewMode}
                           activeHost={isVisibleSftpPanel ? sftpActiveHost : null}
+                          sourceSessionId={
+                            isVisibleSftpPanel
+                              ? (sftpSourceSessionIdForTab.get(tabId) ?? null)
+                              : null
+                          }
                           initialLocation={
                             isVisibleSftpPanel
                               ? (sftpInitialLocationForTab.get(tabId) ?? null)
+                              : null
+                          }
+                          terminalFileContext={
+                            isVisibleSftpPanel
+                              ? ((sftpSourceSessionIdForTab.get(tabId) && sessionFileContextById.get(sftpSourceSessionIdForTab.get(tabId) as string)) ?? null)
                               : null
                           }
                           showWorkspaceHostHeader={isVisibleSftpPanel && !!activeWorkspace}
@@ -2187,13 +2633,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
             // Use pre-computed host to avoid creating new objects on every render
             const host = sessionHostsMap.get(session.id)!;
             const inActiveWorkspace = !!activeWorkspace && session.workspaceId === activeWorkspace.id;
+            const inActiveGroup = !!activeGroup && session.groupId === activeGroup.id;
             const isActiveSolo = activeTabId === session.id && !activeWorkspace && isTerminalLayerVisible;
+            const isActiveGroupedSession = inActiveGroup && session.id === activeSession?.id;
 
             // In focus mode, only the focused session is visible
             const isFocusedInWorkspace = isFocusMode && inActiveWorkspace && session.id === focusedSessionId;
             const isSplitViewVisible = !isFocusMode && inActiveWorkspace;
 
-            const isVisible = ((isFocusedInWorkspace || isSplitViewVisible || isActiveSolo) && isTerminalLayerVisible);
+            const isVisible = ((isFocusedInWorkspace || isSplitViewVisible || isActiveSolo || isActiveGroupedSession) && isTerminalLayerVisible);
 
             // In focus mode, use full area; in split mode, use computed rects
             const rect = (isSplitViewVisible && !isFocusMode) ? activeWorkspaceRects[session.id] : null;
@@ -2245,6 +2693,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   // Set focused session when clicking on a pane in split view
                   if (inActiveWorkspace && !isFocusMode && activeWorkspace) {
                     onSetWorkspaceFocusedSession?.(activeWorkspace.id, session.id);
+                  } else if (inActiveGroup && activeGroup) {
+                    onSelectConsoleInGroup?.(activeGroup.id, session.id);
                   }
                 }}
               >
@@ -2266,7 +2716,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   terminalTheme={terminalTheme}
                   followAppTerminalTheme={followAppTerminalTheme}
                   terminalSettings={terminalSettings}
+                  serverStatsOverride={session.groupId ? activeGroupServerStats : null}
                   sessionId={session.id}
+                  groupId={session.groupId}
+                  transportId={session.transportId}
+                  channelId={session.channelId}
                   startupCommand={session.startupCommand}
                   noAutoRun={session.noAutoRun}
                   serialConfig={session.serialConfig}
@@ -2278,15 +2732,18 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   onOpenTheme={handleOpenTheme}
                   onCloseSession={handleCloseSession}
                   onStatusChange={handleStatusChange}
+                  onUpdateSessionConnectionMeta={onUpdateSessionConnectionMeta}
                   onSessionExit={handleSessionExit}
                   onTerminalDataCapture={handleTerminalDataCapture}
                   onOsDetected={handleOsDetected}
                   onUpdateHost={handleUpdateHost}
                   onAddKnownHost={handleAddKnownHost}
                   onCommandExecuted={handleCommandExecuted}
+                  onSessionCwdResolved={handleSessionCwdResolved}
+                  dockerFileContext={sessionFileContextById.get(session.id)?.kind === "docker" ? sessionFileContextById.get(session.id) as TerminalDockerFileContext : null}
                   onExpandToFocus={inActiveWorkspace && !isFocusMode ? workspaceFocusHandler : undefined}
-                  onSplitHorizontal={onSplitSession ? splitHorizontalHandler : undefined}
-                  onSplitVertical={onSplitSession ? splitVerticalHandler : undefined}
+                  onSplitHorizontal={onSplitSession && !session.groupId ? splitHorizontalHandler : undefined}
+                  onSplitVertical={onSplitSession && !session.groupId ? splitVerticalHandler : undefined}
                   isBroadcastEnabled={inActiveWorkspace && activeWorkspace ? isBroadcastEnabled?.(activeWorkspace.id) : false}
                   onToggleBroadcast={inActiveWorkspace ? workspaceBroadcastHandler : undefined}
                   onToggleComposeBar={inActiveWorkspace ? handleToggleWorkspaceComposeBar : undefined}
@@ -2381,6 +2838,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 const terminalLayerAreEqual = (prev: TerminalLayerProps, next: TerminalLayerProps): boolean => {
   return (
     prev.hosts === next.hosts &&
+    prev.groups === next.groups &&
     prev.keys === next.keys &&
     prev.snippets === next.snippets &&
     prev.snippetPackages === next.snippetPackages &&

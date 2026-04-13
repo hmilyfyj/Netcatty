@@ -3,7 +3,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
-import { Cpu, HardDrive, Maximize2, MemoryStick, Radio, ArrowDownToLine, ArrowUpFromLine } from "lucide-react";
+import { Maximize2, Radio } from "lucide-react";
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom";
 import { useI18n } from "../application/i18n/I18nProvider";
@@ -28,13 +28,12 @@ import {
 import {
   resolveHostTerminalThemeId,
 } from "../domain/terminalAppearance";
-import { classifyDistroId } from "../domain/host";
 import { resolveHostAuth } from "../domain/sshAuth";
+import type { TerminalDockerFileContext } from "../domain/terminalFileContext";
 import { useTerminalBackend } from "../application/state/useTerminalBackend";
 import KnownHostConfirmDialog, { HostKeyInfo } from "./KnownHostConfirmDialog";
 // SFTPModal removed - SFTP is now handled by SftpSidePanel in TerminalLayer
 import { Button } from "./ui/button";
-import { HoverCard, HoverCardContent, HoverCardTrigger } from "./ui/hover-card";
 import { toast } from "./ui/toast";
 import { useAvailableFonts } from "../application/state/fontStore";
 import { TERMINAL_THEMES } from "../infrastructure/config/terminalThemes";
@@ -54,9 +53,14 @@ import { XTERM_PERFORMANCE_CONFIG } from "../infrastructure/config/xtermPerforma
 import { useTerminalSearch } from "./terminal/hooks/useTerminalSearch";
 import { useTerminalContextActions } from "./terminal/hooks/useTerminalContextActions";
 import { useTerminalAuthState } from "./terminal/hooks/useTerminalAuthState";
-import { useServerStats } from "./terminal/hooks/useServerStats";
+import { useServerStats, type ServerStats } from "./terminal/hooks/useServerStats";
+import { ServerStatsBar } from "./terminal/ServerStatsBar";
+import { isServerStatsSupportedHost } from "./terminal/serverStatsSupport";
 import { extractDropEntries, getPathForFile, DropEntry } from "../lib/sftpFileUtils";
 import { useTerminalAutocomplete, AutocompletePopup } from "./terminal/autocomplete";
+import { detectPrompt } from "./terminal/autocomplete/promptDetector";
+import { extractPosixCwdFromPrompt } from "./terminal/autocomplete/useTerminalAutocomplete";
+import { resolveTerminalPathCandidate } from "../domain/terminalFileContext";
 
 /**
  * Extract unique root paths from drop entries for local terminal path insertion.
@@ -127,6 +131,9 @@ interface TerminalProps {
   followAppTerminalTheme?: boolean;
   terminalSettings?: TerminalSettings;
   sessionId: string;
+  groupId?: string;
+  transportId?: string;
+  channelId?: string;
   startupCommand?: string;
   noAutoRun?: boolean;
   serialConfig?: SerialConfig;
@@ -134,6 +141,10 @@ interface TerminalProps {
   keyBindings?: KeyBinding[];
   onHotkeyAction?: (action: string, event: KeyboardEvent) => void;
   onStatusChange?: (sessionId: string, status: TerminalSession["status"]) => void;
+  onUpdateSessionConnectionMeta?: (
+    sessionId: string,
+    meta: Pick<TerminalSession, "transportId" | "channelId">,
+  ) => void;
   onSessionExit?: (sessionId: string, evt: { exitCode?: number; signal?: number; error?: string; reason?: "exited" | "error" | "timeout" | "closed" }) => void;
   onTerminalDataCapture?: (sessionId: string, data: string) => void;
   onOsDetected?: (hostId: string, distro: string) => void;
@@ -146,6 +157,11 @@ interface TerminalProps {
     hostId: string,
     hostLabel: string,
     sessionId: string,
+  ) => void;
+  onSessionCwdResolved?: (
+    sessionId: string,
+    cwd: string,
+    reason: "initial" | "command" | "osc",
   ) => void;
   onSplitHorizontal?: () => void;
   onSplitVertical?: () => void;
@@ -166,21 +182,10 @@ interface TerminalProps {
     sessionId: string,
     executor: ((command: string, noAutoRun?: boolean) => void) | null,
   ) => void;
-  // Session log configuration for real-time streaming
   sessionLog?: { enabled: boolean; directory: string; format: string };
-}
-
-// Helper function to format network speed (bytes/sec) to human-readable format
-function formatNetSpeed(bytesPerSec: number): string {
-  if (bytesPerSec < 1024) {
-    return `${bytesPerSec}B/s`;
-  } else if (bytesPerSec < 1024 * 1024) {
-    return `${(bytesPerSec / 1024).toFixed(1)}K/s`;
-  } else if (bytesPerSec < 1024 * 1024 * 1024) {
-    return `${(bytesPerSec / (1024 * 1024)).toFixed(1)}M/s`;
-  } else {
-    return `${(bytesPerSec / (1024 * 1024 * 1024)).toFixed(1)}G/s`;
-  }
+  showServerStatsInHeader?: boolean;
+  serverStatsOverride?: ServerStats | null;
+  dockerFileContext?: TerminalDockerFileContext | null;
 }
 
 const TerminalComponent: React.FC<TerminalProps> = ({
@@ -202,6 +207,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   followAppTerminalTheme = false,
   terminalSettings,
   sessionId,
+  groupId,
+  transportId,
+  channelId,
   startupCommand,
   noAutoRun,
   serialConfig,
@@ -209,6 +217,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   keyBindings = [],
   onHotkeyAction,
   onStatusChange,
+  onUpdateSessionConnectionMeta,
   onSessionExit,
   onTerminalDataCapture,
   onOsDetected,
@@ -217,6 +226,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   onAddKnownHost,
   onExpandToFocus,
   onCommandExecuted,
+  onSessionCwdResolved,
   onSplitHorizontal,
   onSplitVertical,
   onOpenSftp,
@@ -229,6 +239,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   onBroadcastInput,
   onSnippetExecutorChange,
   sessionLog,
+  showServerStatsInHeader = true,
+  serverStatsOverride = null,
+  dockerFileContext = null,
 }) => {
   // Timeout for connection - increased to 120s to allow time for keyboard-interactive (2FA) authentication
   const CONNECTION_TIMEOUT = 120000;
@@ -254,6 +267,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const terminalDataCapturedRef = useRef(false);
   const onTerminalDataCaptureRef = useRef(onTerminalDataCapture);
   const commandBufferRef = useRef<string>("");
+  const cwdRefreshTimerRef = useRef<number | null>(null);
   const [hasMouseTracking, setHasMouseTracking] = useState(false);
   const mouseTrackingRef = useRef(false);
   const serialLineBufferRef = useRef<string>("");
@@ -439,7 +453,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       for (const ch of text) {
         if (ch === "\r" || ch === "\n") {
           const cmd = commandBufferRef.current.trim();
-          if (cmd && onCommandExecuted) onCommandExecuted(cmd, host.id, host.label, sessionId);
+          if (cmd) {
+            handleTrackedCommandExecuted(cmd);
+          }
           commandBufferRef.current = "";
         } else if (ch === "\x15") {
           // Ctrl+U: clear line — reset command buffer (fuzzy match sends this)
@@ -485,6 +501,133 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   }, [sessionId, host.id]);
 
   useEffect(() => {
+    return () => {
+      if (cwdRefreshTimerRef.current !== null) {
+        window.clearTimeout(cwdRefreshTimerRef.current);
+        cwdRefreshTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const reportResolvedCwd = useCallback((cwd: string, reason: "initial" | "command" | "osc") => {
+    knownCwdRef.current = cwd;
+    onSessionCwdResolved?.(sessionId, cwd, reason);
+  }, [onSessionCwdResolved, sessionId]);
+
+  const resolveVisibleTerminalCwd = useCallback((preferRecentOutput: boolean): string | null => {
+    const term = termRef.current;
+    if (!term) return null;
+
+    const buffer = term.buffer.active;
+    const cursorAbsoluteY = buffer.baseY + buffer.cursorY;
+
+    const normalizeCandidate = (candidate: string | undefined) =>
+      resolveTerminalPathCandidate(candidate, knownCwdRef.current);
+
+    const readRecentPwdOutput = (): string | null => {
+      for (let row = cursorAbsoluteY - 1, inspected = 0; row >= 0 && inspected < 8; row -= 1, inspected += 1) {
+        const line = buffer.getLine(row);
+        if (!line) continue;
+
+        let text = line.translateToString(true);
+        let startRow = row;
+        while (startRow > 0) {
+          const previousLine = buffer.getLine(startRow - 1);
+          if (!previousLine?.isWrapped) break;
+          startRow -= 1;
+          text = `${previousLine.translateToString(false)}${text}`;
+        }
+
+        const trimmed = text.trim();
+        if (!trimmed) continue;
+
+        const resolved = normalizeCandidate(trimmed);
+        if (resolved) return resolved;
+      }
+      return null;
+    };
+
+    if (preferRecentOutput) {
+      const pwdOutputPath = readRecentPwdOutput();
+      if (pwdOutputPath) return pwdOutputPath;
+    }
+
+    const prompt = detectPrompt(term);
+    if (!prompt.isAtPrompt) return null;
+
+    return normalizeCandidate(extractPosixCwdFromPrompt(prompt.promptText));
+  }, []);
+
+  const refreshRemoteCwd = useCallback(async (reason: "initial" | "command") => {
+    if (host.protocol === "local" || host.protocol === "serial" || host.protocol === "telnet") {
+      return;
+    }
+    if (!sessionRef.current) return;
+    try {
+      if (dockerFileContext?.kind === "docker" && dockerFileContext.containerId) {
+        const result = await terminalBackend.getDockerContainerPwd(sessionRef.current, dockerFileContext.containerId);
+        if (result.success && result.cwd) {
+          reportResolvedCwd(result.cwd, reason);
+        }
+      } else {
+        const result = await terminalBackend.getSessionPwd(sessionRef.current);
+        if (result.success && result.cwd) {
+          reportResolvedCwd(result.cwd, reason);
+        }
+      }
+    } catch {
+      // Best effort only.
+    }
+  }, [host.protocol, reportResolvedCwd, terminalBackend, dockerFileContext]);
+
+  const maybeRefreshCwdAfterCommand = useCallback((command: string) => {
+    if (
+      host.protocol === "local"
+      || host.protocol === "serial"
+      || host.protocol === "telnet"
+      || !/^(?:cd|pwd)(?=$|\s|;|&&|\|\|)/.test(command)
+    ) {
+      return;
+    }
+    if (cwdRefreshTimerRef.current !== null) {
+      window.clearTimeout(cwdRefreshTimerRef.current);
+      cwdRefreshTimerRef.current = null;
+    }
+
+    const prefersRecentOutput = /^pwd(?=$|\s|;|&&|\|\|)/.test(command);
+    const isCdCommand = /^cd(?=$|\s|;|&&|\|\|)/.test(command);
+
+    const attemptResolveCwd = (attempt: number, maxAttempts: number) => {
+      const visibleCwd = resolveVisibleTerminalCwd(prefersRecentOutput);
+      if (visibleCwd) {
+        reportResolvedCwd(visibleCwd, "command");
+        return;
+      }
+
+      if (attempt < maxAttempts) {
+        cwdRefreshTimerRef.current = window.setTimeout(() => {
+          cwdRefreshTimerRef.current = null;
+          attemptResolveCwd(attempt + 1, maxAttempts);
+        }, isCdCommand ? 200 : 150);
+      } else {
+        void refreshRemoteCwd("command");
+      }
+    };
+
+    const initialDelay = isCdCommand ? 350 : 120;
+    cwdRefreshTimerRef.current = window.setTimeout(() => {
+      cwdRefreshTimerRef.current = null;
+      attemptResolveCwd(1, isCdCommand ? 4 : 2);
+    }, initialDelay);
+  }, [host.protocol, refreshRemoteCwd, reportResolvedCwd, resolveVisibleTerminalCwd]);
+
+  const handleTrackedCommandExecuted = useCallback((command: string) => {
+    if (!command) return;
+    onCommandExecuted?.(command, host.id, host.label, sessionId);
+    maybeRefreshCwdAfterCommand(command);
+  }, [host.id, host.label, maybeRefreshCwdAfterCommand, onCommandExecuted, sessionId]);
+
+  useEffect(() => {
     if (host.protocol === "local" || host.protocol === "serial" || host.protocol === "telnet") {
       return;
     }
@@ -492,12 +635,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
 
     let cancelled = false;
     const timer = setTimeout(async () => {
-      if (!sessionRef.current) return;
       try {
-        const result = await terminalBackend.getSessionPwd(sessionRef.current);
-        if (!cancelled && result.success && result.cwd) {
-          knownCwdRef.current = result.cwd;
-        }
+        await refreshRemoteCwd("initial");
+        if (cancelled) return;
       } catch {
         // Best effort only.
       }
@@ -507,7 +647,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [host.protocol, status, terminalBackend]);
+  }, [host.protocol, refreshRemoteCwd, status]);
 
   useEffect(() => {
     if (!isVisible) {
@@ -535,20 +675,19 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   // AAA log flood this patch is meant to eliminate. The display icon can
   // still be overridden (see DistroAvatar) — gating uses the raw detected
   // `host.distro` and the explicit `host.deviceType` only.
-  const detectedDeviceClass = classifyDistroId(host.distro);
-  const isNetworkDevice =
-    host.deviceType === 'network' || detectedDeviceClass === 'network-device';
-  const isSupportedOs =
-    !isNetworkDevice &&
-    (host.os === 'linux' || host.os === 'macos' || detectedDeviceClass === 'linux-like');
+  const isSupportedOs = isServerStatsSupportedHost(host);
   const { stats: serverStats } = useServerStats({
     sessionId,
-    enabled: terminalSettings?.showServerStats ?? true,
+    enabled:
+      (terminalSettings?.showServerStats ?? true) &&
+      showServerStatsInHeader &&
+      !serverStatsOverride,
     refreshInterval: terminalSettings?.serverStatsRefreshInterval ?? 5,
     isSupportedOs,
     isConnected: status === 'connected',
     isVisible,
   });
+  const effectiveServerStats = serverStatsOverride ?? serverStats;
 
   const zmodem = useZmodemTransfer(sessionId);
 
@@ -706,6 +845,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     identities,
     resolvedChainHosts,
     sessionId,
+    groupId,
+    transportId,
+    channelId,
     startupCommand,
     noAutoRun,
     terminalSettings,
@@ -740,6 +882,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       }
     },
     onSessionExit,
+    onSessionConnectionMeta: onUpdateSessionConnectionMeta,
     onTerminalDataCapture: handleTerminalDataCaptureOnce,
     onOsDetected,
     onCommandExecuted,
@@ -779,7 +922,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
           snippetsRef,
           sessionId,
           statusRef,
-          onCommandExecuted,
+          onCommandExecuted: (command) => {
+            handleTrackedCommandExecuted(command);
+          },
           commandBufferRef,
           setIsSearchOpen,
           // Serial-specific options
@@ -787,7 +932,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
           serialLineMode: serialConfig?.lineMode,
           serialLineBufferRef,
           onCwdChange: (cwd: string) => {
-            knownCwdRef.current = cwd;
+            reportResolvedCwd(cwd, "osc");
           },
           onOsc52ReadRequest: handleOsc52ReadRequest,
           // Autocomplete integration
@@ -1725,311 +1870,8 @@ const TerminalComponent: React.FC<TerminalProps> = ({
                 )}
               />
             </div>
-            {/* Server Stats Display */}
-            {terminalSettings?.showServerStats && status === 'connected' && serverStats.lastUpdated && (
-              <div className="flex items-center gap-2.5 ml-2 text-[10px] opacity-80 flex-nowrap overflow-hidden min-w-0">
-                {/* CPU with HoverCard for per-core details */}
-                <HoverCard openDelay={200} closeDelay={100}>
-                  <HoverCardTrigger asChild>
-                    <button
-                      className="flex items-center gap-0.5 hover:opacity-100 opacity-80 transition-opacity cursor-pointer flex-shrink-0"
-                      title={t("terminal.serverStats.cpu")}
-                    >
-                      <Cpu size={10} className="flex-shrink-0" />
-                      <span>
-                        {serverStats.cpu !== null ? `${serverStats.cpu}%` : '--'}
-                        {serverStats.cpuCores !== null && ` (${serverStats.cpuCores}C)`}
-                      </span>
-                    </button>
-                  </HoverCardTrigger>
-                  <HoverCardContent
-                    className="w-auto p-3"
-                    side="bottom"
-                    align="start"
-                    sideOffset={8}
-                  >
-                    <div className="text-xs space-y-2">
-                      <div className="font-medium text-sm mb-2">{t("terminal.serverStats.cpuCores")}</div>
-                      {serverStats.cpuPerCore.length > 0 ? (
-                        <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${Math.min(4, serverStats.cpuPerCore.length)}, 1fr)` }}>
-                          {serverStats.cpuPerCore.map((usage, index) => (
-                            <div key={index} className="flex flex-col items-center gap-1 min-w-[48px]">
-                              <div className="text-[10px] text-muted-foreground">Core {index}</div>
-                              <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
-                                <div
-                                  className={cn(
-                                    "h-full rounded-full transition-all",
-                                    usage >= 90 ? "bg-red-500" : usage >= 70 ? "bg-amber-500" : "bg-emerald-500"
-                                  )}
-                                  style={{ width: `${usage}%` }}
-                                />
-                              </div>
-                              <div className={cn(
-                                "text-[11px] font-medium",
-                                usage >= 90 ? "text-red-400" : usage >= 70 ? "text-amber-400" : "text-emerald-400"
-                              )}>
-                                {usage}%
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : serverStats.cpu !== null ? (
-                        <div className="flex flex-col gap-1.5 min-w-[160px]">
-                          <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
-                            <div
-                              className={cn(
-                                "h-full rounded-full transition-all",
-                                serverStats.cpu >= 90 ? "bg-red-500" : serverStats.cpu >= 70 ? "bg-amber-500" : "bg-emerald-500"
-                              )}
-                              style={{ width: `${serverStats.cpu}%` }}
-                            />
-                          </div>
-                          <div className={cn(
-                            "text-center text-[11px] font-medium",
-                            serverStats.cpu >= 90 ? "text-red-400" : serverStats.cpu >= 70 ? "text-amber-400" : "text-emerald-400"
-                          )}>
-                            {serverStats.cpu}% · {serverStats.cpuCores ?? '?'} cores
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="text-muted-foreground">{t("terminal.serverStats.noData")}</div>
-                      )}
-                    </div>
-                  </HoverCardContent>
-                </HoverCard>
-                {/* Memory with HoverCard for htop-style bar and top processes */}
-                <HoverCard openDelay={200} closeDelay={100}>
-                  <HoverCardTrigger asChild>
-                    <button
-                      className="flex items-center gap-0.5 hover:opacity-100 opacity-80 transition-opacity cursor-pointer flex-shrink-0"
-                      title={t("terminal.serverStats.memory")}
-                    >
-                      <MemoryStick size={10} className="flex-shrink-0" />
-                      <span>
-                        {serverStats.memUsed !== null && serverStats.memTotal !== null
-                          ? `${(serverStats.memUsed / 1024).toFixed(1)}/${(serverStats.memTotal / 1024).toFixed(1)}G`
-                          : '--'}
-                      </span>
-                    </button>
-                  </HoverCardTrigger>
-                  <HoverCardContent
-                    className="w-auto p-3"
-                    side="bottom"
-                    align="start"
-                    sideOffset={8}
-                  >
-                    <div className="text-xs space-y-3 min-w-[280px]">
-                      <div className="font-medium text-sm">{t("terminal.serverStats.memoryDetails")}</div>
-                      {/* htop-style memory bar */}
-                      {serverStats.memTotal !== null && (
-                        <div className="space-y-1.5">
-                          <div className="w-full h-3 bg-muted rounded overflow-hidden flex">
-                            {/* Used (green) */}
-                            {serverStats.memUsed !== null && serverStats.memUsed > 0 && (
-                              <div
-                                className="h-full bg-emerald-500"
-                                style={{ width: `${(serverStats.memUsed / serverStats.memTotal) * 100}%` }}
-                                title={`${t("terminal.serverStats.memUsed")}: ${(serverStats.memUsed / 1024).toFixed(1)}G`}
-                              />
-                            )}
-                            {/* Buffers (blue) */}
-                            {serverStats.memBuffers !== null && serverStats.memBuffers > 0 && (
-                              <div
-                                className="h-full bg-blue-500"
-                                style={{ width: `${(serverStats.memBuffers / serverStats.memTotal) * 100}%` }}
-                                title={`${t("terminal.serverStats.memBuffers")}: ${(serverStats.memBuffers / 1024).toFixed(1)}G`}
-                              />
-                            )}
-                            {/* Cached (amber/orange) */}
-                            {serverStats.memCached !== null && serverStats.memCached > 0 && (
-                              <div
-                                className="h-full bg-amber-500"
-                                style={{ width: `${(serverStats.memCached / serverStats.memTotal) * 100}%` }}
-                                title={`${t("terminal.serverStats.memCached")}: ${(serverStats.memCached / 1024).toFixed(1)}G`}
-                              />
-                            )}
-                          </div>
-                          {/* Legend */}
-                          <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px]">
-                            <div className="flex items-center gap-1">
-                              <div className="w-2 h-2 rounded-sm bg-emerald-500" />
-                              <span>{t("terminal.serverStats.memUsed")}: {serverStats.memUsed !== null ? `${(serverStats.memUsed / 1024).toFixed(1)}G` : '--'}</span>
-                            </div>
-                            <div className="flex items-center gap-1">
-                              <div className="w-2 h-2 rounded-sm bg-blue-500" />
-                              <span>{t("terminal.serverStats.memBuffers")}: {serverStats.memBuffers !== null ? `${(serverStats.memBuffers / 1024).toFixed(1)}G` : '--'}</span>
-                            </div>
-                            <div className="flex items-center gap-1">
-                              <div className="w-2 h-2 rounded-sm bg-amber-500" />
-                              <span>{t("terminal.serverStats.memCached")}: {serverStats.memCached !== null ? `${(serverStats.memCached / 1024).toFixed(1)}G` : '--'}</span>
-                            </div>
-                            <div className="flex items-center gap-1">
-                              <div className="w-2 h-2 rounded-sm bg-muted border border-border" />
-                              <span>{t("terminal.serverStats.memFree")}: {serverStats.memFree !== null ? `${(serverStats.memFree / 1024).toFixed(1)}G` : '--'}</span>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                      {/* Swap bar */}
-                      {serverStats.swapTotal !== null && serverStats.swapTotal > 0 && (
-                        <div className="space-y-1.5">
-                          <div className="font-medium text-[11px] text-muted-foreground">{t("terminal.serverStats.swap")}</div>
-                          <div className="w-full h-3 bg-muted rounded overflow-hidden flex">
-                            {serverStats.swapUsed !== null && serverStats.swapUsed > 0 && (
-                              <div
-                                className="h-full bg-rose-500"
-                                style={{ width: `${(serverStats.swapUsed / serverStats.swapTotal) * 100}%` }}
-                                title={`${t("terminal.serverStats.swapUsed")}: ${(serverStats.swapUsed / 1024).toFixed(1)}G`}
-                              />
-                            )}
-                          </div>
-                          <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px]">
-                            <div className="flex items-center gap-1">
-                              <div className="w-2 h-2 rounded-sm bg-rose-500" />
-                              <span>{t("terminal.serverStats.swapUsed")}: {serverStats.swapUsed !== null ? `${(serverStats.swapUsed / 1024).toFixed(1)}G` : '--'}</span>
-                            </div>
-                            <div className="flex items-center gap-1">
-                              <div className="w-2 h-2 rounded-sm bg-muted border border-border" />
-                              <span>{t("terminal.serverStats.swapFree")}: {serverStats.swapTotal !== null && serverStats.swapUsed !== null ? `${((serverStats.swapTotal - serverStats.swapUsed) / 1024).toFixed(1)}G` : '--'}</span>
-                            </div>
-                            <div className="flex items-center gap-1">
-                              <span className="text-muted-foreground">{t("terminal.serverStats.swapTotal")}: {`${(serverStats.swapTotal / 1024).toFixed(1)}G`}</span>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                      {/* Top 10 processes */}
-                      {serverStats.topProcesses.length > 0 && (
-                        <div className="space-y-1.5">
-                          <div className="font-medium text-[11px] text-muted-foreground">{t("terminal.serverStats.topProcesses")}</div>
-                          <div className="space-y-0.5 max-h-[150px] overflow-y-auto">
-                            {serverStats.topProcesses.map((proc, index) => (
-                              <div key={index} className="flex items-center gap-2 text-[10px]">
-                                <span className="w-[32px] text-right text-muted-foreground">{proc.memPercent.toFixed(1)}%</span>
-                                <div className="flex-1 h-1 bg-muted rounded-full overflow-hidden">
-                                  <div
-                                    className="h-full bg-emerald-500 rounded-full"
-                                    style={{ width: `${Math.min(100, proc.memPercent * 2)}%` }}
-                                  />
-                                </div>
-                                <span className="flex-shrink-0 font-mono truncate max-w-[140px]" title={proc.command}>
-                                  {proc.command.split('/').pop()?.split(' ')[0] || proc.command}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </HoverCardContent>
-                </HoverCard>
-                {/* Disk - with HoverCard for disk details */}
-                <HoverCard openDelay={200} closeDelay={100}>
-                  <HoverCardTrigger asChild>
-                    <button
-                      className="flex items-center gap-0.5 hover:opacity-100 opacity-80 transition-opacity cursor-pointer flex-shrink-0"
-                      title={t("terminal.serverStats.disk")}
-                    >
-                      <HardDrive size={10} className="flex-shrink-0" />
-                      <span className={cn(
-                        serverStats.diskPercent !== null && serverStats.diskPercent >= 90 && "text-red-400",
-                        serverStats.diskPercent !== null && serverStats.diskPercent >= 80 && serverStats.diskPercent < 90 && "text-amber-400"
-                      )}>
-                        {serverStats.diskUsed !== null && serverStats.diskTotal !== null && serverStats.diskPercent !== null
-                          ? `${serverStats.diskUsed}/${serverStats.diskTotal}G (${serverStats.diskPercent}%)`
-                          : serverStats.diskPercent !== null
-                            ? `${serverStats.diskPercent}%`
-                            : '--'}
-                      </span>
-                    </button>
-                  </HoverCardTrigger>
-                  <HoverCardContent
-                    className="w-auto p-3"
-                    side="bottom"
-                    align="start"
-                    sideOffset={8}
-                  >
-                    <div className="text-xs space-y-2">
-                      <div className="font-medium text-sm mb-2">{t("terminal.serverStats.diskDetails")}</div>
-                      {serverStats.disks.length > 0 ? (
-                        <div className="space-y-2 max-h-[200px] overflow-y-auto">
-                          {serverStats.disks.map((disk, index) => (
-                            <div key={index} className="flex flex-col gap-1 min-w-[180px]">
-                              <div className="flex items-center justify-between gap-4">
-                                <span className="text-[10px] text-muted-foreground font-mono truncate max-w-[120px]" title={disk.mountPoint}>
-                                  {disk.mountPoint}
-                                </span>
-                                <span className={cn(
-                                  "text-[11px] font-medium whitespace-nowrap",
-                                  disk.percent >= 90 ? "text-red-400" : disk.percent >= 80 ? "text-amber-400" : "text-emerald-400"
-                                )}>
-                                  {disk.used}/{disk.total}G ({disk.percent}%)
-                                </span>
-                              </div>
-                              <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
-                                <div
-                                  className={cn(
-                                    "h-full rounded-full transition-all",
-                                    disk.percent >= 90 ? "bg-red-500" : disk.percent >= 80 ? "bg-amber-500" : "bg-emerald-500"
-                                  )}
-                                  style={{ width: `${disk.percent}%` }}
-                                />
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="text-muted-foreground">{t("terminal.serverStats.noData")}</div>
-                      )}
-                    </div>
-                  </HoverCardContent>
-                </HoverCard>
-                {/* Network - with HoverCard for per-interface details */}
-                {serverStats.netInterfaces.length > 0 && (
-                  <HoverCard openDelay={200} closeDelay={100}>
-                    <HoverCardTrigger asChild>
-                      <button
-                        className="flex items-center gap-1 hover:opacity-100 opacity-80 transition-opacity cursor-pointer flex-shrink-0"
-                        title={t("terminal.serverStats.network")}
-                      >
-                        <ArrowDownToLine size={9} className="flex-shrink-0 text-emerald-400" />
-                        <span>{formatNetSpeed(serverStats.netRxSpeed)}</span>
-                        <ArrowUpFromLine size={9} className="flex-shrink-0 text-sky-400" />
-                        <span>{formatNetSpeed(serverStats.netTxSpeed)}</span>
-                      </button>
-                    </HoverCardTrigger>
-                    <HoverCardContent
-                      className="w-auto p-3"
-                      side="bottom"
-                      align="start"
-                      sideOffset={8}
-                    >
-                      <div className="text-xs space-y-2">
-                        <div className="font-medium text-sm mb-2">{t("terminal.serverStats.networkDetails")}</div>
-                        <div className="space-y-2 max-h-[200px] overflow-y-auto">
-                          {serverStats.netInterfaces.map((iface, index) => (
-                            <div key={index} className="flex items-center justify-between gap-4 min-w-[200px]">
-                              <span className="text-[10px] text-muted-foreground font-mono">
-                                {iface.name}
-                              </span>
-                              <div className="flex items-center gap-2">
-                                <span className="flex items-center gap-0.5 text-emerald-400">
-                                  <ArrowDownToLine size={9} />
-                                  {formatNetSpeed(iface.rxSpeed)}
-                                </span>
-                                <span className="flex items-center gap-0.5 text-sky-400">
-                                  <ArrowUpFromLine size={9} />
-                                  {formatNetSpeed(iface.txSpeed)}
-                                </span>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    </HoverCardContent>
-                  </HoverCard>
-                )}
-              </div>
+            {showServerStatsInHeader && terminalSettings?.showServerStats && status === 'connected' && (
+              <ServerStatsBar stats={effectiveServerStats} className="ml-2" />
             )}
             <div className="flex-1" />
             <div className="flex items-center gap-0.5 flex-shrink-0">

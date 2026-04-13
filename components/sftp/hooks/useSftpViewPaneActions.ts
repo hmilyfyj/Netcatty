@@ -3,6 +3,8 @@ import type { MutableRefObject } from "react";
 import type { SftpStateApi } from "../../../application/state/useSftpState";
 import type { SftpDragCallbacks, SftpTransferSource } from "../SftpContext";
 import { keepOnlyActivePaneSelections } from "./selectionScope";
+import { toast } from "../../ui/toast";
+import { isDockerSftpConnection } from "../../../application/state/sftp/backend";
 
 interface UseSftpViewPaneActionsParams {
   sftpRef: MutableRefObject<SftpStateApi>;
@@ -82,6 +84,13 @@ export const useSftpViewPaneActions = ({
 
   const startGroupedTransfer = useCallback(
     (files: SftpTransferSource[], sourceSide: "left" | "right", targetSide: "left" | "right") => {
+      const sourcePane = sourceSide === "left" ? sftpRef.current.leftPane : sftpRef.current.rightPane;
+      const targetPane = targetSide === "left" ? sftpRef.current.leftPane : sftpRef.current.rightPane;
+      if (isDockerSftpConnection(sourcePane.connection) || isDockerSftpConnection(targetPane.connection)) {
+        toast.error("容器模式暂不支持跨面板复制", "SFTP");
+        return;
+      }
+
       const groups = new Map<string, SftpTransferSource[]>();
       for (const file of files) {
         const key = `${file.sourceConnectionId ?? ""}::${file.sourcePath ?? ""}`;

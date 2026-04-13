@@ -9,7 +9,7 @@
  * - Drag-and-drop reordering of tabs
  */
 
-import { HardDrive, Monitor, Plus, X } from "lucide-react";
+import { HardDrive, Monitor, Package, Plus, X } from "lucide-react";
 import React, {
   memo,
   useCallback,
@@ -29,6 +29,8 @@ export interface SftpTab {
   label: string;
   isLocal: boolean;
   hostId: string | null;
+  backendType: "local" | "sftp" | "docker-container";
+  containerName?: string;
 }
 
 interface SftpTabBarProps {
@@ -348,8 +350,16 @@ const SftpTabBarInner: React.FC<SftpTabBarProps> = ({
                 )}
 
                 <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                  {tab.isLocal ? (
+                  {tab.backendType === "local" ? (
                     <Monitor
+                      size={12}
+                      className={cn(
+                        "shrink-0",
+                        isActive ? "text-primary" : "text-muted-foreground",
+                      )}
+                    />
+                  ) : tab.backendType === "docker-container" ? (
+                    <Package
                       size={12}
                       className={cn(
                         "shrink-0",
@@ -422,7 +432,9 @@ const sftpTabBarAreEqual = (
       prevTab.id !== nextTab.id ||
       prevTab.label !== nextTab.label ||
       prevTab.isLocal !== nextTab.isLocal ||
-      prevTab.hostId !== nextTab.hostId
+      prevTab.hostId !== nextTab.hostId ||
+      prevTab.backendType !== nextTab.backendType ||
+      prevTab.containerName !== nextTab.containerName
     ) {
       return false;
     }

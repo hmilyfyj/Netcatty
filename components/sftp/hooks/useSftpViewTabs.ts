@@ -11,8 +11,22 @@ interface UseSftpViewTabsParams {
 interface UseSftpViewTabsResult {
   leftPanes: SftpStateApi["leftPane"][];
   rightPanes: SftpStateApi["rightPane"][];
-  leftTabsInfo: { id: string; label: string; isLocal: boolean; hostId: string | null }[];
-  rightTabsInfo: { id: string; label: string; isLocal: boolean; hostId: string | null }[];
+  leftTabsInfo: {
+    id: string;
+    label: string;
+    isLocal: boolean;
+    hostId: string | null;
+    backendType: "local" | "sftp" | "docker-container";
+    containerName?: string;
+  }[];
+  rightTabsInfo: {
+    id: string;
+    label: string;
+    isLocal: boolean;
+    hostId: string | null;
+    backendType: "local" | "sftp" | "docker-container";
+    containerName?: string;
+  }[];
   showHostPickerLeft: boolean;
   showHostPickerRight: boolean;
   hostSearchLeft: string;
@@ -114,9 +128,11 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
     () =>
       sftp.leftTabs.tabs.map((pane) => ({
         id: pane.id,
-        label: pane.connection?.hostLabel || "New Tab",
+        label: pane.connection?.containerName || pane.connection?.hostLabel || "New Tab",
         isLocal: pane.connection?.isLocal || false,
         hostId: pane.connection?.hostId || null,
+        backendType: pane.connection?.backendType || (pane.connection?.isLocal ? "local" : "sftp"),
+        containerName: pane.connection?.containerName,
       })),
     [sftp.leftTabs.tabs],
   );
@@ -125,9 +141,11 @@ export const useSftpViewTabs = ({ sftp, sftpRef }: UseSftpViewTabsParams): UseSf
     () =>
       sftp.rightTabs.tabs.map((pane) => ({
         id: pane.id,
-        label: pane.connection?.hostLabel || "New Tab",
+        label: pane.connection?.containerName || pane.connection?.hostLabel || "New Tab",
         isLocal: pane.connection?.isLocal || false,
         hostId: pane.connection?.hostId || null,
+        backendType: pane.connection?.backendType || (pane.connection?.isLocal ? "local" : "sftp"),
+        containerName: pane.connection?.containerName,
       })),
     [sftp.rightTabs.tabs],
   );

@@ -36,6 +36,15 @@ type TerminalBackendApi = {
   serialAvailable: () => boolean;
   execAvailable: () => boolean;
   startSSHSession: (options: NetcattySSHOptions) => Promise<string>;
+  startSSHTransport?: (options: NetcattySSHOptions) => Promise<{
+    transportId: string;
+    remoteSshVersion?: string;
+  }>;
+  openSSHChannel?: (options: NetcattySSHChannelOptions) => Promise<{
+    sessionId: string;
+    channelId: string;
+    transportId: string;
+  }>;
   startTelnetSession: (
     options: Parameters<NonNullable<NetcattyBridge["startTelnetSession"]>>[0],
   ) => Promise<string>;
@@ -101,6 +110,9 @@ export type TerminalSessionStartersContext = {
   identities?: Identity[];
   resolvedChainHosts: Host[];
   sessionId: string;
+  groupId?: string;
+  transportId?: string;
+  channelId?: string;
   startupCommand?: string;
   noAutoRun?: boolean;
   terminalSettings?: TerminalSettings;
@@ -132,6 +144,10 @@ export type TerminalSessionStartersContext = {
   t?: (key: string) => string;
 
   onSessionAttached?: (sessionId: string) => void;
+  onSessionConnectionMeta?: (
+    sessionId: string,
+    meta: Pick<TerminalSession, "transportId" | "channelId">,
+  ) => void;
   onSessionExit?: (sessionId: string, evt: { exitCode?: number; signal?: number; error?: string; reason?: "exited" | "error" | "timeout" | "closed" }) => void;
   onTerminalDataCapture?: (sessionId: string, data: string) => void;
   onOsDetected?: (hostId: string, distro: string) => void;
@@ -553,7 +569,7 @@ export const createTerminalSessionStarters = (ctx: TerminalSessionStartersContex
         password?: string;
         key?: SSHKey;
       }): Promise<string> => {
-        return ctx.terminalBackend.startSSHSession({
+        const commonOptions: NetcattySSHOptions = {
           sessionId: ctx.sessionId,
           hostLabel: ctx.host.label,
           hostname: ctx.host.hostname,
@@ -580,7 +596,38 @@ export const createTerminalSessionStarters = (ctx: TerminalSessionStartersContex
           sessionLog: ctx.sessionLog?.enabled ? ctx.sessionLog : undefined,
           // Only pass local key paths if no vault key is explicitly configured
           identityFilePaths: attempt.key ? undefined : ctx.host.identityFilePaths,
-        });
+        };
+
+        if (ctx.terminalBackend.startSSHTransport && ctx.terminalBackend.openSSHChannel) {
+          const existingTransportId = ctx.transportId;
+          const transportId = existingTransportId || (
+            await ctx.terminalBackend.startSSHTransport(commonOptions)
+          ).transportId;
+
+          if (transportId && transportId !== existingTransportId) {
+            ctx.onSessionConnectionMeta?.(ctx.sessionId, { transportId });
+          }
+
+          const channelResult = await ctx.terminalBackend.openSSHChannel({
+            transportId,
+            sessionId: ctx.sessionId,
+            channelId: ctx.channelId,
+            cols: term.cols,
+            rows: term.rows,
+            charset: ctx.host.charset,
+            env: termEnv,
+            sessionLog: ctx.sessionLog?.enabled ? ctx.sessionLog : undefined,
+          });
+
+          ctx.onSessionConnectionMeta?.(ctx.sessionId, {
+            transportId: channelResult.transportId,
+            channelId: channelResult.channelId,
+          });
+
+          return channelResult.sessionId;
+        }
+
+        return ctx.terminalBackend.startSSHSession(commonOptions);
       };
 
       let id: string;

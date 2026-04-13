@@ -4,6 +4,7 @@ import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge"
 import { logger } from "../../../lib/logger";
 import { SftpPane } from "./types";
 import { joinPath } from "./utils";
+import { isDockerSftpConnection, isLocalSftpConnection } from "./backend";
 import {
   UploadController,
   uploadFromDataTransfer,
@@ -87,13 +88,25 @@ export const useSftpExternalOperations = (
         throw new Error("No connection available");
       }
 
-      if (pane.connection.isLocal) {
+      if (isLocalSftpConnection(pane.connection)) {
         const bridge = netcattyBridge.get();
         if (bridge?.readLocalFile) {
           const buffer = await bridge.readLocalFile(filePath);
           return new TextDecoder().decode(buffer);
         }
         throw new Error("Local file reading not supported");
+      }
+
+      if (isDockerSftpConnection(pane.connection)) {
+        const bridge = netcattyBridge.get();
+        if (!pane.connection.sourceSessionId || !pane.connection.containerId || !bridge?.dockerReadTextFile) {
+          throw new Error("容器文件读取不可用");
+        }
+        return bridge.dockerReadTextFile(
+          pane.connection.sourceSessionId,
+          pane.connection.containerId,
+          filePath,
+        );
       }
 
       const sftpId = sftpSessionsRef.current.get(pane.connection.id);
@@ -118,12 +131,16 @@ export const useSftpExternalOperations = (
         throw new Error("No connection available");
       }
 
-      if (pane.connection.isLocal) {
+      if (isLocalSftpConnection(pane.connection)) {
         const bridge = netcattyBridge.get();
         if (bridge?.readLocalFile) {
           return await bridge.readLocalFile(filePath);
         }
         throw new Error("Local file reading not supported");
+      }
+
+      if (isDockerSftpConnection(pane.connection)) {
+        throw new Error("容器模式暂不支持二进制直接读取");
       }
 
       const sftpId = sftpSessionsRef.current.get(pane.connection.id);
@@ -148,7 +165,7 @@ export const useSftpExternalOperations = (
         throw new Error("No connection available");
       }
 
-      if (pane.connection.isLocal) {
+      if (isLocalSftpConnection(pane.connection)) {
         const bridge = netcattyBridge.get();
         if (bridge?.writeLocalFile) {
           const data = new TextEncoder().encode(content);
@@ -156,6 +173,20 @@ export const useSftpExternalOperations = (
           return;
         }
         throw new Error("Local file writing not supported");
+      }
+
+      if (isDockerSftpConnection(pane.connection)) {
+        const bridge = netcattyBridge.get();
+        if (!pane.connection.sourceSessionId || !pane.connection.containerId || !bridge?.dockerWriteTextFile) {
+          throw new Error("容器文件写入不可用");
+        }
+        await bridge.dockerWriteTextFile(
+          pane.connection.sourceSessionId,
+          pane.connection.containerId,
+          filePath,
+          content,
+        );
+        return;
       }
 
       const sftpId = sftpSessionsRef.current.get(pane.connection.id);
@@ -191,9 +222,23 @@ export const useSftpExternalOperations = (
         throw new Error("System app opening not supported");
       }
 
-      if (pane.connection.isLocal) {
+      if (isLocalSftpConnection(pane.connection)) {
         await bridge.openWithApplication(remotePath, appPath);
         return { localTempPath: remotePath };
+      }
+
+      if (isDockerSftpConnection(pane.connection)) {
+        if (!pane.connection.sourceSessionId || !pane.connection.containerId || !bridge.dockerDownloadFileToTemp) {
+          throw new Error("容器文件下载不可用");
+        }
+        const { localPath } = await bridge.dockerDownloadFileToTemp(
+          pane.connection.sourceSessionId,
+          pane.connection.containerId,
+          remotePath,
+          fileName,
+        );
+        await bridge.openWithApplication(localPath, appPath);
+        return { localTempPath: localPath };
       }
 
       const sftpId = sftpSessionsRef.current.get(pane.connection.id);
@@ -520,6 +565,10 @@ export const useSftpExternalOperations = (
         throw new Error("Bridge not available");
       }
 
+      if (isDockerSftpConnection(pane.connection)) {
+        throw new Error("容器模式暂不支持上传文件");
+      }
+
       const sftpId = pane.connection.isLocal
         ? null
         : sftpSessionsRef.current.get(pane.connection.id) || null;
@@ -598,6 +647,10 @@ export const useSftpExternalOperations = (
       const bridge = netcattyBridge.get();
       if (!bridge) {
         throw new Error("Bridge not available");
+      }
+
+      if (isDockerSftpConnection(pane.connection)) {
+        throw new Error("容器模式暂不支持上传文件");
       }
 
       const sftpId = pane.connection.isLocal

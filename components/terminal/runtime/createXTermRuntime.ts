@@ -493,6 +493,13 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
               if (term.modes.bracketedPasteMode && !ctx.terminalSettingsRef.current?.disableBracketedPaste) data = wrapBracketedPaste(data);
               ctx.terminalBackend.writeToSession(id, data);
               scrollToBottomAfterPaste();
+              // Update command buffer for pasted content (without trailing newline)
+              if (ctx.statusRef.current === "connected" && ctx.onCommandExecuted) {
+                const pastedCommand = text.trim();
+                if (pastedCommand) {
+                  ctx.commandBufferRef.current = pastedCommand;
+                }
+              }
             }
           });
           break;
@@ -529,6 +536,13 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
           if (term.modes.bracketedPasteMode && !ctx.terminalSettingsRef.current?.disableBracketedPaste) data = wrapBracketedPaste(data);
           ctx.terminalBackend.writeToSession(ctx.sessionRef.current, data);
           scrollToBottomAfterPaste();
+          // Update command buffer for pasted content (without trailing newline)
+          if (ctx.statusRef.current === "connected" && ctx.onCommandExecuted) {
+            const pastedCommand = text.trim();
+            if (pastedCommand) {
+              ctx.commandBufferRef.current = pastedCommand;
+            }
+          }
         }
       } catch (err) {
         logger.warn("[Terminal] Failed to paste from clipboard:", err);
@@ -623,7 +637,29 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
 
       if (ctx.statusRef.current === "connected" && ctx.onCommandExecuted) {
         if (data === "\r" || data === "\n") {
-          const cmd = ctx.commandBufferRef.current.trim();
+          // Always try to get command from terminal buffer first
+          // This handles all cases: typed input, pasted input, history navigation (up/down arrows), mixed input
+          let cmd = "";
+          try {
+            const buffer = term.buffer.active;
+            const lineIndex = buffer.baseY + buffer.cursorY;
+            const line = buffer.getLine(lineIndex);
+            if (line) {
+              const lineText = line.translateToString(true);
+              // Extract command part (after prompt, typically after last $ or # or >)
+              // Common prompt patterns: "user@host:~$ ", "root@host:/# ", "[user@host]>", etc.
+              const promptMatch = lineText.match(/[#$>]\s*(.*)$/);
+              if (promptMatch && promptMatch[1]) {
+                cmd = promptMatch[1].trim();
+              } else {
+                // Fallback: use the whole line (trim whitespace)
+                cmd = lineText.trim();
+              }
+            }
+          } catch {
+            // Fallback to commandBuffer if buffer access fails
+            cmd = ctx.commandBufferRef.current.trim();
+          }
           if (cmd) ctx.onCommandExecuted(cmd, ctx.host.id, ctx.host.label, ctx.sessionId);
           ctx.commandBufferRef.current = "";
         } else if (data === "\x7f" || data === "\b") {
@@ -637,6 +673,7 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
         } else if (data.length > 1 && !data.startsWith("\x1b")) {
           ctx.commandBufferRef.current += data;
         }
+      } else {
       }
     }
   });

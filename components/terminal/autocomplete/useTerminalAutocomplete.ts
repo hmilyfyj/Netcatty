@@ -975,7 +975,7 @@ function chooseAutocompleteCwd(
   return fallbackCwd;
 }
 
-function extractPosixCwdFromPrompt(promptText: string): string | undefined {
+export function extractPosixCwdFromPrompt(promptText: string): string | undefined {
   const trimmed = promptText.trimEnd().replace(/[#$%>]\s*$/, "");
   if (!trimmed) return undefined;
 

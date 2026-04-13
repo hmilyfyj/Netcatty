@@ -13,6 +13,7 @@ const { NetcattyAgent } = require("./netcattyAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const passphraseHandler = require("./passphraseHandler.cjs");
 const { createProxySocket } = require("./proxyUtils.cjs");
+const tempDirBridge = require("./tempDirBridge.cjs");
 const {
   buildAuthHandler,
   createKeyboardInteractiveHandler,
@@ -293,6 +294,7 @@ function buildAlgorithms(legacyEnabled) {
 // Session storage - shared reference passed from main
 let sessions = null;
 let electronModule = null;
+const sshTransports = new Map();
 
 // Authentication method cache - remembers successful auth methods per host
 // Key format: "username@hostname:port"
@@ -370,6 +372,39 @@ const { safeSend } = require("./ipcUtils.cjs");
 function init(deps) {
   sessions = deps.sessions;
   electronModule = deps.electronModule;
+}
+
+function createTransportId() {
+  return `ssh-transport-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function stopSessionArtifacts(sessionId, session) {
+  sessionLogStreamManager.stopStream(sessionId);
+  session?.zmodemSentry?.cancel();
+  sessionEncodings.delete(sessionId);
+  sessionDecoders.delete(sessionId);
+}
+
+function closeTransportById(transportId) {
+  const transport = sshTransports.get(transportId);
+  if (!transport) return;
+
+  sshTransports.delete(transportId);
+
+  try { transport.conn?.end(); } catch {}
+  for (const conn of transport.chainConnections || []) {
+    try { conn.end(); } catch {}
+  }
+}
+
+function detachSessionFromTransport(transportId, sessionId) {
+  const transport = sshTransports.get(transportId);
+  if (!transport) return;
+
+  transport.channelSessionIds.delete(sessionId);
+  if (transport.channelSessionIds.size === 0) {
+    closeTransportById(transportId);
+  }
 }
 
 /**
@@ -645,15 +680,13 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
 }
 
 /**
- * Start an SSH session
+ * Start an SSH transport
  */
-async function startSSHSession(event, options) {
+async function startSSHTransport(event, options) {
   const sessionId =
     options.sessionId ||
     `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-  const cols = options.cols || 80;
-  const rows = options.rows || 24;
+  const transportId = options.transportId || createTransportId();
   const sender = event.sender;
 
   const sendProgress = (hop, total, label, status, error) => {
@@ -1162,195 +1195,28 @@ async function startSSHSession(event, options) {
         }
 
         sendProgress(totalHops, totalHops, options.hostname, 'authenticated');
-        sendProgress(totalHops, totalHops, options.hostname, 'shell');
-
-        conn.shell(
-          {
-            term: "xterm-256color",
-            cols,
-            rows,
+        const transport = {
+          id: transportId,
+          conn,
+          chainConnections,
+          webContentsId: event.sender.id,
+          hostname: options.host || options.hostname || '',
+          username: options.username || '',
+          label: options.label || options.hostLabel || '',
+          remoteSshVersion: (conn && typeof conn._remoteVer === 'string') ? conn._remoteVer : '',
+          channelSessionIds: new Set(),
+          progress: {
+            totalHops,
+            hostname: options.hostname,
           },
-          {
-            env: {
-              LANG: resolveLangFromCharset(options.charset),
-              COLORTERM: "truecolor",
-              ...(options.env || {}),
-            },
-          },
-          (err, stream) => {
-            if (err) {
-              settled = true;
-              conn.end();
-              for (const c of chainConnections) {
-                try { c.end(); } catch { }
-              }
-              sendProgress(totalHops, totalHops, options.hostname, 'error', `Failed to open shell: ${err.message}`);
-              reject(err);
-              return;
-            }
+        };
+        sshTransports.set(transportId, transport);
 
-            sendProgress(totalHops, totalHops, options.hostname, 'connected');
-
-            const session = {
-              conn,
-              stream,
-              chainConnections,
-              webContentsId: event.sender.id,
-              // Store connection info for MCP host discovery
-              hostname: options.host || options.hostname || '',
-              username: options.username || '',
-              label: options.label || '',
-              lastIdlePrompt: '',
-              lastIdlePromptAt: 0,
-              _promptTrackTail: '',
-              // SSH server identification string (the `software` part of
-              // `SSH-2.0-<software>`). ssh2 captures this during the header
-              // exchange and stores it on the client as `_remoteVer` — it
-              // is available by the time 'ready' fires, so the renderer can
-              // use it to detect network-device vendors without running any
-              // additional exec channels. See domain/host.ts
-              // `detectVendorFromSshVersion`.
-              remoteSshVersion: (conn && typeof conn._remoteVer === 'string') ? conn._remoteVer : '',
-            };
-            sessions.set(sessionId, session);
-
-            // Start real-time session log stream if configured
-            if (options.sessionLog?.enabled && options.sessionLog?.directory) {
-              sessionLogStreamManager.startStream(sessionId, {
-                hostLabel: options.hostLabel || options.hostname || '',
-                hostname: options.hostname || '',
-                directory: options.sessionLog.directory,
-                format: options.sessionLog.format || 'txt',
-                startTime: Date.now(),
-              });
-            }
-
-            // Data buffering for reduced IPC overhead
-            let dataBuffer = '';
-            let flushTimeout = null;
-            const FLUSH_INTERVAL = 8; // ms - flush every 8ms for ~120fps equivalent
-            const MAX_BUFFER_SIZE = 16384; // 16KB - flush immediately if buffer gets too large
-
-            const flushBuffer = () => {
-              if (dataBuffer.length > 0) {
-                const contents = event.sender;
-                safeSend(contents, "netcatty:data", { sessionId, data: dataBuffer });
-                dataBuffer = '';
-              }
-              flushTimeout = null;
-            };
-
-            const bufferData = (data) => {
-              dataBuffer += data;
-              // Immediate flush for large chunks
-              if (dataBuffer.length >= MAX_BUFFER_SIZE) {
-                if (flushTimeout) {
-                  clearTimeout(flushTimeout);
-                  flushTimeout = null;
-                }
-                flushBuffer();
-              } else if (!flushTimeout) {
-                // Schedule flush
-                flushTimeout = setTimeout(flushBuffer, FLUSH_INTERVAL);
-              }
-            };
-
-            const sshZmodemSentry = createZmodemSentry({
-              sessionId,
-              onData(buf) {
-                const decoder = getSessionDecoder(sessionId, "stdout");
-                const decoded = decoder.write(buf);
-                trackSessionIdlePrompt(session, decoded);
-                bufferData(decoded);
-                sessionLogStreamManager.appendData(sessionId, decoded);
-              },
-              writeToRemote(buf) {
-                try { return stream.write(buf); } catch { return true; /* ignore */ }
-              },
-              interruptRemote() {
-                try { stream.signal?.("INT"); } catch { /* ignore */ }
-              },
-              getWebContents() {
-                return event.sender;
-              },
-              label: "SSH",
-            });
-            session.zmodemSentry = sshZmodemSentry;
-
-            stream.on("data", (data) => {
-              // data is Buffer from ssh2 — feed raw bytes to ZMODEM sentry.
-              // In normal mode, sentry's onData callback handles decoding and buffering.
-              sshZmodemSentry.consume(data);
-            });
-
-            stream.stderr?.on("data", (data) => {
-              // stderr is not used for ZMODEM — decode normally
-              const decoder = getSessionDecoder(sessionId, "stderr");
-              const decoded = decoder.write(data);
-              bufferData(decoded);
-              sessionLogStreamManager.appendData(sessionId, decoded);
-            });
-
-            // Capture the real exit code from the remote process.
-            // "exit" fires when the remote shell/process exits normally;
-            // "close" fires whenever the channel closes (could be network drop).
-            // Only treat it as user-initiated exit if "exit" fired with a numeric
-            // code and no signal. Signal terminations (e.g. server kill, idle
-            // timeout) have code=null and signal set — those are not user exits.
-            let streamExitCode = 0;
-            let streamExited = false;
-            stream.on("exit", (code, signal) => {
-              streamExitCode = typeof code === "number" ? code : 0;
-              streamExited = typeof code === "number" && !signal;
-            });
-
-            stream.on("close", () => {
-              // Always flush buffered data regardless of session state
-              if (flushTimeout) {
-                clearTimeout(flushTimeout);
-              }
-              flushBuffer();
-              sessionLogStreamManager.stopStream(sessionId);
-
-              // Only send exit if session hasn't already been cleaned up by
-              // conn.once("close") — which fires before stream.on("close")
-              // in ssh2 when the transport drops.
-              if (sessions.has(sessionId)) {
-                const contents = event.sender;
-                const session = sessions.get(sessionId);
-                const transportError = session?._transportError;
-                if (transportError) {
-                  safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: transportError, reason: "error" });
-                } else {
-                  safeSend(contents, "netcatty:exit", { sessionId, exitCode: streamExitCode, reason: streamExited ? "exited" : "closed" });
-                }
-                sessions.get(sessionId)?.zmodemSentry?.cancel();
-                sessions.delete(sessionId);
-                sessionEncodings.delete(sessionId);
-                sessionDecoders.delete(sessionId);
-              }
-              conn.end();
-              for (const c of chainConnections) {
-                try { c.end(); } catch { }
-              }
-            });
-
-            // Pre-seed encoding from host charset if it's a GB variant
-            if (options.charset && /^gb/i.test(String(options.charset).trim())) {
-              sessionEncodings.set(sessionId, "gb18030");
-            }
-
-            // Run startup command if specified
-            if (options.startupCommand) {
-              setTimeout(() => {
-                stream.write(`${options.startupCommand}\n`);
-              }, 300);
-            }
-
-            settled = true;
-            resolve({ sessionId });
-          }
-        );
+        settled = true;
+        resolve({
+          transportId,
+          remoteSshVersion: transport.remoteSshVersion,
+        });
       });
 
       conn.on("error", (err) => {
@@ -1362,10 +1228,13 @@ async function startSSHSession(event, options) {
         // any buffered data first and then send exit with this error info.
         if (settled) {
           console.warn(`${logPrefix} ${options.hostname} post-settle error:`, err.message);
-          // Store the error so the close handler can include it in the exit event
-          if (sessions.has(sessionId)) {
-            const session = sessions.get(sessionId);
-            if (session) session._transportError = err.message;
+          const transport = sshTransports.get(transportId);
+          if (transport) {
+            transport._transportError = err.message;
+            for (const channelSessionId of transport.channelSessionIds) {
+              const session = sessions.get(channelSessionId);
+              if (session) session._transportError = err.message;
+            }
           }
           return;
         }
@@ -1392,11 +1261,8 @@ async function startSSHSession(event, options) {
 
         sendProgress(totalHops, totalHops, options.hostname, 'error', err.message);
         safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "error" });
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
+        stopSessionArtifacts(sessionId, sessions.get(sessionId));
         sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
         for (const c of chainConnections) {
           try { c.end(); } catch { }
         }
@@ -1413,11 +1279,8 @@ async function startSSHSession(event, options) {
         const contents = event.sender;
         sendProgress(totalHops, totalHops, options.hostname, 'error', err.message);
         safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "timeout" });
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
+        stopSessionArtifacts(sessionId, sessions.get(sessionId));
         sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
         for (const c of chainConnections) {
           try { c.end(); } catch { }
         }
@@ -1428,29 +1291,33 @@ async function startSSHSession(event, options) {
 
       conn.once("close", () => {
         const contents = event.sender;
+        const transport = sshTransports.get(transportId);
         if (!settled) {
           sendProgress(totalHops, totalHops, options.hostname, 'error', `Connection to ${options.hostname} closed unexpectedly`);
         }
-        // Only send exit if the session hasn't already been cleaned up by the
-        // error handler (avoids sending a misleading exitCode:0 "closed" after
-        // a real transport error was already reported).
-        if (sessions.has(sessionId)) {
-          const session = sessions.get(sessionId);
-          const transportError = session?._transportError;
-          if (transportError) {
-            // A transport error was recorded — report it as an error exit
-            safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: transportError, reason: "error" });
-          } else {
-            safeSend(contents, "netcatty:exit", { sessionId, exitCode: 0, reason: "closed" });
+        if (transport) {
+          sshTransports.delete(transportId);
+          const transportError = transport._transportError;
+          for (const channelSessionId of [...transport.channelSessionIds]) {
+            const session = sessions.get(channelSessionId);
+            if (!session) continue;
+            const reason = transportError ? "error" : "closed";
+            safeSend(contents, "netcatty:exit", {
+              sessionId: channelSessionId,
+              exitCode: transportError ? 1 : 0,
+              error: transportError,
+              reason,
+            });
+            stopSessionArtifacts(channelSessionId, session);
+            sessions.delete(channelSessionId);
           }
-        }
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
-        sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
-        for (const c of chainConnections) {
-          try { c.end(); } catch { }
+          for (const c of transport.chainConnections || []) {
+            try { c.end(); } catch {}
+          }
+        } else {
+          for (const c of chainConnections) {
+            try { c.end(); } catch { }
+          }
         }
         if (!settled) {
           settled = true;
@@ -1548,6 +1415,208 @@ async function startSSHSession(event, options) {
     safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message });
     throw err;
   }
+}
+
+async function openSSHChannel(event, options) {
+  const transport = sshTransports.get(options.transportId);
+  if (!transport || !transport.conn) {
+    throw new Error("SSH transport not found");
+  }
+
+  const sessionId =
+    options.sessionId ||
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const channelId =
+    options.channelId ||
+    `${sessionId}-channel`;
+  const cols = options.cols || 80;
+  const rows = options.rows || 24;
+  const contents = event.sender;
+  const totalHops = transport.progress?.totalHops || 1;
+  const hostname = transport.progress?.hostname || transport.hostname || "";
+
+  return new Promise((resolve, reject) => {
+    safeSend(contents, "netcatty:chain:progress", {
+      sessionId,
+      hop: totalHops,
+      total: totalHops,
+      label: hostname,
+      status: "shell",
+    });
+
+    transport.conn.shell(
+      {
+        term: "xterm-256color",
+        cols,
+        rows,
+      },
+      {
+        env: {
+          LANG: resolveLangFromCharset(options.charset),
+          COLORTERM: "truecolor",
+          ...(options.env || {}),
+        },
+      },
+      (err, stream) => {
+        if (err) {
+          if (transport.channelSessionIds.size === 0) {
+            closeTransportById(transport.id);
+          }
+          reject(err);
+          return;
+        }
+
+        safeSend(contents, "netcatty:chain:progress", {
+          sessionId,
+          hop: totalHops,
+          total: totalHops,
+          label: hostname,
+          status: "connected",
+        });
+
+        const session = {
+          conn: transport.conn,
+          stream,
+          chainConnections: transport.chainConnections,
+          webContentsId: transport.webContentsId,
+          hostname: transport.hostname,
+          username: transport.username,
+          label: transport.label,
+          remoteSshVersion: transport.remoteSshVersion,
+          transportId: transport.id,
+          channelId,
+          lastIdlePrompt: '',
+          lastIdlePromptAt: 0,
+          _promptTrackTail: '',
+        };
+        sessions.set(sessionId, session);
+        transport.channelSessionIds.add(sessionId);
+
+        if (options.sessionLog?.enabled && options.sessionLog?.directory) {
+          sessionLogStreamManager.startStream(sessionId, {
+            hostLabel: transport.label || hostname,
+            hostname: transport.hostname || hostname,
+            directory: options.sessionLog.directory,
+            format: options.sessionLog.format || 'txt',
+            startTime: Date.now(),
+          });
+        }
+
+        let dataBuffer = '';
+        let flushTimeout = null;
+        const FLUSH_INTERVAL = 8;
+        const MAX_BUFFER_SIZE = 16384;
+
+        const flushBuffer = () => {
+          if (dataBuffer.length > 0) {
+            safeSend(contents, "netcatty:data", { sessionId, data: dataBuffer });
+            dataBuffer = '';
+          }
+          flushTimeout = null;
+        };
+
+        const bufferData = (data) => {
+          dataBuffer += data;
+          if (dataBuffer.length >= MAX_BUFFER_SIZE) {
+            if (flushTimeout) {
+              clearTimeout(flushTimeout);
+              flushTimeout = null;
+            }
+            flushBuffer();
+          } else if (!flushTimeout) {
+            flushTimeout = setTimeout(flushBuffer, FLUSH_INTERVAL);
+          }
+        };
+
+        const sshZmodemSentry = createZmodemSentry({
+          sessionId,
+          onData(buf) {
+            const decoder = getSessionDecoder(sessionId, "stdout");
+            const decoded = decoder.write(buf);
+            trackSessionIdlePrompt(session, decoded);
+            bufferData(decoded);
+            sessionLogStreamManager.appendData(sessionId, decoded);
+          },
+          writeToRemote(buf) {
+            try { return stream.write(buf); } catch { return true; }
+          },
+          interruptRemote() {
+            try { stream.signal?.("INT"); } catch {}
+          },
+          getWebContents() {
+            return contents;
+          },
+          label: "SSH",
+        });
+        session.zmodemSentry = sshZmodemSentry;
+
+        stream.on("data", (data) => {
+          sshZmodemSentry.consume(data);
+        });
+
+        stream.stderr?.on("data", (data) => {
+          const decoder = getSessionDecoder(sessionId, "stderr");
+          const decoded = decoder.write(data);
+          bufferData(decoded);
+          sessionLogStreamManager.appendData(sessionId, decoded);
+        });
+
+        let streamExitCode = 0;
+        let streamExited = false;
+        stream.on("exit", (code, signal) => {
+          streamExitCode = typeof code === "number" ? code : 0;
+          streamExited = typeof code === "number" && !signal;
+        });
+
+        stream.on("close", () => {
+          if (flushTimeout) {
+            clearTimeout(flushTimeout);
+          }
+          flushBuffer();
+
+          const existingSession = sessions.get(sessionId);
+          const transportError = existingSession?._transportError || transport._transportError;
+          if (existingSession) {
+            safeSend(contents, "netcatty:exit", {
+              sessionId,
+              exitCode: transportError ? 1 : streamExitCode,
+              error: transportError,
+              reason: transportError ? "error" : (streamExited ? "exited" : "closed"),
+            });
+            stopSessionArtifacts(sessionId, existingSession);
+            sessions.delete(sessionId);
+          } else {
+            stopSessionArtifacts(sessionId, session);
+          }
+
+          detachSessionFromTransport(transport.id, sessionId);
+        });
+
+        if (options.charset && /^gb/i.test(String(options.charset).trim())) {
+          sessionEncodings.set(sessionId, "gb18030");
+        }
+
+        resolve({
+          sessionId,
+          channelId,
+          transportId: transport.id,
+        });
+      },
+    );
+  });
+}
+
+async function startSSHSession(event, options) {
+  const transport = await startSSHTransport(event, options);
+  return openSSHChannel(event, {
+    transportId: transport.transportId,
+    sessionId: options.sessionId,
+    cols: options.cols,
+    rows: options.rows,
+    charset: options.charset,
+    env: options.env,
+    sessionLog: options.sessionLog,
+  });
 }
 
 /**
@@ -1676,6 +1745,420 @@ async function execCommand(event, payload) {
 
     conn.connect(connectOpts);
   });
+}
+
+function quoteShellValue(value) {
+  return `'${String(value ?? "").replace(/'/g, `'\\''`)}'`;
+}
+
+function normalizeDockerError(error, fallbackMessage) {
+  const raw = error instanceof Error ? error.message : String(error || "");
+  const lower = raw.toLowerCase();
+
+  if (lower.includes("session not found")) {
+    return {
+      supported: false,
+      reason: "session-unavailable",
+      error: "SSH 会话不可用",
+      message: "SSH 会话不可用",
+    };
+  }
+  if (lower.includes("__netcatty_docker_missing__") || lower.includes("command not found") || lower.includes("docker: not found")) {
+    return {
+      supported: false,
+      reason: "docker-missing",
+      error: "宿主机未安装 Docker CLI",
+      message: "宿主机未安装 Docker CLI",
+    };
+  }
+  if (lower.includes("permission denied")) {
+    return {
+      supported: false,
+      reason: "permission-denied",
+      error: "当前 SSH 用户无权访问 Docker",
+      message: "当前 SSH 用户无权访问 Docker",
+    };
+  }
+  if (lower.includes("is not running") || lower.includes("container") && lower.includes("not running")) {
+    return {
+      supported: false,
+      reason: "docker-unavailable",
+      error: "容器已停止",
+      message: "容器已停止",
+    };
+  }
+  if (lower.includes("executable file not found") || lower.includes("sh: not found") || lower.includes("shell")) {
+    return {
+      supported: false,
+      reason: "docker-unavailable",
+      error: "容器缺少必要的 shell 或命令",
+      message: "容器缺少必要的 shell 或命令",
+    };
+  }
+  if (lower.includes("__netcatty_path_not_found__") || lower.includes("no such file or directory")) {
+    return {
+      supported: false,
+      reason: "docker-unavailable",
+      error: "目标路径不存在",
+      message: "目标路径不存在",
+    };
+  }
+
+  return {
+    supported: false,
+    reason: "unknown",
+    error: raw || fallbackMessage,
+    message: raw || fallbackMessage,
+  };
+}
+
+function ensureExecSession(sessionId) {
+  const session = sessions?.get(sessionId);
+  if (!session || !session.conn) {
+    throw new Error("Session not found or not connected");
+  }
+  return session;
+}
+
+async function execOnExistingSession(sessionId, command, options = {}) {
+  const session = ensureExecSession(sessionId);
+  const {
+    timeoutMs = 15000,
+    stdin,
+    binaryStdout = false,
+  } = options;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let streamRef = null;
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+
+    const timer = setTimeout(() => {
+      try {
+        streamRef?.close?.();
+        streamRef?.destroy?.();
+      } catch {
+        // ignore
+      }
+      finish(reject, new Error("SSH exec timeout"));
+    }, timeoutMs);
+
+    session.conn.exec(command, (err, stream) => {
+      if (err) {
+        finish(reject, err);
+        return;
+      }
+
+      streamRef = stream;
+      stream.on("data", (chunk) => {
+        stdoutChunks.push(Buffer.from(chunk));
+      });
+      stream.stderr?.on("data", (chunk) => {
+        stderrChunks.push(Buffer.from(chunk));
+      });
+      stream.on("error", (streamErr) => {
+        finish(reject, streamErr);
+      });
+      stream.on("close", (code) => {
+        const stdoutBuffer = Buffer.concat(stdoutChunks);
+        const stderr = Buffer.concat(stderrChunks).toString("utf8");
+        finish(resolve, {
+          code: typeof code === "number" ? code : 0,
+          stdout: binaryStdout ? stdoutBuffer : stdoutBuffer.toString("utf8"),
+          stderr,
+        });
+      });
+
+      if (stdin !== undefined) {
+        stream.end(Buffer.isBuffer(stdin) ? stdin : Buffer.from(String(stdin), "utf8"));
+      } else {
+        stream.end();
+      }
+    });
+  });
+}
+
+function buildDockerShellCommand(containerId, script, args = [], options = {}) {
+  const shellArgs = args.map((arg) => quoteShellValue(arg)).join(" ");
+  const interactiveFlag = options.interactive ? "-i " : "";
+  return [
+    "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }",
+    "docker ps >/dev/null || exit $?",
+    `docker exec ${interactiveFlag}${quoteShellValue(containerId)} sh -lc ${quoteShellValue(script)} sh${shellArgs ? ` ${shellArgs}` : ""}`,
+  ].join("; ");
+}
+
+function parseDockerEntries(rawOutput) {
+  return rawOutput
+    .split(/\r?\n/)
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const [name, type, linkTargetRaw, sizeRaw, lastModifiedRaw, permissions = ""] = line.split("\t");
+      return {
+        name,
+        type,
+        linkTarget: linkTargetRaw || undefined,
+        size: String(Number.parseInt(sizeRaw || "0", 10) || 0),
+        lastModified: new Date((Number.parseInt(lastModifiedRaw || "0", 10) || 0) * 1000).toISOString(),
+        permissions,
+      };
+    });
+}
+
+async function checkDockerSessionSupport(_event, { sessionId }) {
+  try {
+    const result = await execOnExistingSession(
+      sessionId,
+      "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }; docker ps >/dev/null",
+      { timeoutMs: 12000 },
+    );
+    if (result.code === 0) {
+      return { supported: true };
+    }
+    return normalizeDockerError(result.stderr || result.stdout, "Docker 不可用");
+  } catch (error) {
+    return normalizeDockerError(error, "Docker 不可用");
+  }
+}
+
+async function listDockerContainersForSession(_event, { sessionId }) {
+  const support = await checkDockerSessionSupport(_event, { sessionId });
+  if (!support.supported) {
+    throw new Error(support.error || "Docker 不可用");
+  }
+
+  const command = [
+    "ids=$(docker ps -q)",
+    '[ -n "$ids" ] || exit 0',
+    "docker inspect $ids --format '{{.Id}}\\t{{.Name}}\\t{{.State.Status}}\\t{{json .Config.WorkingDir}}'",
+  ].join("; ");
+
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法列出容器").message);
+  }
+
+  return String(result.stdout)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [id, rawName, status, workingDirJson] = line.split(/\\t|\t/);
+      let workingDir = "";
+      try {
+        workingDir = JSON.parse(workingDirJson || "\"\"");
+      } catch {
+        workingDir = "";
+      }
+      return {
+        id,
+        name: (rawName || "").replace(/^\//, ""),
+        status,
+        workingDir: workingDir || undefined,
+      };
+    });
+}
+
+async function listDockerFilesForSession(_event, { sessionId, containerId, path: targetPath }) {
+  const script = [
+    'target="$1"',
+    '[ -n "$target" ] || target="/"',
+    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+    '[ -d "$target" ] || { echo "__NETCATTY_NOT_DIRECTORY__" >&2; exit 45; }',
+    'for p in "$target"/* "$target"/.[!.]* "$target"/..?*; do',
+    '  [ -e "$p" ] || [ -L "$p" ] || continue',
+    '  name=${p##*/}',
+    '  if [ -L "$p" ]; then',
+    '    type="symlink"',
+    '    if [ -d "$p" ]; then link="directory"; elif [ -e "$p" ]; then link="file"; else link=""; fi',
+    '  elif [ -d "$p" ]; then',
+    '    type="directory"',
+    '    link=""',
+    '  else',
+    '    type="file"',
+    '    link=""',
+    '  fi',
+    "  stat_out=$(stat -c '%s\t%Y\t%A' \"$p\" 2>/dev/null || printf '0\t0\t')",
+    '  printf "%s\t%s\t%s\t%s\n" "$name" "$type" "$link" "$stat_out"',
+    "done",
+  ].join("\n");
+
+  const command = buildDockerShellCommand(containerId, script, [targetPath || "/"]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法读取容器目录").message);
+  }
+  return parseDockerEntries(String(result.stdout));
+}
+
+async function getDockerContainerPwd(_event, { sessionId, containerId }) {
+  const script = 'pwd';
+  const command = buildDockerShellCommand(containerId, script, []);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 8000 });
+  if (result.code !== 0) {
+    return { success: false, error: normalizeDockerError(result.stderr || result.stdout, "无法获取容器工作目录").message };
+  }
+  const cwd = String(result.stdout).trim();
+  if (!cwd || !cwd.startsWith("/")) {
+    return { success: false, error: "无法获取有效的容器工作目录" };
+  }
+  return { success: true, cwd };
+}
+
+async function readDockerTextFile(_event, { sessionId, containerId, path: targetPath }) {
+  const script = [
+    'target="$1"',
+    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+    'cat -- "$target"',
+  ].join("; ");
+  const command = buildDockerShellCommand(containerId, script, [targetPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法读取容器文件").message);
+  }
+  return String(result.stdout);
+}
+
+async function writeSessionTempFile(sessionId, content) {
+  const command = [
+    'tmp=$(mktemp /tmp/netcatty-docker-write.XXXXXX 2>/dev/null || mktemp -t netcatty-docker-write.XXXXXX)',
+    '[ -n "$tmp" ] || exit 1',
+    'cat > "$tmp"',
+    'printf "%s" "$tmp"',
+  ].join("; ");
+  const result = await execOnExistingSession(sessionId, command, {
+    timeoutMs: 20000,
+    stdin: content ?? "",
+  });
+  if (result.code !== 0) {
+    throw new Error("无法创建远端临时文件");
+  }
+  const tempPath = String(result.stdout || "").trim();
+  if (!tempPath) {
+    throw new Error("无法创建远端临时文件");
+  }
+  return tempPath;
+}
+
+async function writeDockerTextFile(_event, { sessionId, containerId, path: targetPath, content }) {
+  const ensureParentScript = [
+    'target="$1"',
+    'parent=$(dirname "$target")',
+    '[ -d "$parent" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+  ].join("; ");
+  const ensureParentCommand = buildDockerShellCommand(containerId, ensureParentScript, [targetPath]);
+  const ensureParentResult = await execOnExistingSession(sessionId, ensureParentCommand, { timeoutMs: 15000 });
+  if (ensureParentResult.code !== 0) {
+    throw new Error(normalizeDockerError(ensureParentResult.stderr || ensureParentResult.stdout, "无法保存容器文件").message);
+  }
+
+  let remoteTempPath = "";
+  try {
+    remoteTempPath = await writeSessionTempFile(sessionId, content);
+    const copyCommand = [
+      "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }",
+      "docker ps >/dev/null || exit $?",
+      `docker cp ${quoteShellValue(remoteTempPath)} ${quoteShellValue(`${containerId}:${targetPath}`)}`,
+    ].join("; ");
+    const copyResult = await execOnExistingSession(sessionId, copyCommand, { timeoutMs: 20000 });
+    if (copyResult.code !== 0) {
+      throw new Error(normalizeDockerError(copyResult.stderr || copyResult.stdout, "无法保存容器文件").message);
+    }
+
+    const verifyScript = [
+      'target="$1"',
+      '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+      'cat -- "$target"',
+    ].join("; ");
+    const verifyCommand = buildDockerShellCommand(containerId, verifyScript, [targetPath]);
+    const verifyResult = await execOnExistingSession(sessionId, verifyCommand, { timeoutMs: 20000 });
+    if (verifyResult.code !== 0) {
+      throw new Error(normalizeDockerError(verifyResult.stderr || verifyResult.stdout, "无法校验容器文件内容").message);
+    }
+    if (String(verifyResult.stdout) !== String(content ?? "")) {
+      throw new Error("容器文件保存校验失败");
+    }
+  } finally {
+    if (remoteTempPath) {
+      await execOnExistingSession(
+        sessionId,
+        `rm -f -- ${quoteShellValue(remoteTempPath)}`,
+        { timeoutMs: 10000 },
+      ).catch(() => {});
+    }
+  }
+}
+
+async function downloadDockerFile(sessionId, containerId, remotePath, localPath) {
+  const script = [
+    'target="$1"',
+    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+    'cat -- "$target"',
+  ].join("; ");
+  const command = buildDockerShellCommand(containerId, script, [remotePath]);
+  const result = await execOnExistingSession(sessionId, command, {
+    timeoutMs: 20000,
+    binaryStdout: true,
+  });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || "", "无法下载容器文件").message);
+  }
+  await fs.promises.writeFile(localPath, result.stdout);
+  return { localPath };
+}
+
+async function downloadDockerFileHandler(_event, { sessionId, containerId, remotePath, localPath }) {
+  return downloadDockerFile(sessionId, containerId, remotePath, localPath);
+}
+
+async function downloadDockerFileToTemp(_event, { sessionId, containerId, remotePath, fileName }) {
+  const tempPath = tempDirBridge.getTempFilePath(fileName || path.basename(remotePath || "download"));
+  return downloadDockerFile(sessionId, containerId, remotePath, tempPath);
+}
+
+async function mkdirDockerPath(_event, { sessionId, containerId, path: targetPath }) {
+  const command = buildDockerShellCommand(containerId, 'mkdir -p -- "$1"', [targetPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法创建目录").message);
+  }
+}
+
+async function createDockerFile(_event, { sessionId, containerId, path: targetPath }) {
+  const script = [
+    'target="$1"',
+    'parent=$(dirname "$target")',
+    '[ -d "$parent" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+    ': > "$target"',
+  ].join("; ");
+  const command = buildDockerShellCommand(containerId, script, [targetPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法创建文件").message);
+  }
+}
+
+async function deleteDockerPath(_event, { sessionId, containerId, path: targetPath }) {
+  const command = buildDockerShellCommand(containerId, 'rm -rf -- "$1"', [targetPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法删除路径").message);
+  }
+}
+
+async function renameDockerPath(_event, { sessionId, containerId, oldPath, newPath }) {
+  const command = buildDockerShellCommand(containerId, 'mv -- "$1" "$2"', [oldPath, newPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法重命名路径").message);
+  }
 }
 
 /**
@@ -1808,6 +2291,77 @@ async function startSSHSessionWrapper(event, options) {
     // so Electron's ipcMain.handle can serialize it back to the renderer
     // instead of it becoming an uncaught exception that crashes the app.
     // See: https://github.com/nicely-gg/netcatty/issues/482
+    const connError = new Error(err.message);
+    connError.level = err.level || 'client-socket';
+    connError.code = err.code;
+    throw connError;
+  }
+}
+
+async function startSSHTransportWrapper(event, options) {
+  try {
+    return await startSSHTransport(event, options);
+  } catch (err) {
+    const isAuthError = err.message?.toLowerCase().includes('authentication') ||
+      err.message?.toLowerCase().includes('auth') ||
+      err.level === 'client-authentication';
+
+    if (isAuthError) {
+      const hasJumpHosts = options.jumpHosts && options.jumpHosts.length > 0;
+      const isPasswordOnly = !hasJumpHosts && !options.agentForwarding && !!options.password && !options.privateKey && !options.certificate;
+      if (!isPasswordOnly && (!options._unlockedEncryptedKeys || options._unlockedEncryptedKeys.length === 0)) {
+        const allKeysWithEncrypted = await findAllDefaultPrivateKeysFromHelper({ includeEncrypted: true });
+        const encryptedKeys = allKeysWithEncrypted.filter(k => k.isEncrypted);
+
+        if (encryptedKeys.length > 0) {
+          console.log('[SSH] Auth failed, found encrypted default keys. Requesting passphrases for retry...');
+
+          const passphraseResult = await requestPassphrasesForEncryptedKeys(
+            event.sender,
+            options.hostname
+          );
+
+          if (passphraseResult.cancelled) {
+            console.log('[SSH] User cancelled passphrase flow, not retrying');
+          } else if (passphraseResult.keys.length > 0) {
+            console.log('[SSH] User unlocked keys, retrying transport...', {
+              count: passphraseResult.keys.length,
+              keyNames: passphraseResult.keys.map(k => k.keyName)
+            });
+
+            try {
+              return await startSSHTransport(event, {
+                ...options,
+                _unlockedEncryptedKeys: passphraseResult.keys,
+              });
+            } catch (retryErr) {
+              const isRetryAuthError = retryErr.message?.toLowerCase().includes('authentication') ||
+                retryErr.message?.toLowerCase().includes('auth') ||
+                retryErr.level === 'client-authentication';
+
+              if (isRetryAuthError) {
+                const authError = new Error(retryErr.message);
+                authError.level = 'client-authentication';
+                authError.isAuthError = true;
+                throw authError;
+              }
+              const connError = new Error(retryErr.message);
+              connError.level = retryErr.level || 'client-socket';
+              connError.code = retryErr.code;
+              throw connError;
+            }
+          } else {
+            console.log('[SSH] User did not unlock any keys, not retrying');
+          }
+        }
+      }
+
+      const authError = new Error(err.message);
+      authError.level = 'client-authentication';
+      authError.isAuthError = true;
+      throw authError;
+    }
+
     const connError = new Error(err.message);
     connError.level = err.level || 'client-socket';
     connError.code = err.code;
@@ -2489,11 +3043,25 @@ async function setSessionEncoding(_event, { sessionId, encoding }) {
  */
 function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:start", startSSHSessionWrapper);
+  ipcMain.handle("netcatty:ssh:transport:start", startSSHTransportWrapper);
+  ipcMain.handle("netcatty:ssh:channel:open", openSSHChannel);
   ipcMain.handle("netcatty:ssh:exec", execCommand);
   ipcMain.handle("netcatty:ssh:pwd", getSessionPwd);
   ipcMain.handle("netcatty:ssh:remoteInfo", getSessionRemoteInfo);
   ipcMain.handle("netcatty:ssh:distroInfo", getSessionDistroInfo);
   ipcMain.handle("netcatty:ssh:listdir", listSessionDir);
+  ipcMain.handle("netcatty:ssh:docker:check", checkDockerSessionSupport);
+  ipcMain.handle("netcatty:ssh:docker:listContainers", listDockerContainersForSession);
+  ipcMain.handle("netcatty:ssh:docker:listFiles", listDockerFilesForSession);
+  ipcMain.handle("netcatty:ssh:docker:readText", readDockerTextFile);
+  ipcMain.handle("netcatty:ssh:docker:writeText", writeDockerTextFile);
+  ipcMain.handle("netcatty:ssh:docker:downloadFile", downloadDockerFileHandler);
+  ipcMain.handle("netcatty:ssh:docker:downloadFileToTemp", downloadDockerFileToTemp);
+  ipcMain.handle("netcatty:ssh:docker:mkdir", mkdirDockerPath);
+  ipcMain.handle("netcatty:ssh:docker:createFile", createDockerFile);
+  ipcMain.handle("netcatty:ssh:docker:delete", deleteDockerPath);
+  ipcMain.handle("netcatty:ssh:docker:rename", renameDockerPath);
+  ipcMain.handle("netcatty:ssh:docker:pwd", getDockerContainerPwd);
   ipcMain.handle("netcatty:ssh:stats", getServerStats);
   ipcMain.handle("netcatty:key:generate", generateKeyPair);
   ipcMain.handle("netcatty:ssh:setEncoding", setSessionEncoding);
@@ -2528,4 +3096,6 @@ module.exports = {
   registerHandlers,
   connectThroughChain,
   buildAlgorithms,
+  startSSHTransport,
+  openSSHChannel,
 };

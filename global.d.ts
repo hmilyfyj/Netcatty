@@ -1,4 +1,9 @@
-import type { RemoteFile, SftpFilenameEncoding } from "./types";
+import type {
+  DockerContainerSummary,
+  DockerSessionSupportResult,
+  RemoteFile,
+  SftpFilenameEncoding,
+} from "./types";
 import type { S3Config, SyncedFile, WebDAVConfig } from "./domain/sync";
 
 declare module "*.cjs" {
@@ -100,6 +105,18 @@ declare global {
     identityFilePaths?: string[];
   }
 
+  interface NetcattySSHChannelOptions {
+    transportId: string;
+    sessionId?: string;
+    channelId?: string;
+    cols?: number;
+    rows?: number;
+    charset?: string;
+    startupCommand?: string;
+    env?: Record<string, string>;
+    sessionLog?: { enabled: boolean; directory: string; format: string };
+  }
+
   interface SftpStatResult {
     name: string;
     type: 'file' | 'directory' | 'symlink';
@@ -164,6 +181,15 @@ declare global {
   interface NetcattyBridge {
     getWindowsPtyInfo?(): NetcattyWindowsPtyInfo | null;
     startSSHSession(options: NetcattySSHOptions): Promise<string>;
+    startSSHTransport?(options: NetcattySSHOptions): Promise<{
+      transportId: string;
+      remoteSshVersion?: string;
+    }>;
+    openSSHChannel?(options: NetcattySSHChannelOptions): Promise<{
+      sessionId: string;
+      channelId: string;
+      transportId: string;
+    }>;
     startTelnetSession?(options: {
       sessionId?: string;
       hostname: string;
@@ -367,6 +393,19 @@ declare global {
 
     // SFTP operations
     openSftp(options: NetcattySSHOptions): Promise<string>;
+    openSftpForSession?(sessionId: string, options?: { timeoutMs?: number }): Promise<string>;
+    dockerCheckSessionSupport?(sessionId: string): Promise<DockerSessionSupportResult>;
+    dockerListContainersForSession?(sessionId: string): Promise<DockerContainerSummary[]>;
+    dockerListFilesForSession?(sessionId: string, containerId: string, path: string): Promise<RemoteFile[]>;
+    dockerReadTextFile?(sessionId: string, containerId: string, path: string): Promise<string>;
+    dockerWriteTextFile?(sessionId: string, containerId: string, path: string, content: string): Promise<void>;
+    dockerDownloadFile?(sessionId: string, containerId: string, remotePath: string, localPath: string): Promise<{ localPath: string }>;
+    dockerDownloadFileToTemp?(sessionId: string, containerId: string, remotePath: string, fileName: string): Promise<{ localPath: string }>;
+    dockerCreateDirectory?(sessionId: string, containerId: string, path: string): Promise<void>;
+    dockerCreateFile?(sessionId: string, containerId: string, path: string): Promise<void>;
+    dockerDeletePath?(sessionId: string, containerId: string, path: string): Promise<void>;
+    dockerRenamePath?(sessionId: string, containerId: string, oldPath: string, newPath: string): Promise<void>;
+    dockerGetContainerPwd?(sessionId: string, containerId: string): Promise<{ success: boolean; cwd?: string; error?: string }>;
     listSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<RemoteFile[]>;
     readSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<string>;
     readSftpBinary?(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<ArrayBuffer>;

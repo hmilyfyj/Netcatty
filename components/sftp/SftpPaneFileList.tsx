@@ -18,6 +18,7 @@ import { buildSftpColumnTemplate, type ColumnWidths, type SortField, type SortOr
 import { isNavigableDirectory } from "./index";
 import { isKnownBinaryFile } from "../../lib/sftpFileUtils";
 import { SftpFileRow } from "./index";
+import { isDockerSftpConnection } from "../../application/state/sftp/backend";
 
 interface SftpPaneFileListProps {
   t: (key: string, params?: Record<string, unknown>) => string;
@@ -182,6 +183,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
   // Use refs for frequently-changing values in context-menu actions
   const selectedFilesRef = useRef(pane.selectedFiles);
   selectedFilesRef.current = pane.selectedFiles;
+  const showPermissionsAction = !!pane.connection && !pane.connection.isLocal && !isDockerSftpConnection(pane.connection);
 
   const handleBackgroundClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement;
@@ -303,7 +305,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
             <ContextMenuItem onClick={() => openRenameDialog(joinPath(pane.connection?.currentPath ?? "", entry.name))}>
               <Pencil size={14} className="mr-2" /> {t("common.rename")}
             </ContextMenuItem>
-            {onEditPermissions && pane.connection && !pane.connection.isLocal && (
+            {onEditPermissions && showPermissionsAction && (
               <ContextMenuItem onClick={() => onEditPermissions(entry)}>
                 <Shield size={14} className="mr-2" />{" "}
                 {t("sftp.context.permissions")}
@@ -359,6 +361,7 @@ export const SftpPaneFileList: React.FC<SftpPaneFileListProps> = React.memo(({
       openRenameDialog,
       pane.connection,
       pane.selectedFiles,
+      showPermissionsAction,
       setShowNewFolderDialog,
       setShowNewFileDialog,
       t,

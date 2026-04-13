@@ -1,10 +1,12 @@
 import { useCallback, useRef } from "react";
+import type { MutableRefObject } from "react";
 import type { Host, SftpFileEntry, SftpFilenameEncoding } from "../../../domain/models";
 import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
 import { logger } from "../../../lib/logger";
 import { SftpPane } from "./types";
 import { getFileName, getParentPath, isNavigableDirectory, isWindowsRoot, joinPath } from "./utils";
 import { buildCacheKey, setSharedRemoteHostCache } from "./sharedRemoteHostCache";
+import { isDockerSftpConnection, isLocalSftpConnection } from "./backend";
 
 /** Shared empty set for navigation resets — never mutate this. */
 const EMPTY_SET = new Set<string>();
@@ -14,18 +16,19 @@ interface UseSftpPaneActionsParams {
   getActivePane: (side: "left" | "right") => SftpPane | null;
   updateTab: (side: "left" | "right", tabId: string, updater: (pane: SftpPane) => SftpPane) => void;
   updateActiveTab: (side: "left" | "right", updater: (pane: SftpPane) => SftpPane) => void;
-  leftTabsRef: React.MutableRefObject<{ tabs: SftpPane[]; activeTabId: string | null }>;
-  rightTabsRef: React.MutableRefObject<{ tabs: SftpPane[]; activeTabId: string | null }>;
-  navSeqRef: React.MutableRefObject<{ left: number; right: number }>;
-  dirCacheRef: React.MutableRefObject<Map<string, { files: SftpFileEntry[]; timestamp: number }>>;
-  sftpSessionsRef: React.MutableRefObject<Map<string, string>>;
-  lastConnectedHostRef: React.MutableRefObject<{ left: Host | "local" | null; right: Host | "local" | null }>;
-  connectionCacheKeyMapRef: React.MutableRefObject<Map<string, string>>;
-  reconnectingRef: React.MutableRefObject<{ left: boolean; right: boolean }>;
+  leftTabsRef: MutableRefObject<{ tabs: SftpPane[]; activeTabId: string | null }>;
+  rightTabsRef: MutableRefObject<{ tabs: SftpPane[]; activeTabId: string | null }>;
+  navSeqRef: MutableRefObject<{ left: number; right: number }>;
+  dirCacheRef: MutableRefObject<Map<string, { files: SftpFileEntry[]; timestamp: number }>>;
+  sftpSessionsRef: MutableRefObject<Map<string, string>>;
+  lastConnectedHostRef: MutableRefObject<{ left: Host | "local" | null; right: Host | "local" | null }>;
+  connectionCacheKeyMapRef: MutableRefObject<Map<string, string>>;
+  reconnectingRef: MutableRefObject<{ left: boolean; right: boolean }>;
   makeCacheKey: (connectionId: string, path: string, encoding?: SftpFilenameEncoding) => string;
   clearCacheForConnection: (connectionId: string) => void;
   listLocalFiles: (path: string) => Promise<SftpFileEntry[]>;
   listRemoteFiles: (sftpId: string, path: string, encoding?: SftpFilenameEncoding) => Promise<SftpFileEntry[]>;
+  listDockerFiles: (sessionId: string, containerId: string, path: string) => Promise<SftpFileEntry[]>;
   handleSessionError: (side: "left" | "right", error: Error) => void;
   isSessionError: (err: unknown) => boolean;
   clearSelectionsExcept: (target: { side: "left" | "right"; tabId: string } | null) => void;
@@ -77,6 +80,7 @@ export const useSftpPaneActions = ({
   clearCacheForConnection,
   listLocalFiles,
   listRemoteFiles,
+  listDockerFiles,
   handleSessionError,
   isSessionError,
   clearSelectionsExcept,
@@ -197,7 +201,7 @@ export const useSftpPaneActions = ({
           error: null,
           selectedFiles: EMPTY_SET,
         }));
-        if (!pane.connection.isLocal) {
+        if (!isLocalSftpConnection(pane.connection) && !isDockerSftpConnection(pane.connection)) {
           // Use hostId as the shared cache key — this is safe because the
           // shared cache is a best-effort optimization and hostId uniquely
           // identifies the connection in the common case. Session-time
@@ -247,8 +251,17 @@ export const useSftpPaneActions = ({
       try {
         let files: SftpFileEntry[];
 
-        if (pane.connection.isLocal) {
+        if (isLocalSftpConnection(pane.connection)) {
           files = await listLocalFiles(path);
+        } else if (isDockerSftpConnection(pane.connection)) {
+          if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+            throw new Error("容器会话不可用");
+          }
+          files = await listDockerFiles(
+            pane.connection.sourceSessionId,
+            pane.connection.containerId,
+            path,
+          );
         } else {
           const sftpId = sftpSessionsRef.current.get(pane.connection.id);
           if (!sftpId) {
@@ -321,7 +334,7 @@ export const useSftpPaneActions = ({
           loading: false,
           selectedFiles: EMPTY_SET,
         }));
-        if (!pane.connection.isLocal) {
+        if (!isLocalSftpConnection(pane.connection) && !isDockerSftpConnection(pane.connection)) {
           setSharedRemoteHostCache(getActivePaneCacheKey(side, pane.connection.hostId, pane.connection.id), {
             path,
             homeDir: pane.connection.homeDir ?? path,
@@ -364,6 +377,7 @@ export const useSftpPaneActions = ({
       makeCacheKey,
       dirCacheTtlMs,
       listLocalFiles,
+      listDockerFiles,
       listRemoteFiles,
       sftpSessionsRef,
       clearCacheForConnection,
@@ -379,7 +393,10 @@ export const useSftpPaneActions = ({
         ? sideTabs.tabs.find((t) => t.id === options.tabId) ?? null
         : getActivePane(side);
       if (pane?.connection) {
-        const hasRemoteSession = pane.connection.isLocal || sftpSessionsRef.current.has(pane.connection.id);
+        const hasRemoteSession =
+          isLocalSftpConnection(pane.connection) ||
+          isDockerSftpConnection(pane.connection) ||
+          sftpSessionsRef.current.has(pane.connection.id);
         if (!hasRemoteSession) {
           if (options?.tabId) return;
           const lastHost = lastConnectedHostRef.current[side];
@@ -541,8 +558,17 @@ export const useSftpPaneActions = ({
       const fullPath = joinPath(path, name);
 
       try {
-        if (pane.connection.isLocal) {
+        if (isLocalSftpConnection(pane.connection)) {
           await netcattyBridge.get()?.mkdirLocal?.(fullPath);
+        } else if (isDockerSftpConnection(pane.connection)) {
+          if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+            throw new Error("容器会话不可用");
+          }
+          await netcattyBridge.get()?.dockerCreateDirectory?.(
+            pane.connection.sourceSessionId,
+            pane.connection.containerId,
+            fullPath,
+          );
         } else {
           const sftpId = sftpSessionsRef.current.get(pane.connection.id);
           if (!sftpId) {
@@ -582,7 +608,7 @@ export const useSftpPaneActions = ({
       const fullPath = joinPath(path, name);
 
       try {
-        if (pane.connection.isLocal) {
+        if (isLocalSftpConnection(pane.connection)) {
           const bridge = netcattyBridge.get();
           if (bridge?.writeLocalFile) {
             const emptyBuffer = new ArrayBuffer(0);
@@ -590,6 +616,15 @@ export const useSftpPaneActions = ({
           } else {
             throw new Error("Local file writing not supported");
           }
+        } else if (isDockerSftpConnection(pane.connection)) {
+          if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+            throw new Error("容器会话不可用");
+          }
+          await netcattyBridge.get()?.dockerCreateFile?.(
+            pane.connection.sourceSessionId,
+            pane.connection.containerId,
+            fullPath,
+          );
         } else {
           const sftpId = sftpSessionsRef.current.get(pane.connection.id);
           if (!sftpId) {
@@ -638,8 +673,17 @@ export const useSftpPaneActions = ({
         for (const name of fileNames) {
           const fullPath = joinPath(pane.connection.currentPath, name);
 
-          if (pane.connection.isLocal) {
+          if (isLocalSftpConnection(pane.connection)) {
             await netcattyBridge.get()?.deleteLocalFile?.(fullPath);
+          } else if (isDockerSftpConnection(pane.connection)) {
+            if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+              throw new Error("容器会话不可用");
+            }
+            await netcattyBridge.get()?.dockerDeletePath?.(
+              pane.connection.sourceSessionId,
+              pane.connection.containerId,
+              fullPath,
+            );
           } else {
             const sftpId = sftpSessionsRef.current.get(pane.connection.id);
             if (!sftpId) {
@@ -682,11 +726,24 @@ export const useSftpPaneActions = ({
         for (const name of fileNames) {
           const fullPath = joinPath(path, name);
 
-          if (pane.connection.isLocal) {
+          if (isLocalSftpConnection(pane.connection)) {
             if (!bridge.deleteLocalFile) {
               throw new Error("Local delete unavailable");
             }
             await bridge.deleteLocalFile(fullPath);
+          } else if (isDockerSftpConnection(pane.connection)) {
+            if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+              const error = new Error("容器会话不可用");
+              throw error;
+            }
+            if (!bridge.dockerDeletePath) {
+              throw new Error("Docker delete unavailable");
+            }
+            await bridge.dockerDeletePath(
+              pane.connection.sourceSessionId,
+              pane.connection.containerId,
+              fullPath,
+            );
           } else {
             const sftpId = sftpSessionsRef.current.get(pane.connection.id);
             if (!sftpId) {
@@ -752,8 +809,18 @@ export const useSftpPaneActions = ({
       const newPath = joinPath(pane.connection.currentPath, newName);
 
       try {
-        if (pane.connection.isLocal) {
+        if (isLocalSftpConnection(pane.connection)) {
           await netcattyBridge.get()?.renameLocalFile?.(oldPath, newPath);
+        } else if (isDockerSftpConnection(pane.connection)) {
+          if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+            throw new Error("容器会话不可用");
+          }
+          await netcattyBridge.get()?.dockerRenamePath?.(
+            pane.connection.sourceSessionId,
+            pane.connection.containerId,
+            oldPath,
+            newPath,
+          );
         } else {
           const sftpId = sftpSessionsRef.current.get(pane.connection.id);
           if (!sftpId) {
@@ -785,8 +852,18 @@ export const useSftpPaneActions = ({
       const newPath = joinPath(parentPath, newName);
 
       try {
-        if (pane.connection.isLocal) {
+        if (isLocalSftpConnection(pane.connection)) {
           await netcattyBridge.get()?.renameLocalFile?.(oldPath, newPath);
+        } else if (isDockerSftpConnection(pane.connection)) {
+          if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+            throw new Error("容器会话不可用");
+          }
+          await netcattyBridge.get()?.dockerRenamePath?.(
+            pane.connection.sourceSessionId,
+            pane.connection.containerId,
+            oldPath,
+            newPath,
+          );
         } else {
           const sftpId = sftpSessionsRef.current.get(pane.connection.id);
           if (!sftpId) {
@@ -839,7 +916,7 @@ export const useSftpPaneActions = ({
       }
 
       try {
-        if (pane.connection.isLocal) {
+        if (isLocalSftpConnection(pane.connection)) {
           const renameLocalFile = netcattyBridge.get()?.renameLocalFile;
           if (!renameLocalFile) {
             throw new Error("Local rename unavailable");
@@ -847,6 +924,23 @@ export const useSftpPaneActions = ({
           for (const sourcePath of movableSources) {
             const destinationPath = joinPath(targetPath, getFileName(sourcePath));
             await renameLocalFile(sourcePath, destinationPath);
+          }
+        } else if (isDockerSftpConnection(pane.connection)) {
+          if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+            throw new Error("容器会话不可用");
+          }
+          const renameDockerPath = netcattyBridge.get()?.dockerRenamePath;
+          if (!renameDockerPath) {
+            throw new Error("Docker rename unavailable");
+          }
+          for (const sourcePath of movableSources) {
+            const destinationPath = joinPath(targetPath, getFileName(sourcePath));
+            await renameDockerPath(
+              pane.connection.sourceSessionId,
+              pane.connection.containerId,
+              sourcePath,
+              destinationPath,
+            );
           }
         } else {
           const sftpId = sftpSessionsRef.current.get(pane.connection.id);
@@ -914,7 +1008,7 @@ export const useSftpPaneActions = ({
       mode: string,
     ) => {
       const pane = getActivePane(side);
-      if (!pane?.connection || pane.connection.isLocal) {
+      if (!pane?.connection || isLocalSftpConnection(pane.connection) || isDockerSftpConnection(pane.connection)) {
         logger.warn("Cannot change permissions on local files");
         return;
       }
