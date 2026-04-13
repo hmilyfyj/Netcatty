@@ -1027,7 +1027,9 @@ function closeSession(event, payload) {
     session.flushPendingData?.();
     if (session.stream) {
       session.stream.close();
-      session.conn?.end();
+      if (!session.transportId) {
+        session.conn?.end();
+      }
     } else if (session.proc) {
       session.proc.kill();
     } else if (session.socket) {
@@ -1035,7 +1037,7 @@ function closeSession(event, payload) {
     } else if (session.serialPort) {
       session.serialPort.close();
     }
-    if (session.chainConnections) {
+    if (!session.transportId && session.chainConnections) {
       for (const c of session.chainConnections) {
         try { c.end(); } catch {}
       }

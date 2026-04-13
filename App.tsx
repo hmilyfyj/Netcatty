@@ -283,6 +283,7 @@ function App({ settings }: { settings: SettingsState }) {
     closeGroup,
     closeWorkspace,
     updateSessionStatus,
+    updateSessionConnectionMeta,
     createWorkspaceWithHosts,
     createWorkspaceFromSessions,
     addSessionToWorkspace,
@@ -1558,6 +1559,7 @@ function App({ settings }: { settings: SettingsState }) {
           onSelectConsoleInGroup={selectConsoleInGroup}
           onCloseConsoleInGroup={closeConsoleInGroup}
           onUpdateSessionStatus={handleSessionStatusChange}
+          onUpdateSessionConnectionMeta={updateSessionConnectionMeta}
           onUpdateHostDistro={updateHostDistro}
           onUpdateHost={(host) => updateHosts(hosts.map(h => h.id === host.id ? host : h))}
           onAddKnownHost={(kh) => updateKnownHosts([...knownHosts, kh])}

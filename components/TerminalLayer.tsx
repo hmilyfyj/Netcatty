@@ -38,7 +38,6 @@ import { DistroAvatar } from './DistroAvatar';
 import Terminal from './Terminal';
 import { SftpSidePanel } from './SftpSidePanel';
 import { ScriptsSidePanel } from './ScriptsSidePanel';
-import { ServerStatsBar } from './terminal/ServerStatsBar';
 import { ThemeSidePanel } from './terminal/ThemeSidePanel';
 import { useServerStats } from './terminal/hooks/useServerStats';
 import { isServerStatsSupportedHost } from './terminal/serverStatsSupport';
@@ -373,6 +372,10 @@ interface TerminalLayerProps {
   onSelectConsoleInGroup?: (groupId: string, sessionId: string) => void;
   onCloseConsoleInGroup?: (groupId: string, sessionId: string) => void;
   onUpdateSessionStatus: (sessionId: string, status: TerminalSession['status']) => void;
+  onUpdateSessionConnectionMeta?: (
+    sessionId: string,
+    meta: Pick<TerminalSession, 'transportId' | 'channelId'>,
+  ) => void;
   onUpdateHostDistro: (hostId: string, distro: string) => void;
   onUpdateHost: (host: Host) => void;
   onAddKnownHost?: (knownHost: KnownHost) => void;
@@ -433,6 +436,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   onSelectConsoleInGroup,
   onCloseConsoleInGroup,
   onUpdateSessionStatus,
+  onUpdateSessionConnectionMeta,
   onUpdateHostDistro,
   onUpdateHost,
   onAddKnownHost,
@@ -530,9 +534,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (evt.reason === "exited") {
       onCloseSession(sessionId);
     } else {
+      onUpdateSessionConnectionMeta?.(sessionId, {
+        transportId: undefined,
+        channelId: undefined,
+      });
       onUpdateSessionStatus(sessionId, 'disconnected');
     }
-  }, [onUpdateSessionStatus, onCloseSession]);
+  }, [onCloseSession, onUpdateSessionConnectionMeta, onUpdateSessionStatus]);
 
   const handleOsDetected = useCallback((hostId: string, distro: string) => {
     onUpdateHostDistro(hostId, distro);
@@ -607,6 +615,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
     return sessions.find(s => s.id === activeTabId);
   }, [activeGroup, activeGroupSessions, sessions, activeTabId]);
+  const groupStatsSourceSession = useMemo(() => {
+    if (!activeGroup || activeGroupSessions.length === 0) return null;
+    return activeGroupSessions.find((session) => session.status === 'connected') ?? activeGroupSessions[0];
+  }, [activeGroup, activeGroupSessions]);
 
   // Handle broadcast input - write to all other sessions in the same workspace
   const handleBroadcastInput = useCallback((data: string, sourceSessionId: string) => {
@@ -667,11 +679,84 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const [sftpInitialLocationForTab, setSftpInitialLocationForTab] = useState<
     Map<string, { hostId: string; path: string }>
   >(new Map());
+  const [sessionCwdById, setSessionCwdById] = useState<Map<string, string>>(new Map());
   const [sftpPendingUploadsForTab, setSftpPendingUploadsForTab] = useState<
     Map<string, PendingSftpUpload>
   >(new Map());
   const sftpHostForTabRef = useRef(sftpHostForTab);
   sftpHostForTabRef.current = sftpHostForTab;
+  const sessionCwdByIdRef = useRef(sessionCwdById);
+  sessionCwdByIdRef.current = sessionCwdById;
+
+  useEffect(() => {
+    const validSessionIds = new Set(sessions.map((session) => session.id));
+    setSessionCwdById((prev) => {
+      let changed = false;
+      const next = new Map<string, string>();
+      prev.forEach((cwd, sessionId) => {
+        if (validSessionIds.has(sessionId)) {
+          next.set(sessionId, cwd);
+          return;
+        }
+        changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [sessions]);
+
+  const isSessionDrivingTab = useCallback((session: TerminalSession, tabId: string): boolean => {
+    if (session.workspaceId === tabId) {
+      return workspacesRef.current.find((workspace) => workspace.id === tabId)?.focusedSessionId === session.id;
+    }
+    if (session.groupId === tabId) {
+      const group = groupsRef.current.find((entry) => entry.id === tabId);
+      if (!group) return false;
+      if (group.activeSessionId) {
+        return group.activeSessionId === session.id;
+      }
+      const groupSessions = sessionsRef.current
+        .filter((entry) => entry.groupId === tabId)
+        .sort((a, b) => (a.groupConsoleIndex ?? 0) - (b.groupConsoleIndex ?? 0));
+      return groupSessions[0]?.id === session.id;
+    }
+    return tabId === session.id;
+  }, []);
+
+  const syncSftpLocationToSessionCwd = useCallback((sessionId: string, cwd: string) => {
+    const session = sessionsRef.current.find((entry) => entry.id === sessionId);
+    if (!session || !cwd) return;
+
+    const tabId = session.workspaceId || session.groupId || session.id;
+    if (!isSessionDrivingTab(session, tabId)) return;
+
+    const hostId = session.hostId || session.id;
+    setSftpInitialLocationForTab((prev) => {
+      const current = prev.get(tabId);
+      if (current?.hostId === hostId && current.path === cwd) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.set(tabId, { hostId, path: cwd });
+      return next;
+    });
+  }, [isSessionDrivingTab]);
+
+  const handleSessionCwdResolved = useCallback((
+    sessionId: string,
+    cwd: string,
+    _reason: "initial" | "command" | "osc",
+  ) => {
+    setSessionCwdById((prev) => {
+      const current = prev.get(sessionId);
+      if (current === cwd) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.set(sessionId, cwd);
+      return next;
+    });
+    syncSftpLocationToSessionCwd(sessionId, cwd);
+  }, [syncSftpLocationToSessionCwd]);
 
   const handleToggleWorkspaceComposeBar = useCallback(() => {
     setIsComposeBarOpen(prev => !prev);
@@ -860,10 +945,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
     return map;
   }, [sessions, hostMap, groupConfigs]);
-  const activeSessionHost = useMemo(() => {
-    if (!activeSession) return null;
-    return sessionHostsMap.get(activeSession.id) ?? null;
-  }, [activeSession, sessionHostsMap]);
+  const groupStatsSourceHost = useMemo(() => {
+    if (!groupStatsSourceSession) return null;
+    return sessionHostsMap.get(groupStatsSourceSession.id) ?? null;
+  }, [groupStatsSourceSession, sessionHostsMap]);
   const sessionChainHostsMap = useMemo(() => {
     const map = new Map<string, Host[]>();
     for (const session of sessions) {
@@ -1205,15 +1290,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   const isTerminalLayerVisible = isVisible || !!draggingSessionId;
   const activeGroupSupportsServerStats = useMemo(
-    () => isServerStatsSupportedHost(activeSessionHost),
-    [activeSessionHost],
+    () => isServerStatsSupportedHost(groupStatsSourceHost),
+    [groupStatsSourceHost],
   );
   const { stats: activeGroupServerStats } = useServerStats({
-    sessionId: activeSession?.id ?? '',
+    sessionId: groupStatsSourceSession?.id ?? '',
     enabled: !!activeGroup && (terminalSettings?.showServerStats ?? true),
     refreshInterval: terminalSettings?.serverStatsRefreshInterval ?? 5,
     isSupportedOs: activeGroupSupportsServerStats,
-    isConnected: activeSession?.status === 'connected',
+    isConnected: groupStatsSourceSession?.status === 'connected',
     isVisible: isTerminalLayerVisible && !!activeGroup,
   });
 
@@ -1269,11 +1354,21 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (!sessionId) return null;
     try {
       const result = await terminalBackend.getSessionPwd(sessionId);
-      return result.success && result.cwd ? result.cwd : null;
+      if (result.success && result.cwd) {
+        setSessionCwdById((prev) => {
+          if (prev.get(sessionId) === result.cwd) return prev;
+          const next = new Map(prev);
+          next.set(sessionId, result.cwd);
+          return next;
+        });
+        syncSftpLocationToSessionCwd(sessionId, result.cwd);
+        return result.cwd;
+      }
+      return sessionCwdByIdRef.current.get(sessionId) ?? null;
     } catch {
-      return null;
+      return sessionCwdByIdRef.current.get(sessionId) ?? null;
     }
-  }, [activeWorkspace?.focusedSessionId, activeSession?.id, terminalBackend]);
+  }, [activeWorkspace?.focusedSessionId, activeSession?.id, syncSftpLocationToSessionCwd, terminalBackend]);
 
   // Close the entire side panel for the current tab
   const handleCloseSidePanel = useCallback(() => {
@@ -1931,82 +2026,54 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (!activeGroup || activeGroupSessions.length === 0) return null;
 
     return (
-      <div className="shrink-0 border-b border-border/50 bg-background/95" data-section="terminal-group-tabs">
-        <div className="h-10 flex items-center gap-1 px-3">
-          <div className="flex items-center gap-1 min-w-0 flex-1 overflow-x-auto scrollbar-none">
-            {activeGroupSessions.map((session) => {
-              const isActiveConsole = session.id === activeSession?.id;
-              const statusColor = session.status === 'connected'
-                ? 'text-emerald-500'
-                : session.status === 'connecting'
-                  ? 'text-amber-500'
-                  : 'text-rose-500';
-              return (
-                <button
-                  key={session.id}
-                  type="button"
-                  className={cn(
-                    "h-7 px-3 rounded-md text-xs font-medium inline-flex items-center gap-2 shrink-0 border transition-colors",
-                    isActiveConsole
-                      ? "bg-primary/12 border-primary/30 text-foreground"
-                      : "bg-transparent border-border/50 text-muted-foreground hover:text-foreground hover:bg-muted/60",
-                  )}
-                  onClick={() => onSelectConsoleInGroup?.(activeGroup.id, session.id)}
+      <div
+        className="h-10 shrink-0 flex items-center gap-1 px-3 border-b border-border/50 bg-background/95"
+        data-section="terminal-group-tabs"
+      >
+        <div className="flex items-center gap-1 min-w-0 flex-1 overflow-x-auto scrollbar-none">
+          {activeGroupSessions.map((session) => {
+            const isActiveConsole = session.id === activeSession?.id;
+            const statusColor = session.status === 'connected'
+              ? 'text-emerald-500'
+              : session.status === 'connecting'
+                ? 'text-amber-500'
+                : 'text-rose-500';
+            return (
+              <button
+                key={session.id}
+                type="button"
+                className={cn(
+                  "h-7 px-3 rounded-md text-xs font-medium inline-flex items-center gap-2 shrink-0 border transition-colors",
+                  isActiveConsole
+                    ? "bg-primary/12 border-primary/30 text-foreground"
+                    : "bg-transparent border-border/50 text-muted-foreground hover:text-foreground hover:bg-muted/60",
+                )}
+                onClick={() => onSelectConsoleInGroup?.(activeGroup.id, session.id)}
+              >
+                <span>{`控制台 ${session.groupConsoleIndex ?? 1}`}</span>
+                <Circle size={8} className={cn("flex-shrink-0 fill-current", statusColor)} />
+                <span
+                  className="rounded-full p-0.5 hover:bg-destructive/10 hover:text-destructive"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onCloseConsoleInGroup?.(activeGroup.id, session.id);
+                  }}
                 >
-                  <span>{`控制台 ${session.groupConsoleIndex ?? 1}`}</span>
-                  <Circle size={8} className={cn("flex-shrink-0 fill-current", statusColor)} />
-                  <span
-                    className="rounded-full p-0.5 hover:bg-destructive/10 hover:text-destructive"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onCloseConsoleInGroup?.(activeGroup.id, session.id);
-                    }}
-                  >
-                    <X size={12} />
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7 shrink-0"
-            onClick={() => onCreateConsoleInGroup?.(activeGroup.id)}
-            title="新建控制台"
-          >
-            <Plus size={14} />
-          </Button>
+                  <X size={12} />
+                </span>
+              </button>
+            );
+          })}
         </div>
-        <div className="flex items-center gap-3 px-3 py-2 border-t border-border/40 bg-muted/20">
-          <div className="flex items-center gap-2 min-w-0 shrink-0">
-            {activeSessionHost ? (
-              <DistroAvatar host={activeSessionHost} fallback={activeGroup.hostLabel} size="sm" />
-            ) : (
-              <Server size={16} className="text-muted-foreground" />
-            )}
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="text-xs font-medium truncate">{activeGroup.hostLabel}</span>
-                <Circle
-                  size={8}
-                  className={cn(
-                    'shrink-0 fill-current',
-                    activeSession?.status === 'connected'
-                      ? 'text-emerald-500'
-                      : activeSession?.status === 'connecting'
-                        ? 'text-amber-500'
-                        : 'text-rose-500',
-                  )}
-                />
-              </div>
-              <div className="text-[10px] text-muted-foreground truncate">
-                {[activeGroup.username, activeGroup.hostname].filter(Boolean).join('@')}
-              </div>
-            </div>
-          </div>
-          <ServerStatsBar stats={activeGroupServerStats} className="min-w-0 flex-1 justify-end" />
-        </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 shrink-0"
+          onClick={() => onCreateConsoleInGroup?.(activeGroup.id)}
+          title="新建控制台"
+        >
+          <Plus size={14} />
+        </Button>
       </div>
     );
   };
@@ -2439,8 +2506,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   terminalTheme={terminalTheme}
                   followAppTerminalTheme={followAppTerminalTheme}
                   terminalSettings={terminalSettings}
-                  showServerStatsInHeader={!session.groupId}
+                  serverStatsOverride={session.groupId ? activeGroupServerStats : null}
                   sessionId={session.id}
+                  groupId={session.groupId}
+                  transportId={session.transportId}
+                  channelId={session.channelId}
                   startupCommand={session.startupCommand}
                   noAutoRun={session.noAutoRun}
                   serialConfig={session.serialConfig}
@@ -2452,12 +2522,14 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   onOpenTheme={handleOpenTheme}
                   onCloseSession={handleCloseSession}
                   onStatusChange={handleStatusChange}
+                  onUpdateSessionConnectionMeta={onUpdateSessionConnectionMeta}
                   onSessionExit={handleSessionExit}
                   onTerminalDataCapture={handleTerminalDataCapture}
                   onOsDetected={handleOsDetected}
                   onUpdateHost={handleUpdateHost}
                   onAddKnownHost={handleAddKnownHost}
                   onCommandExecuted={handleCommandExecuted}
+                  onSessionCwdResolved={handleSessionCwdResolved}
                   onExpandToFocus={inActiveWorkspace && !isFocusMode ? workspaceFocusHandler : undefined}
                   onSplitHorizontal={onSplitSession && !session.groupId ? splitHorizontalHandler : undefined}
                   onSplitVertical={onSplitSession && !session.groupId ? splitVerticalHandler : undefined}

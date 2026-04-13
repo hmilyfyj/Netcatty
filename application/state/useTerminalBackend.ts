@@ -33,6 +33,18 @@ export const useTerminalBackend = () => {
     return bridge.startSSHSession(options);
   }, []);
 
+  const startSSHTransport = useCallback(async (options: NetcattySSHOptions) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.startSSHTransport) throw new Error("startSSHTransport unavailable");
+    return bridge.startSSHTransport(options);
+  }, []);
+
+  const openSSHChannel = useCallback(async (options: NetcattySSHChannelOptions) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.openSSHChannel) throw new Error("openSSHChannel unavailable");
+    return bridge.openSSHChannel(options);
+  }, []);
+
   const startTelnetSession = useCallback(async (options: Parameters<NonNullable<NetcattyBridge["startTelnetSession"]>>[0]) => {
     const bridge = netcattyBridge.get();
     if (!bridge?.startTelnetSession) throw new Error("startTelnetSession unavailable");
@@ -113,7 +125,7 @@ export const useTerminalBackend = () => {
 
   const backendAvailable = useCallback(() => {
     const bridge = netcattyBridge.get();
-    return !!bridge?.startSSHSession;
+    return !!bridge?.startSSHSession || (!!bridge?.startSSHTransport && !!bridge?.openSSHChannel);
   }, []);
 
   const listSerialPorts = useCallback(async () => {
@@ -159,6 +171,8 @@ export const useTerminalBackend = () => {
     execAvailable,
     openExternalAvailable,
     startSSHSession,
+    startSSHTransport,
+    openSSHChannel,
     startTelnetSession,
     startMoshSession,
     startLocalSession,

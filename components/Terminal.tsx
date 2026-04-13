@@ -51,7 +51,7 @@ import { XTERM_PERFORMANCE_CONFIG } from "../infrastructure/config/xtermPerforma
 import { useTerminalSearch } from "./terminal/hooks/useTerminalSearch";
 import { useTerminalContextActions } from "./terminal/hooks/useTerminalContextActions";
 import { useTerminalAuthState } from "./terminal/hooks/useTerminalAuthState";
-import { useServerStats } from "./terminal/hooks/useServerStats";
+import { useServerStats, type ServerStats } from "./terminal/hooks/useServerStats";
 import { ServerStatsBar } from "./terminal/ServerStatsBar";
 import { isServerStatsSupportedHost } from "./terminal/serverStatsSupport";
 import { extractDropEntries, getPathForFile, DropEntry } from "../lib/sftpFileUtils";
@@ -126,6 +126,9 @@ interface TerminalProps {
   followAppTerminalTheme?: boolean;
   terminalSettings?: TerminalSettings;
   sessionId: string;
+  groupId?: string;
+  transportId?: string;
+  channelId?: string;
   startupCommand?: string;
   noAutoRun?: boolean;
   serialConfig?: SerialConfig;
@@ -133,6 +136,10 @@ interface TerminalProps {
   keyBindings?: KeyBinding[];
   onHotkeyAction?: (action: string, event: KeyboardEvent) => void;
   onStatusChange?: (sessionId: string, status: TerminalSession["status"]) => void;
+  onUpdateSessionConnectionMeta?: (
+    sessionId: string,
+    meta: Pick<TerminalSession, "transportId" | "channelId">,
+  ) => void;
   onSessionExit?: (sessionId: string, evt: { exitCode?: number; signal?: number; error?: string; reason?: "exited" | "error" | "timeout" | "closed" }) => void;
   onTerminalDataCapture?: (sessionId: string, data: string) => void;
   onOsDetected?: (hostId: string, distro: string) => void;
@@ -145,6 +152,11 @@ interface TerminalProps {
     hostId: string,
     hostLabel: string,
     sessionId: string,
+  ) => void;
+  onSessionCwdResolved?: (
+    sessionId: string,
+    cwd: string,
+    reason: "initial" | "command" | "osc",
   ) => void;
   onSplitHorizontal?: () => void;
   onSplitVertical?: () => void;
@@ -168,6 +180,7 @@ interface TerminalProps {
   // Session log configuration for real-time streaming
   sessionLog?: { enabled: boolean; directory: string; format: string };
   showServerStatsInHeader?: boolean;
+  serverStatsOverride?: ServerStats | null;
 }
 
 const TerminalComponent: React.FC<TerminalProps> = ({
@@ -189,6 +202,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   followAppTerminalTheme = false,
   terminalSettings,
   sessionId,
+  groupId,
+  transportId,
+  channelId,
   startupCommand,
   noAutoRun,
   serialConfig,
@@ -196,6 +212,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   keyBindings = [],
   onHotkeyAction,
   onStatusChange,
+  onUpdateSessionConnectionMeta,
   onSessionExit,
   onTerminalDataCapture,
   onOsDetected,
@@ -204,6 +221,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   onAddKnownHost,
   onExpandToFocus,
   onCommandExecuted,
+  onSessionCwdResolved,
   onSplitHorizontal,
   onSplitVertical,
   onOpenSftp,
@@ -217,6 +235,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   onSnippetExecutorChange,
   sessionLog,
   showServerStatsInHeader = true,
+  serverStatsOverride = null,
 }) => {
   // Timeout for connection - increased to 120s to allow time for keyboard-interactive (2FA) authentication
   const CONNECTION_TIMEOUT = 120000;
@@ -237,6 +256,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const terminalDataCapturedRef = useRef(false);
   const onTerminalDataCaptureRef = useRef(onTerminalDataCapture);
   const commandBufferRef = useRef<string>("");
+  const cwdRefreshTimerRef = useRef<number | null>(null);
   const [hasMouseTracking, setHasMouseTracking] = useState(false);
   const mouseTrackingRef = useRef(false);
   const serialLineBufferRef = useRef<string>("");
@@ -422,7 +442,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       for (const ch of text) {
         if (ch === "\r" || ch === "\n") {
           const cmd = commandBufferRef.current.trim();
-          if (cmd && onCommandExecuted) onCommandExecuted(cmd, host.id, host.label, sessionId);
+          if (cmd) {
+            handleTrackedCommandExecuted(cmd);
+          }
           commandBufferRef.current = "";
         } else if (ch === "\x15") {
           // Ctrl+U: clear line — reset command buffer (fuzzy match sends this)
@@ -468,6 +490,58 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   }, [sessionId, host.id]);
 
   useEffect(() => {
+    return () => {
+      if (cwdRefreshTimerRef.current !== null) {
+        window.clearTimeout(cwdRefreshTimerRef.current);
+        cwdRefreshTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const reportResolvedCwd = useCallback((cwd: string, reason: "initial" | "command" | "osc") => {
+    knownCwdRef.current = cwd;
+    onSessionCwdResolved?.(sessionId, cwd, reason);
+  }, [onSessionCwdResolved, sessionId]);
+
+  const refreshRemoteCwd = useCallback(async (reason: "initial" | "command") => {
+    if (host.protocol === "local" || host.protocol === "serial" || host.protocol === "telnet") {
+      return;
+    }
+    if (!sessionRef.current) return;
+    try {
+      const result = await terminalBackend.getSessionPwd(sessionRef.current);
+      if (result.success && result.cwd) {
+        reportResolvedCwd(result.cwd, reason);
+      }
+    } catch {
+      // Best effort only.
+    }
+  }, [host.protocol, reportResolvedCwd, terminalBackend]);
+
+  const maybeRefreshCwdAfterCommand = useCallback((command: string) => {
+    if (
+      host.protocol === "local"
+      || host.protocol === "serial"
+      || host.protocol === "telnet"
+      || !/^(?:cd|pwd)(?=$|\s|;|&&|\|\|)/.test(command)
+    ) {
+      return;
+    }
+    if (cwdRefreshTimerRef.current !== null) {
+      window.clearTimeout(cwdRefreshTimerRef.current);
+    }
+    cwdRefreshTimerRef.current = window.setTimeout(() => {
+      void refreshRemoteCwd("command");
+    }, 120);
+  }, [host.protocol, refreshRemoteCwd]);
+
+  const handleTrackedCommandExecuted = useCallback((command: string) => {
+    if (!command) return;
+    onCommandExecuted?.(command, host.id, host.label, sessionId);
+    maybeRefreshCwdAfterCommand(command);
+  }, [host.id, host.label, maybeRefreshCwdAfterCommand, onCommandExecuted, sessionId]);
+
+  useEffect(() => {
     if (host.protocol === "local" || host.protocol === "serial" || host.protocol === "telnet") {
       return;
     }
@@ -475,12 +549,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
 
     let cancelled = false;
     const timer = setTimeout(async () => {
-      if (!sessionRef.current) return;
       try {
-        const result = await terminalBackend.getSessionPwd(sessionRef.current);
-        if (!cancelled && result.success && result.cwd) {
-          knownCwdRef.current = result.cwd;
-        }
+        await refreshRemoteCwd("initial");
+        if (cancelled) return;
       } catch {
         // Best effort only.
       }
@@ -490,7 +561,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [host.protocol, status, terminalBackend]);
+  }, [host.protocol, refreshRemoteCwd, status]);
 
   useEffect(() => {
     if (!isVisible) {
@@ -521,12 +592,16 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const isSupportedOs = isServerStatsSupportedHost(host);
   const { stats: serverStats } = useServerStats({
     sessionId,
-    enabled: (terminalSettings?.showServerStats ?? true) && showServerStatsInHeader,
+    enabled:
+      (terminalSettings?.showServerStats ?? true) &&
+      showServerStatsInHeader &&
+      !serverStatsOverride,
     refreshInterval: terminalSettings?.serverStatsRefreshInterval ?? 5,
     isSupportedOs,
     isConnected: status === 'connected',
     isVisible,
   });
+  const effectiveServerStats = serverStatsOverride ?? serverStats;
 
   const zmodem = useZmodemTransfer(sessionId);
 
@@ -683,6 +758,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     identities,
     resolvedChainHosts,
     sessionId,
+    groupId,
+    transportId,
+    channelId,
     startupCommand,
     noAutoRun,
     terminalSettings,
@@ -717,6 +795,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       }
     },
     onSessionExit,
+    onSessionConnectionMeta: onUpdateSessionConnectionMeta,
     onTerminalDataCapture: handleTerminalDataCaptureOnce,
     onOsDetected,
     onCommandExecuted,
@@ -756,7 +835,9 @@ const TerminalComponent: React.FC<TerminalProps> = ({
           snippetsRef,
           sessionId,
           statusRef,
-          onCommandExecuted,
+          onCommandExecuted: (command) => {
+            handleTrackedCommandExecuted(command);
+          },
           commandBufferRef,
           setIsSearchOpen,
           // Serial-specific options
@@ -764,7 +845,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
           serialLineMode: serialConfig?.lineMode,
           serialLineBufferRef,
           onCwdChange: (cwd: string) => {
-            knownCwdRef.current = cwd;
+            reportResolvedCwd(cwd, "osc");
           },
           onOsc52ReadRequest: handleOsc52ReadRequest,
           // Autocomplete integration
@@ -1662,7 +1743,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
               />
             </div>
             {showServerStatsInHeader && terminalSettings?.showServerStats && status === 'connected' && (
-              <ServerStatsBar stats={serverStats} className="ml-2" />
+              <ServerStatsBar stats={effectiveServerStats} className="ml-2" />
             )}
             <div className="flex-1" />
             <div className="flex items-center gap-0.5 flex-shrink-0">

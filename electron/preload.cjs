@@ -539,6 +539,12 @@ const api = {
     const result = await ipcRenderer.invoke("netcatty:start", options);
     return result.sessionId;
   },
+  startSSHTransport: async (options) => {
+    return ipcRenderer.invoke("netcatty:ssh:transport:start", options);
+  },
+  openSSHChannel: async (options) => {
+    return ipcRenderer.invoke("netcatty:ssh:channel:open", options);
+  },
   startTelnetSession: async (options) => {
     const result = await ipcRenderer.invoke("netcatty:telnet:start", options);
     return result.sessionId;

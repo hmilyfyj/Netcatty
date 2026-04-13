@@ -192,6 +192,26 @@ export const useSessionState = () => {
     setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, status } : s));
   }, []);
 
+  const updateSessionConnectionMeta = useCallback((
+    sessionId: string,
+    meta: Pick<TerminalSession, 'transportId' | 'channelId'>,
+  ) => {
+    setSessions(prev => {
+      const targetSession = prev.find(session => session.id === sessionId);
+      if (!targetSession) return prev;
+
+      return prev.map(session => {
+        if (session.id === sessionId) {
+          return { ...session, ...meta };
+        }
+        if (meta.transportId && targetSession.groupId && session.groupId === targetSession.groupId && !session.transportId) {
+          return { ...session, transportId: meta.transportId };
+        }
+        return session;
+      });
+    });
+  }, []);
+
   const selectConsoleInGroup = useCallback((groupId: string, sessionId: string) => {
     setGroups(prev => prev.map(group => (
       group.id === groupId
@@ -212,12 +232,17 @@ export const useSessionState = () => {
     );
     if (!baseSession) return null;
 
+    const sharedTransportId = baseSession.transportId
+      || sessions.find(session => session.groupId === groupId && session.transportId)?.transportId;
+
     const nextShellType = baseSession.protocol === 'local'
       ? options?.localShellType
       : baseSession.shellType;
     const newSession = cloneSessionConnection(baseSession, {
       groupId,
       groupConsoleIndex: group.nextConsoleIndex,
+      transportId: sharedTransportId,
+      channelId: undefined,
       shellType: nextShellType,
     });
 
@@ -951,6 +976,7 @@ export const useSessionState = () => {
     closeGroup,
     closeWorkspace,
     updateSessionStatus,
+    updateSessionConnectionMeta,
     createWorkspaceWithHosts,
     createWorkspaceFromSessions,
     addSessionToWorkspace,

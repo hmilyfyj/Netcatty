@@ -293,6 +293,7 @@ function buildAlgorithms(legacyEnabled) {
 // Session storage - shared reference passed from main
 let sessions = null;
 let electronModule = null;
+const sshTransports = new Map();
 
 // Authentication method cache - remembers successful auth methods per host
 // Key format: "username@hostname:port"
@@ -370,6 +371,39 @@ const { safeSend } = require("./ipcUtils.cjs");
 function init(deps) {
   sessions = deps.sessions;
   electronModule = deps.electronModule;
+}
+
+function createTransportId() {
+  return `ssh-transport-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function stopSessionArtifacts(sessionId, session) {
+  sessionLogStreamManager.stopStream(sessionId);
+  session?.zmodemSentry?.cancel();
+  sessionEncodings.delete(sessionId);
+  sessionDecoders.delete(sessionId);
+}
+
+function closeTransportById(transportId) {
+  const transport = sshTransports.get(transportId);
+  if (!transport) return;
+
+  sshTransports.delete(transportId);
+
+  try { transport.conn?.end(); } catch {}
+  for (const conn of transport.chainConnections || []) {
+    try { conn.end(); } catch {}
+  }
+}
+
+function detachSessionFromTransport(transportId, sessionId) {
+  const transport = sshTransports.get(transportId);
+  if (!transport) return;
+
+  transport.channelSessionIds.delete(sessionId);
+  if (transport.channelSessionIds.size === 0) {
+    closeTransportById(transportId);
+  }
 }
 
 /**
@@ -645,15 +679,13 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
 }
 
 /**
- * Start an SSH session
+ * Start an SSH transport
  */
-async function startSSHSession(event, options) {
+async function startSSHTransport(event, options) {
   const sessionId =
     options.sessionId ||
     `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-  const cols = options.cols || 80;
-  const rows = options.rows || 24;
+  const transportId = options.transportId || createTransportId();
   const sender = event.sender;
 
   const sendProgress = (hop, total, label, status, error) => {
@@ -1162,195 +1194,28 @@ async function startSSHSession(event, options) {
         }
 
         sendProgress(totalHops, totalHops, options.hostname, 'authenticated');
-        sendProgress(totalHops, totalHops, options.hostname, 'shell');
-
-        conn.shell(
-          {
-            term: "xterm-256color",
-            cols,
-            rows,
+        const transport = {
+          id: transportId,
+          conn,
+          chainConnections,
+          webContentsId: event.sender.id,
+          hostname: options.host || options.hostname || '',
+          username: options.username || '',
+          label: options.label || options.hostLabel || '',
+          remoteSshVersion: (conn && typeof conn._remoteVer === 'string') ? conn._remoteVer : '',
+          channelSessionIds: new Set(),
+          progress: {
+            totalHops,
+            hostname: options.hostname,
           },
-          {
-            env: {
-              LANG: resolveLangFromCharset(options.charset),
-              COLORTERM: "truecolor",
-              ...(options.env || {}),
-            },
-          },
-          (err, stream) => {
-            if (err) {
-              settled = true;
-              conn.end();
-              for (const c of chainConnections) {
-                try { c.end(); } catch { }
-              }
-              sendProgress(totalHops, totalHops, options.hostname, 'error', `Failed to open shell: ${err.message}`);
-              reject(err);
-              return;
-            }
+        };
+        sshTransports.set(transportId, transport);
 
-            sendProgress(totalHops, totalHops, options.hostname, 'connected');
-
-            const session = {
-              conn,
-              stream,
-              chainConnections,
-              webContentsId: event.sender.id,
-              // Store connection info for MCP host discovery
-              hostname: options.host || options.hostname || '',
-              username: options.username || '',
-              label: options.label || '',
-              lastIdlePrompt: '',
-              lastIdlePromptAt: 0,
-              _promptTrackTail: '',
-              // SSH server identification string (the `software` part of
-              // `SSH-2.0-<software>`). ssh2 captures this during the header
-              // exchange and stores it on the client as `_remoteVer` — it
-              // is available by the time 'ready' fires, so the renderer can
-              // use it to detect network-device vendors without running any
-              // additional exec channels. See domain/host.ts
-              // `detectVendorFromSshVersion`.
-              remoteSshVersion: (conn && typeof conn._remoteVer === 'string') ? conn._remoteVer : '',
-            };
-            sessions.set(sessionId, session);
-
-            // Start real-time session log stream if configured
-            if (options.sessionLog?.enabled && options.sessionLog?.directory) {
-              sessionLogStreamManager.startStream(sessionId, {
-                hostLabel: options.hostLabel || options.hostname || '',
-                hostname: options.hostname || '',
-                directory: options.sessionLog.directory,
-                format: options.sessionLog.format || 'txt',
-                startTime: Date.now(),
-              });
-            }
-
-            // Data buffering for reduced IPC overhead
-            let dataBuffer = '';
-            let flushTimeout = null;
-            const FLUSH_INTERVAL = 8; // ms - flush every 8ms for ~120fps equivalent
-            const MAX_BUFFER_SIZE = 16384; // 16KB - flush immediately if buffer gets too large
-
-            const flushBuffer = () => {
-              if (dataBuffer.length > 0) {
-                const contents = event.sender;
-                safeSend(contents, "netcatty:data", { sessionId, data: dataBuffer });
-                dataBuffer = '';
-              }
-              flushTimeout = null;
-            };
-
-            const bufferData = (data) => {
-              dataBuffer += data;
-              // Immediate flush for large chunks
-              if (dataBuffer.length >= MAX_BUFFER_SIZE) {
-                if (flushTimeout) {
-                  clearTimeout(flushTimeout);
-                  flushTimeout = null;
-                }
-                flushBuffer();
-              } else if (!flushTimeout) {
-                // Schedule flush
-                flushTimeout = setTimeout(flushBuffer, FLUSH_INTERVAL);
-              }
-            };
-
-            const sshZmodemSentry = createZmodemSentry({
-              sessionId,
-              onData(buf) {
-                const decoder = getSessionDecoder(sessionId, "stdout");
-                const decoded = decoder.write(buf);
-                trackSessionIdlePrompt(session, decoded);
-                bufferData(decoded);
-                sessionLogStreamManager.appendData(sessionId, decoded);
-              },
-              writeToRemote(buf) {
-                try { return stream.write(buf); } catch { return true; /* ignore */ }
-              },
-              interruptRemote() {
-                try { stream.signal?.("INT"); } catch { /* ignore */ }
-              },
-              getWebContents() {
-                return event.sender;
-              },
-              label: "SSH",
-            });
-            session.zmodemSentry = sshZmodemSentry;
-
-            stream.on("data", (data) => {
-              // data is Buffer from ssh2 — feed raw bytes to ZMODEM sentry.
-              // In normal mode, sentry's onData callback handles decoding and buffering.
-              sshZmodemSentry.consume(data);
-            });
-
-            stream.stderr?.on("data", (data) => {
-              // stderr is not used for ZMODEM — decode normally
-              const decoder = getSessionDecoder(sessionId, "stderr");
-              const decoded = decoder.write(data);
-              bufferData(decoded);
-              sessionLogStreamManager.appendData(sessionId, decoded);
-            });
-
-            // Capture the real exit code from the remote process.
-            // "exit" fires when the remote shell/process exits normally;
-            // "close" fires whenever the channel closes (could be network drop).
-            // Only treat it as user-initiated exit if "exit" fired with a numeric
-            // code and no signal. Signal terminations (e.g. server kill, idle
-            // timeout) have code=null and signal set — those are not user exits.
-            let streamExitCode = 0;
-            let streamExited = false;
-            stream.on("exit", (code, signal) => {
-              streamExitCode = typeof code === "number" ? code : 0;
-              streamExited = typeof code === "number" && !signal;
-            });
-
-            stream.on("close", () => {
-              // Always flush buffered data regardless of session state
-              if (flushTimeout) {
-                clearTimeout(flushTimeout);
-              }
-              flushBuffer();
-              sessionLogStreamManager.stopStream(sessionId);
-
-              // Only send exit if session hasn't already been cleaned up by
-              // conn.once("close") — which fires before stream.on("close")
-              // in ssh2 when the transport drops.
-              if (sessions.has(sessionId)) {
-                const contents = event.sender;
-                const session = sessions.get(sessionId);
-                const transportError = session?._transportError;
-                if (transportError) {
-                  safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: transportError, reason: "error" });
-                } else {
-                  safeSend(contents, "netcatty:exit", { sessionId, exitCode: streamExitCode, reason: streamExited ? "exited" : "closed" });
-                }
-                sessions.get(sessionId)?.zmodemSentry?.cancel();
-                sessions.delete(sessionId);
-                sessionEncodings.delete(sessionId);
-                sessionDecoders.delete(sessionId);
-              }
-              conn.end();
-              for (const c of chainConnections) {
-                try { c.end(); } catch { }
-              }
-            });
-
-            // Pre-seed encoding from host charset if it's a GB variant
-            if (options.charset && /^gb/i.test(String(options.charset).trim())) {
-              sessionEncodings.set(sessionId, "gb18030");
-            }
-
-            // Run startup command if specified
-            if (options.startupCommand) {
-              setTimeout(() => {
-                stream.write(`${options.startupCommand}\n`);
-              }, 300);
-            }
-
-            settled = true;
-            resolve({ sessionId });
-          }
-        );
+        settled = true;
+        resolve({
+          transportId,
+          remoteSshVersion: transport.remoteSshVersion,
+        });
       });
 
       conn.on("error", (err) => {
@@ -1362,10 +1227,13 @@ async function startSSHSession(event, options) {
         // any buffered data first and then send exit with this error info.
         if (settled) {
           console.warn(`${logPrefix} ${options.hostname} post-settle error:`, err.message);
-          // Store the error so the close handler can include it in the exit event
-          if (sessions.has(sessionId)) {
-            const session = sessions.get(sessionId);
-            if (session) session._transportError = err.message;
+          const transport = sshTransports.get(transportId);
+          if (transport) {
+            transport._transportError = err.message;
+            for (const channelSessionId of transport.channelSessionIds) {
+              const session = sessions.get(channelSessionId);
+              if (session) session._transportError = err.message;
+            }
           }
           return;
         }
@@ -1392,11 +1260,8 @@ async function startSSHSession(event, options) {
 
         sendProgress(totalHops, totalHops, options.hostname, 'error', err.message);
         safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "error" });
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
+        stopSessionArtifacts(sessionId, sessions.get(sessionId));
         sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
         for (const c of chainConnections) {
           try { c.end(); } catch { }
         }
@@ -1413,11 +1278,8 @@ async function startSSHSession(event, options) {
         const contents = event.sender;
         sendProgress(totalHops, totalHops, options.hostname, 'error', err.message);
         safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "timeout" });
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
+        stopSessionArtifacts(sessionId, sessions.get(sessionId));
         sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
         for (const c of chainConnections) {
           try { c.end(); } catch { }
         }
@@ -1428,29 +1290,33 @@ async function startSSHSession(event, options) {
 
       conn.once("close", () => {
         const contents = event.sender;
+        const transport = sshTransports.get(transportId);
         if (!settled) {
           sendProgress(totalHops, totalHops, options.hostname, 'error', `Connection to ${options.hostname} closed unexpectedly`);
         }
-        // Only send exit if the session hasn't already been cleaned up by the
-        // error handler (avoids sending a misleading exitCode:0 "closed" after
-        // a real transport error was already reported).
-        if (sessions.has(sessionId)) {
-          const session = sessions.get(sessionId);
-          const transportError = session?._transportError;
-          if (transportError) {
-            // A transport error was recorded — report it as an error exit
-            safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: transportError, reason: "error" });
-          } else {
-            safeSend(contents, "netcatty:exit", { sessionId, exitCode: 0, reason: "closed" });
+        if (transport) {
+          sshTransports.delete(transportId);
+          const transportError = transport._transportError;
+          for (const channelSessionId of [...transport.channelSessionIds]) {
+            const session = sessions.get(channelSessionId);
+            if (!session) continue;
+            const reason = transportError ? "error" : "closed";
+            safeSend(contents, "netcatty:exit", {
+              sessionId: channelSessionId,
+              exitCode: transportError ? 1 : 0,
+              error: transportError,
+              reason,
+            });
+            stopSessionArtifacts(channelSessionId, session);
+            sessions.delete(channelSessionId);
           }
-        }
-        sessionLogStreamManager.stopStream(sessionId);
-        sessions.get(sessionId)?.zmodemSentry?.cancel();
-        sessions.delete(sessionId);
-        sessionEncodings.delete(sessionId);
-        sessionDecoders.delete(sessionId);
-        for (const c of chainConnections) {
-          try { c.end(); } catch { }
+          for (const c of transport.chainConnections || []) {
+            try { c.end(); } catch {}
+          }
+        } else {
+          for (const c of chainConnections) {
+            try { c.end(); } catch { }
+          }
         }
         if (!settled) {
           settled = true;
@@ -1548,6 +1414,208 @@ async function startSSHSession(event, options) {
     safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message });
     throw err;
   }
+}
+
+async function openSSHChannel(event, options) {
+  const transport = sshTransports.get(options.transportId);
+  if (!transport || !transport.conn) {
+    throw new Error("SSH transport not found");
+  }
+
+  const sessionId =
+    options.sessionId ||
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const channelId =
+    options.channelId ||
+    `${sessionId}-channel`;
+  const cols = options.cols || 80;
+  const rows = options.rows || 24;
+  const contents = event.sender;
+  const totalHops = transport.progress?.totalHops || 1;
+  const hostname = transport.progress?.hostname || transport.hostname || "";
+
+  return new Promise((resolve, reject) => {
+    safeSend(contents, "netcatty:chain:progress", {
+      sessionId,
+      hop: totalHops,
+      total: totalHops,
+      label: hostname,
+      status: "shell",
+    });
+
+    transport.conn.shell(
+      {
+        term: "xterm-256color",
+        cols,
+        rows,
+      },
+      {
+        env: {
+          LANG: resolveLangFromCharset(options.charset),
+          COLORTERM: "truecolor",
+          ...(options.env || {}),
+        },
+      },
+      (err, stream) => {
+        if (err) {
+          if (transport.channelSessionIds.size === 0) {
+            closeTransportById(transport.id);
+          }
+          reject(err);
+          return;
+        }
+
+        safeSend(contents, "netcatty:chain:progress", {
+          sessionId,
+          hop: totalHops,
+          total: totalHops,
+          label: hostname,
+          status: "connected",
+        });
+
+        const session = {
+          conn: transport.conn,
+          stream,
+          chainConnections: transport.chainConnections,
+          webContentsId: transport.webContentsId,
+          hostname: transport.hostname,
+          username: transport.username,
+          label: transport.label,
+          remoteSshVersion: transport.remoteSshVersion,
+          transportId: transport.id,
+          channelId,
+          lastIdlePrompt: '',
+          lastIdlePromptAt: 0,
+          _promptTrackTail: '',
+        };
+        sessions.set(sessionId, session);
+        transport.channelSessionIds.add(sessionId);
+
+        if (options.sessionLog?.enabled && options.sessionLog?.directory) {
+          sessionLogStreamManager.startStream(sessionId, {
+            hostLabel: transport.label || hostname,
+            hostname: transport.hostname || hostname,
+            directory: options.sessionLog.directory,
+            format: options.sessionLog.format || 'txt',
+            startTime: Date.now(),
+          });
+        }
+
+        let dataBuffer = '';
+        let flushTimeout = null;
+        const FLUSH_INTERVAL = 8;
+        const MAX_BUFFER_SIZE = 16384;
+
+        const flushBuffer = () => {
+          if (dataBuffer.length > 0) {
+            safeSend(contents, "netcatty:data", { sessionId, data: dataBuffer });
+            dataBuffer = '';
+          }
+          flushTimeout = null;
+        };
+
+        const bufferData = (data) => {
+          dataBuffer += data;
+          if (dataBuffer.length >= MAX_BUFFER_SIZE) {
+            if (flushTimeout) {
+              clearTimeout(flushTimeout);
+              flushTimeout = null;
+            }
+            flushBuffer();
+          } else if (!flushTimeout) {
+            flushTimeout = setTimeout(flushBuffer, FLUSH_INTERVAL);
+          }
+        };
+
+        const sshZmodemSentry = createZmodemSentry({
+          sessionId,
+          onData(buf) {
+            const decoder = getSessionDecoder(sessionId, "stdout");
+            const decoded = decoder.write(buf);
+            trackSessionIdlePrompt(session, decoded);
+            bufferData(decoded);
+            sessionLogStreamManager.appendData(sessionId, decoded);
+          },
+          writeToRemote(buf) {
+            try { return stream.write(buf); } catch { return true; }
+          },
+          interruptRemote() {
+            try { stream.signal?.("INT"); } catch {}
+          },
+          getWebContents() {
+            return contents;
+          },
+          label: "SSH",
+        });
+        session.zmodemSentry = sshZmodemSentry;
+
+        stream.on("data", (data) => {
+          sshZmodemSentry.consume(data);
+        });
+
+        stream.stderr?.on("data", (data) => {
+          const decoder = getSessionDecoder(sessionId, "stderr");
+          const decoded = decoder.write(data);
+          bufferData(decoded);
+          sessionLogStreamManager.appendData(sessionId, decoded);
+        });
+
+        let streamExitCode = 0;
+        let streamExited = false;
+        stream.on("exit", (code, signal) => {
+          streamExitCode = typeof code === "number" ? code : 0;
+          streamExited = typeof code === "number" && !signal;
+        });
+
+        stream.on("close", () => {
+          if (flushTimeout) {
+            clearTimeout(flushTimeout);
+          }
+          flushBuffer();
+
+          const existingSession = sessions.get(sessionId);
+          const transportError = existingSession?._transportError || transport._transportError;
+          if (existingSession) {
+            safeSend(contents, "netcatty:exit", {
+              sessionId,
+              exitCode: transportError ? 1 : streamExitCode,
+              error: transportError,
+              reason: transportError ? "error" : (streamExited ? "exited" : "closed"),
+            });
+            stopSessionArtifacts(sessionId, existingSession);
+            sessions.delete(sessionId);
+          } else {
+            stopSessionArtifacts(sessionId, session);
+          }
+
+          detachSessionFromTransport(transport.id, sessionId);
+        });
+
+        if (options.charset && /^gb/i.test(String(options.charset).trim())) {
+          sessionEncodings.set(sessionId, "gb18030");
+        }
+
+        resolve({
+          sessionId,
+          channelId,
+          transportId: transport.id,
+        });
+      },
+    );
+  });
+}
+
+async function startSSHSession(event, options) {
+  const transport = await startSSHTransport(event, options);
+  return openSSHChannel(event, {
+    transportId: transport.transportId,
+    sessionId: options.sessionId,
+    cols: options.cols,
+    rows: options.rows,
+    charset: options.charset,
+    env: options.env,
+    sessionLog: options.sessionLog,
+  });
 }
 
 /**
@@ -1808,6 +1876,77 @@ async function startSSHSessionWrapper(event, options) {
     // so Electron's ipcMain.handle can serialize it back to the renderer
     // instead of it becoming an uncaught exception that crashes the app.
     // See: https://github.com/nicely-gg/netcatty/issues/482
+    const connError = new Error(err.message);
+    connError.level = err.level || 'client-socket';
+    connError.code = err.code;
+    throw connError;
+  }
+}
+
+async function startSSHTransportWrapper(event, options) {
+  try {
+    return await startSSHTransport(event, options);
+  } catch (err) {
+    const isAuthError = err.message?.toLowerCase().includes('authentication') ||
+      err.message?.toLowerCase().includes('auth') ||
+      err.level === 'client-authentication';
+
+    if (isAuthError) {
+      const hasJumpHosts = options.jumpHosts && options.jumpHosts.length > 0;
+      const isPasswordOnly = !hasJumpHosts && !options.agentForwarding && !!options.password && !options.privateKey && !options.certificate;
+      if (!isPasswordOnly && (!options._unlockedEncryptedKeys || options._unlockedEncryptedKeys.length === 0)) {
+        const allKeysWithEncrypted = await findAllDefaultPrivateKeysFromHelper({ includeEncrypted: true });
+        const encryptedKeys = allKeysWithEncrypted.filter(k => k.isEncrypted);
+
+        if (encryptedKeys.length > 0) {
+          console.log('[SSH] Auth failed, found encrypted default keys. Requesting passphrases for retry...');
+
+          const passphraseResult = await requestPassphrasesForEncryptedKeys(
+            event.sender,
+            options.hostname
+          );
+
+          if (passphraseResult.cancelled) {
+            console.log('[SSH] User cancelled passphrase flow, not retrying');
+          } else if (passphraseResult.keys.length > 0) {
+            console.log('[SSH] User unlocked keys, retrying transport...', {
+              count: passphraseResult.keys.length,
+              keyNames: passphraseResult.keys.map(k => k.keyName)
+            });
+
+            try {
+              return await startSSHTransport(event, {
+                ...options,
+                _unlockedEncryptedKeys: passphraseResult.keys,
+              });
+            } catch (retryErr) {
+              const isRetryAuthError = retryErr.message?.toLowerCase().includes('authentication') ||
+                retryErr.message?.toLowerCase().includes('auth') ||
+                retryErr.level === 'client-authentication';
+
+              if (isRetryAuthError) {
+                const authError = new Error(retryErr.message);
+                authError.level = 'client-authentication';
+                authError.isAuthError = true;
+                throw authError;
+              }
+              const connError = new Error(retryErr.message);
+              connError.level = retryErr.level || 'client-socket';
+              connError.code = retryErr.code;
+              throw connError;
+            }
+          } else {
+            console.log('[SSH] User did not unlock any keys, not retrying');
+          }
+        }
+      }
+
+      const authError = new Error(err.message);
+      authError.level = 'client-authentication';
+      authError.isAuthError = true;
+      throw authError;
+    }
+
     const connError = new Error(err.message);
     connError.level = err.level || 'client-socket';
     connError.code = err.code;
@@ -2489,6 +2628,8 @@ async function setSessionEncoding(_event, { sessionId, encoding }) {
  */
 function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:start", startSSHSessionWrapper);
+  ipcMain.handle("netcatty:ssh:transport:start", startSSHTransportWrapper);
+  ipcMain.handle("netcatty:ssh:channel:open", openSSHChannel);
   ipcMain.handle("netcatty:ssh:exec", execCommand);
   ipcMain.handle("netcatty:ssh:pwd", getSessionPwd);
   ipcMain.handle("netcatty:ssh:remoteInfo", getSessionRemoteInfo);
@@ -2528,4 +2669,6 @@ module.exports = {
   registerHandlers,
   connectThroughChain,
   buildAlgorithms,
+  startSSHTransport,
+  openSSHChannel,
 };

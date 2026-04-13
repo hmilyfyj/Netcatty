@@ -100,6 +100,18 @@ declare global {
     identityFilePaths?: string[];
   }
 
+  interface NetcattySSHChannelOptions {
+    transportId: string;
+    sessionId?: string;
+    channelId?: string;
+    cols?: number;
+    rows?: number;
+    charset?: string;
+    startupCommand?: string;
+    env?: Record<string, string>;
+    sessionLog?: { enabled: boolean; directory: string; format: string };
+  }
+
   interface SftpStatResult {
     name: string;
     type: 'file' | 'directory' | 'symlink';
@@ -164,6 +176,15 @@ declare global {
   interface NetcattyBridge {
     getWindowsPtyInfo?(): NetcattyWindowsPtyInfo | null;
     startSSHSession(options: NetcattySSHOptions): Promise<string>;
+    startSSHTransport?(options: NetcattySSHOptions): Promise<{
+      transportId: string;
+      remoteSshVersion?: string;
+    }>;
+    openSSHChannel?(options: NetcattySSHChannelOptions): Promise<{
+      sessionId: string;
+      channelId: string;
+      transportId: string;
+    }>;
     startTelnetSession?(options: {
       sessionId?: string;
       hostname: string;
