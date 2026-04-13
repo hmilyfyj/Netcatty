@@ -27,7 +27,6 @@ import {
 } from '../domain/terminalAppearance';
 import { cn, normalizeLineEndings } from '../lib/utils';
 import { detectLocalOs } from '../lib/localShell';
-import { logger } from '../lib/logger';
 import { useStoredString } from '../application/state/useStoredString';
 import { useStoredNumber } from '../application/state/useStoredNumber';
 import { STORAGE_KEY_SIDE_PANEL_WIDTH } from '../infrastructure/config/storageKeys';
@@ -811,7 +810,6 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   const handleCommandExecuted = useCallback((command: string, hostId: string, hostLabel: string, sessionId: string) => {
     const parsedDockerExec = parseDockerExecCommand(command);
-    logger.info("[TerminalLayer] handleCommandExecuted", { command, parsedDockerExec, sessionId });
     if (parsedDockerExec) {
       updateSessionFileContext(sessionId, (current) => ({
         kind: "docker",
@@ -821,27 +819,16 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
         cwd: parsedDockerExec.cwd,
         updatedAt: Date.now(),
       }));
-      logger.info("[TerminalLayer] Docker context updated", { containerRef: parsedDockerExec.containerRef, cwd: parsedDockerExec.cwd });
       if (!parsedDockerExec.cwd) {
         window.setTimeout(async () => {
           try {
             const currentContext = sessionFileContextByIdRef.current.get(sessionId);
-            logger.info("[TerminalLayer] Fetching container cwd", { sessionId, currentContext });
-            if (currentContext?.kind !== "docker") {
-              logger.warn("[TerminalLayer] Context is not docker", { currentContext });
-              return;
-            }
+            if (currentContext?.kind !== "docker") return;
             const containers = await terminalBackend.listDockerContainers(sessionId);
-            logger.info("[TerminalLayer] Containers fetched", { containersCount: containers?.length, containers });
             if (!containers) return;
             const container = containers.find((item) => matchDockerContainerForContext(item, currentContext));
-            logger.info("[TerminalLayer] Container matched", { container, currentContext });
-            if (!container?.id) {
-              logger.warn("[TerminalLayer] No container matched", { currentContext });
-              return;
-            }
+            if (!container?.id) return;
             const result = await terminalBackend.getDockerContainerPwd(sessionId, container.id);
-            logger.info("[TerminalLayer] Container pwd result", { result, containerId: container.id });
             if (result.success && result.cwd) {
               updateSessionFileContext(sessionId, (prev) => {
                 if (prev?.kind !== "docker" || prev.containerRef !== currentContext.containerRef) return prev;
@@ -851,11 +838,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   updatedAt: Date.now(),
                 };
               });
-              logger.info("[TerminalLayer] Syncing SFTP to cwd", { cwd: result.cwd });
               syncSftpLocationToSessionCwd(sessionId, result.cwd);
             }
-          } catch (err) {
-            logger.error("[TerminalLayer] Error fetching container cwd", err);
+          } catch {
+            // Best effort only.
           }
         }, 300);
       }
