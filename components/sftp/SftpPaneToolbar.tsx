@@ -152,7 +152,7 @@ export const SftpPaneToolbar: React.FC<SftpPaneToolbarProps> = React.memo(({
     }
   }, [showFilterBar, setShowFilterBar, filterInputRef]);
 
-  const isRemote = !pane.connection?.isLocal;
+  const isRemote = pane.connection?.backendType === "sftp";
 
   // Buttons that always remain visible (not collapsed)
   const pinnedButtons = (

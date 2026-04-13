@@ -1,11 +1,20 @@
 import { useCallback, useEffect, useRef } from "react";
-import type { MutableRefObject } from "react";
+import type { Dispatch, MutableRefObject, SetStateAction } from "react";
 import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
-import type { Host, Identity, SftpConnection, SftpFileEntry, SftpFilenameEncoding, SSHKey } from "../../../domain/models";
+import type {
+  DockerContainerSummary,
+  Host,
+  Identity,
+  SftpConnection,
+  SftpFileEntry,
+  SftpFilenameEncoding,
+  SSHKey,
+} from "../../../domain/models";
 import type { SftpPane } from "./types";
 import { useSftpDirectoryListing } from "./useSftpDirectoryListing";
 import { useSftpHostCredentials } from "./useSftpHostCredentials";
 import { buildCacheKey, getSharedRemoteHostCache, setSharedRemoteHostCache } from "./sharedRemoteHostCache";
+import { isDockerSftpConnection } from "./backend";
 
 interface UseSftpConnectionsParams {
   hosts: Host[];
@@ -17,8 +26,8 @@ interface UseSftpConnectionsParams {
   rightTabs: { tabs: SftpPane[] };
   leftPane: SftpPane;
   rightPane: SftpPane;
-  setLeftTabs: React.Dispatch<React.SetStateAction<{ tabs: SftpPane[]; activeTabId: string | null }>>;
-  setRightTabs: React.Dispatch<React.SetStateAction<{ tabs: SftpPane[]; activeTabId: string | null }>>;
+  setLeftTabs: Dispatch<SetStateAction<{ tabs: SftpPane[]; activeTabId: string | null }>>;
+  setRightTabs: Dispatch<SetStateAction<{ tabs: SftpPane[]; activeTabId: string | null }>>;
   getActivePane: (side: "left" | "right") => SftpPane | null;
   updateTab: (side: "left" | "right", tabId: string, updater: (prev: SftpPane) => SftpPane) => void;
   navSeqRef: MutableRefObject<{ left: number; right: number }>;
@@ -34,10 +43,22 @@ interface UseSftpConnectionsParams {
 }
 
 interface UseSftpConnectionsResult {
-  connect: (side: "left" | "right", host: Host | "local", options?: { forceNewTab?: boolean; onTabCreated?: (tabId: string) => void }) => Promise<void>;
+  connect: (side: "left" | "right", host: Host | "local", options?: ConnectOptions) => Promise<void>;
+  connectDockerContainer: (
+    side: "left" | "right",
+    options: { host: Host; sourceSessionId: string; container: DockerContainerSummary },
+    connectOptions?: ConnectOptions,
+  ) => Promise<void>;
   disconnect: (side: "left" | "right") => Promise<void>;
   listLocalFiles: (path: string) => Promise<SftpFileEntry[]>;
   listRemoteFiles: (sftpId: string, path: string, encoding?: SftpFilenameEncoding) => Promise<SftpFileEntry[]>;
+  listDockerFiles: (sessionId: string, containerId: string, path: string) => Promise<SftpFileEntry[]>;
+}
+
+interface ConnectOptions {
+  forceNewTab?: boolean;
+  onTabCreated?: (tabId: string) => void;
+  sourceSessionId?: string | null;
 }
 
 export const useSftpConnections = ({
@@ -66,10 +87,10 @@ export const useSftpConnections = ({
   autoConnectLocalOnMount = true,
 }: UseSftpConnectionsParams): UseSftpConnectionsResult => {
   const getHostCredentials = useSftpHostCredentials({ hosts, keys, identities });
-  const { listLocalFiles, listRemoteFiles } = useSftpDirectoryListing();
+  const { listLocalFiles, listRemoteFiles, listDockerFiles } = useSftpDirectoryListing();
 
   const connect = useCallback(
-    async (side: "left" | "right", host: Host | "local", options?: { forceNewTab?: boolean; onTabCreated?: (tabId: string) => void }) => {
+    async (side: "left" | "right", host: Host | "local", options?: ConnectOptions) => {
       const setTabs = side === "left" ? setLeftTabs : setRightTabs;
 
       let activeTabId: string | null = null;
@@ -150,6 +171,7 @@ export const useSftpConnections = ({
           hostId: "local",
           hostLabel: "Local",
           isLocal: true,
+          backendType: "local",
           status: "connected",
           currentPath: homeDir,
           homeDir,
@@ -203,8 +225,10 @@ export const useSftpConnections = ({
           hostId: host.id,
           hostLabel: host.label,
           isLocal: false,
+          backendType: "sftp",
           status: "connecting",
           currentPath: cachedStartPath,
+          sourceSessionId: options?.sourceSessionId ?? undefined,
         };
 
         updateTab(side, activeTabId, (prev) => ({
@@ -268,6 +292,7 @@ export const useSftpConnections = ({
         try {
           const credentials = getHostCredentials(host);
           const openSftp = bridge?.openSftp;
+          const openSftpForSession = bridge?.openSftpForSession;
           if (!openSftp) throw new Error("SFTP bridge unavailable");
 
           const isAuthError = (err: unknown): boolean => {
@@ -283,38 +308,59 @@ export const useSftpConnections = ({
 
           const hasKey = !!credentials.privateKey;
           const hasPassword = !!credentials.password;
+          const sourceSessionId = options?.sourceSessionId ?? null;
 
           let sftpId: string | undefined;
-          if (hasKey) {
+          if (sourceSessionId && openSftpForSession) {
             try {
-              const keyFirstCredentials = {
-                sessionId: `sftp-${connectionId}`,
-                ...credentials,
-              };
-              if (!credentials.sudo) {
-                keyFirstCredentials.password = undefined;
-              }
-              sftpId = await openSftp(keyFirstCredentials);
-            } catch (err) {
-              if (hasPassword && isAuthError(err)) {
-                sftpId = await openSftp({
+              updateTab(side, activeTabId, (prev) => ({
+                ...prev,
+                connectionLogs: [...prev.connectionLogs, "Reusing active terminal SSH connection..."],
+              }));
+              sftpId = await openSftpForSession(sourceSessionId, { timeoutMs: 15_000 });
+            } catch {
+              updateTab(side, activeTabId, (prev) => ({
+                ...prev,
+                connectionLogs: [
+                  ...prev.connectionLogs,
+                  "Falling back to a dedicated SFTP connection...",
+                ],
+              }));
+            }
+          }
+
+          if (!sftpId) {
+            if (hasKey) {
+              try {
+                const keyFirstCredentials = {
                   sessionId: `sftp-${connectionId}`,
                   ...credentials,
-                  privateKey: undefined,
-                  certificate: undefined,
-                  publicKey: undefined,
-                  keyId: undefined,
-                  keySource: undefined,
-                });
-              } else {
-                throw err;
+                };
+                if (!credentials.sudo) {
+                  keyFirstCredentials.password = undefined;
+                }
+                sftpId = await openSftp(keyFirstCredentials);
+              } catch (err) {
+                if (hasPassword && isAuthError(err)) {
+                  sftpId = await openSftp({
+                    sessionId: `sftp-${connectionId}`,
+                    ...credentials,
+                    privateKey: undefined,
+                    certificate: undefined,
+                    publicKey: undefined,
+                    keyId: undefined,
+                    keySource: undefined,
+                  });
+                } else {
+                  throw err;
+                }
               }
+            } else {
+              sftpId = await openSftp({
+                sessionId: `sftp-${connectionId}`,
+                ...credentials,
+              });
             }
-          } else {
-            sftpId = await openSftp({
-              sessionId: `sftp-${connectionId}`,
-              ...credentials,
-            });
           }
 
           if (!sftpId) throw new Error("Failed to open SFTP session");
@@ -496,6 +542,158 @@ export const useSftpConnections = ({
 
   const initialConnectDoneRef = useRef(false);
 
+  const connectDockerContainer = useCallback(
+    async (
+      side: "left" | "right",
+      dockerOptions: { host: Host; sourceSessionId: string; container: DockerContainerSummary },
+      options?: ConnectOptions,
+    ) => {
+      const { host, sourceSessionId, container } = dockerOptions;
+      const setTabs = side === "left" ? setLeftTabs : setRightTabs;
+      const sideTabs = side === "left" ? leftTabsRef.current : rightTabsRef.current;
+
+      let activeTabId: string | null = null;
+      if (!sideTabs.activeTabId || options?.forceNewTab) {
+        const newPane = createEmptyPane();
+        activeTabId = newPane.id;
+        setTabs((prev) => ({
+          tabs: [...prev.tabs, newPane],
+          activeTabId: newPane.id,
+        }));
+      } else {
+        activeTabId = sideTabs.activeTabId;
+      }
+
+      if (!activeTabId) return;
+
+      options?.onTabCreated?.(activeTabId);
+
+      const connectionId = `${side}-docker-${Date.now()}`;
+      navSeqRef.current[side] += 1;
+      const connectRequestId = navSeqRef.current[side];
+      lastConnectedHostRef.current[side] = host;
+      const hostCacheKey = buildCacheKey(host.id, host.hostname, host.port, host.protocol, host.sftpSudo, host.username);
+      connectionCacheKeyMapRef.current.set(connectionId, `${hostCacheKey}::docker:${container.id}`);
+
+      const currentPane = getActivePane(side);
+      if (!options?.forceNewTab) {
+        if (currentPane?.connection) {
+          clearCacheForConnection(currentPane.connection.id);
+        }
+        if (currentPane?.connection && !currentPane.connection.isLocal) {
+          const oldSftpId = sftpSessionsRef.current.get(currentPane.connection.id);
+          if (oldSftpId) {
+            sftpSessionsRef.current.delete(currentPane.connection.id);
+            try {
+              await netcattyBridge.get()?.closeSftp(oldSftpId);
+            } catch {
+              // ignore stale close
+            }
+          }
+        }
+      }
+
+      const initialPath = container.workingDir || "/";
+      const connection: SftpConnection = {
+        id: connectionId,
+        hostId: host.id,
+        hostLabel: `${host.label} / ${container.name}`,
+        isLocal: false,
+        backendType: "docker-container",
+        status: "connecting",
+        currentPath: initialPath,
+        homeDir: initialPath,
+        sourceSessionId,
+        containerId: container.id,
+        containerName: container.name,
+        containerWorkingDir: container.workingDir,
+      };
+
+      updateTab(side, activeTabId, (prev) => ({
+        ...prev,
+        connection,
+        loading: true,
+        reconnecting: false,
+        error: null,
+        connectionLogs: [],
+        files: [],
+        filenameEncoding: "utf-8",
+      }));
+
+      try {
+        let startPath = initialPath;
+        let files: SftpFileEntry[] = [];
+        try {
+          files = await listDockerFiles(sourceSessionId, container.id, startPath);
+        } catch (error) {
+          if (startPath !== "/") {
+            startPath = "/";
+            files = await listDockerFiles(sourceSessionId, container.id, startPath);
+          } else {
+            throw error;
+          }
+        }
+
+        if (navSeqRef.current[side] !== connectRequestId) return;
+
+        dirCacheRef.current.set(makeCacheKey(connectionId, startPath, "utf-8"), {
+          files,
+          timestamp: Date.now(),
+        });
+
+        reconnectingRef.current[side] = false;
+        updateTab(side, activeTabId, (prev) => ({
+          ...prev,
+          connection: prev.connection
+            ? {
+                ...prev.connection,
+                status: "connected",
+                currentPath: startPath,
+                homeDir: startPath,
+              }
+            : null,
+          files,
+          loading: false,
+          reconnecting: false,
+        }));
+      } catch (err) {
+        if (navSeqRef.current[side] !== connectRequestId) return;
+        reconnectingRef.current[side] = false;
+        updateTab(side, activeTabId, (prev) => ({
+          ...prev,
+          connection: prev.connection
+            ? {
+                ...prev.connection,
+                status: "error",
+                error: err instanceof Error ? err.message : "打开容器失败",
+              }
+            : null,
+          error: err instanceof Error ? err.message : "打开容器失败",
+          loading: false,
+          reconnecting: false,
+        }));
+      }
+    },
+    [
+      clearCacheForConnection,
+      createEmptyPane,
+      getActivePane,
+      listDockerFiles,
+      makeCacheKey,
+      reconnectingRef,
+      setLeftTabs,
+      setRightTabs,
+      sftpSessionsRef,
+      updateTab,
+      leftTabsRef,
+      rightTabsRef,
+      navSeqRef,
+      lastConnectedHostRef,
+      connectionCacheKeyMapRef,
+      dirCacheRef,
+    ],
+  );
+
   useEffect(() => {
     if (
       autoConnectLocalOnMount &&
@@ -553,7 +751,7 @@ export const useSftpConnections = ({
       reconnectingRef.current[side] = false;
       lastConnectedHostRef.current[side] = null;
 
-      if (pane.connection && !pane.connection.isLocal) {
+      if (pane.connection && !pane.connection.isLocal && !isDockerSftpConnection(pane.connection)) {
         const sftpId = sftpSessionsRef.current.get(pane.connection.id);
         if (sftpId) {
           try {
@@ -573,8 +771,10 @@ export const useSftpConnections = ({
 
   return {
     connect,
+    connectDockerContainer,
     disconnect,
     listLocalFiles,
     listRemoteFiles,
+    listDockerFiles,
   };
 };

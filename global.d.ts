@@ -1,4 +1,9 @@
-import type { RemoteFile, SftpFilenameEncoding } from "./types";
+import type {
+  DockerContainerSummary,
+  DockerSessionSupportResult,
+  RemoteFile,
+  SftpFilenameEncoding,
+} from "./types";
 import type { S3Config, SyncedFile, WebDAVConfig } from "./domain/sync";
 
 declare module "*.cjs" {
@@ -388,6 +393,18 @@ declare global {
 
     // SFTP operations
     openSftp(options: NetcattySSHOptions): Promise<string>;
+    openSftpForSession?(sessionId: string, options?: { timeoutMs?: number }): Promise<string>;
+    dockerCheckSessionSupport?(sessionId: string): Promise<DockerSessionSupportResult>;
+    dockerListContainersForSession?(sessionId: string): Promise<DockerContainerSummary[]>;
+    dockerListFilesForSession?(sessionId: string, containerId: string, path: string): Promise<RemoteFile[]>;
+    dockerReadTextFile?(sessionId: string, containerId: string, path: string): Promise<string>;
+    dockerWriteTextFile?(sessionId: string, containerId: string, path: string, content: string): Promise<void>;
+    dockerDownloadFile?(sessionId: string, containerId: string, remotePath: string, localPath: string): Promise<{ localPath: string }>;
+    dockerDownloadFileToTemp?(sessionId: string, containerId: string, remotePath: string, fileName: string): Promise<{ localPath: string }>;
+    dockerCreateDirectory?(sessionId: string, containerId: string, path: string): Promise<void>;
+    dockerCreateFile?(sessionId: string, containerId: string, path: string): Promise<void>;
+    dockerDeletePath?(sessionId: string, containerId: string, path: string): Promise<void>;
+    dockerRenamePath?(sessionId: string, containerId: string, oldPath: string, newPath: string): Promise<void>;
     listSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<RemoteFile[]>;
     readSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<string>;
     readSftpBinary?(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<ArrayBuffer>;

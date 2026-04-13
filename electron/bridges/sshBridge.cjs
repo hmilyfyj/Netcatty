@@ -13,6 +13,7 @@ const { NetcattyAgent } = require("./netcattyAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const passphraseHandler = require("./passphraseHandler.cjs");
 const { createProxySocket } = require("./proxyUtils.cjs");
+const tempDirBridge = require("./tempDirBridge.cjs");
 const {
   buildAuthHandler,
   createKeyboardInteractiveHandler,
@@ -1746,6 +1747,406 @@ async function execCommand(event, payload) {
   });
 }
 
+function quoteShellValue(value) {
+  return `'${String(value ?? "").replace(/'/g, `'\\''`)}'`;
+}
+
+function normalizeDockerError(error, fallbackMessage) {
+  const raw = error instanceof Error ? error.message : String(error || "");
+  const lower = raw.toLowerCase();
+
+  if (lower.includes("session not found")) {
+    return {
+      supported: false,
+      reason: "session-unavailable",
+      error: "SSH 会话不可用",
+      message: "SSH 会话不可用",
+    };
+  }
+  if (lower.includes("__netcatty_docker_missing__") || lower.includes("command not found") || lower.includes("docker: not found")) {
+    return {
+      supported: false,
+      reason: "docker-missing",
+      error: "宿主机未安装 Docker CLI",
+      message: "宿主机未安装 Docker CLI",
+    };
+  }
+  if (lower.includes("permission denied")) {
+    return {
+      supported: false,
+      reason: "permission-denied",
+      error: "当前 SSH 用户无权访问 Docker",
+      message: "当前 SSH 用户无权访问 Docker",
+    };
+  }
+  if (lower.includes("is not running") || lower.includes("container") && lower.includes("not running")) {
+    return {
+      supported: false,
+      reason: "docker-unavailable",
+      error: "容器已停止",
+      message: "容器已停止",
+    };
+  }
+  if (lower.includes("executable file not found") || lower.includes("sh: not found") || lower.includes("shell")) {
+    return {
+      supported: false,
+      reason: "docker-unavailable",
+      error: "容器缺少必要的 shell 或命令",
+      message: "容器缺少必要的 shell 或命令",
+    };
+  }
+  if (lower.includes("__netcatty_path_not_found__") || lower.includes("no such file or directory")) {
+    return {
+      supported: false,
+      reason: "docker-unavailable",
+      error: "目标路径不存在",
+      message: "目标路径不存在",
+    };
+  }
+
+  return {
+    supported: false,
+    reason: "unknown",
+    error: raw || fallbackMessage,
+    message: raw || fallbackMessage,
+  };
+}
+
+function ensureExecSession(sessionId) {
+  const session = sessions?.get(sessionId);
+  if (!session || !session.conn) {
+    throw new Error("Session not found or not connected");
+  }
+  return session;
+}
+
+async function execOnExistingSession(sessionId, command, options = {}) {
+  const session = ensureExecSession(sessionId);
+  const {
+    timeoutMs = 15000,
+    stdin,
+    binaryStdout = false,
+  } = options;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let streamRef = null;
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+
+    const timer = setTimeout(() => {
+      try {
+        streamRef?.close?.();
+        streamRef?.destroy?.();
+      } catch {
+        // ignore
+      }
+      finish(reject, new Error("SSH exec timeout"));
+    }, timeoutMs);
+
+    session.conn.exec(command, (err, stream) => {
+      if (err) {
+        finish(reject, err);
+        return;
+      }
+
+      streamRef = stream;
+      stream.on("data", (chunk) => {
+        stdoutChunks.push(Buffer.from(chunk));
+      });
+      stream.stderr?.on("data", (chunk) => {
+        stderrChunks.push(Buffer.from(chunk));
+      });
+      stream.on("error", (streamErr) => {
+        finish(reject, streamErr);
+      });
+      stream.on("close", (code) => {
+        const stdoutBuffer = Buffer.concat(stdoutChunks);
+        const stderr = Buffer.concat(stderrChunks).toString("utf8");
+        finish(resolve, {
+          code: typeof code === "number" ? code : 0,
+          stdout: binaryStdout ? stdoutBuffer : stdoutBuffer.toString("utf8"),
+          stderr,
+        });
+      });
+
+      if (stdin !== undefined) {
+        stream.end(Buffer.isBuffer(stdin) ? stdin : Buffer.from(String(stdin), "utf8"));
+      } else {
+        stream.end();
+      }
+    });
+  });
+}
+
+function buildDockerShellCommand(containerId, script, args = [], options = {}) {
+  const shellArgs = args.map((arg) => quoteShellValue(arg)).join(" ");
+  const interactiveFlag = options.interactive ? "-i " : "";
+  return [
+    "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }",
+    "docker ps >/dev/null || exit $?",
+    `docker exec ${interactiveFlag}${quoteShellValue(containerId)} sh -lc ${quoteShellValue(script)} sh${shellArgs ? ` ${shellArgs}` : ""}`,
+  ].join("; ");
+}
+
+function parseDockerEntries(rawOutput) {
+  return rawOutput
+    .split(/\r?\n/)
+    .filter((line) => line.length > 0)
+    .map((line) => {
+      const [name, type, linkTargetRaw, sizeRaw, lastModifiedRaw, permissions = ""] = line.split("\t");
+      return {
+        name,
+        type,
+        linkTarget: linkTargetRaw || undefined,
+        size: String(Number.parseInt(sizeRaw || "0", 10) || 0),
+        lastModified: new Date((Number.parseInt(lastModifiedRaw || "0", 10) || 0) * 1000).toISOString(),
+        permissions,
+      };
+    });
+}
+
+async function checkDockerSessionSupport(_event, { sessionId }) {
+  try {
+    const result = await execOnExistingSession(
+      sessionId,
+      "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }; docker ps >/dev/null",
+      { timeoutMs: 12000 },
+    );
+    if (result.code === 0) {
+      return { supported: true };
+    }
+    return normalizeDockerError(result.stderr || result.stdout, "Docker 不可用");
+  } catch (error) {
+    return normalizeDockerError(error, "Docker 不可用");
+  }
+}
+
+async function listDockerContainersForSession(_event, { sessionId }) {
+  const support = await checkDockerSessionSupport(_event, { sessionId });
+  if (!support.supported) {
+    throw new Error(support.error || "Docker 不可用");
+  }
+
+  const command = [
+    "ids=$(docker ps -q)",
+    '[ -n "$ids" ] || exit 0',
+    "docker inspect $ids --format '{{.Id}}\\t{{.Name}}\\t{{.State.Status}}\\t{{json .Config.WorkingDir}}'",
+  ].join("; ");
+
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法列出容器").message);
+  }
+
+  return String(result.stdout)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [id, rawName, status, workingDirJson] = line.split(/\\t|\t/);
+      let workingDir = "";
+      try {
+        workingDir = JSON.parse(workingDirJson || "\"\"");
+      } catch {
+        workingDir = "";
+      }
+      return {
+        id,
+        name: (rawName || "").replace(/^\//, ""),
+        status,
+        workingDir: workingDir || undefined,
+      };
+    });
+}
+
+async function listDockerFilesForSession(_event, { sessionId, containerId, path: targetPath }) {
+  const script = [
+    'target="$1"',
+    '[ -n "$target" ] || target="/"',
+    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+    '[ -d "$target" ] || { echo "__NETCATTY_NOT_DIRECTORY__" >&2; exit 45; }',
+    'for p in "$target"/* "$target"/.[!.]* "$target"/..?*; do',
+    '  [ -e "$p" ] || [ -L "$p" ] || continue',
+    '  name=${p##*/}',
+    '  if [ -L "$p" ]; then',
+    '    type="symlink"',
+    '    if [ -d "$p" ]; then link="directory"; elif [ -e "$p" ]; then link="file"; else link=""; fi',
+    '  elif [ -d "$p" ]; then',
+    '    type="directory"',
+    '    link=""',
+    '  else',
+    '    type="file"',
+    '    link=""',
+    '  fi',
+    "  stat_out=$(stat -c '%s\t%Y\t%A' \"$p\" 2>/dev/null || printf '0\t0\t')",
+    '  printf "%s\t%s\t%s\t%s\n" "$name" "$type" "$link" "$stat_out"',
+    "done",
+  ].join("\n");
+
+  const command = buildDockerShellCommand(containerId, script, [targetPath || "/"]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法读取容器目录").message);
+  }
+  return parseDockerEntries(String(result.stdout));
+}
+
+async function readDockerTextFile(_event, { sessionId, containerId, path: targetPath }) {
+  const script = [
+    'target="$1"',
+    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+    'cat -- "$target"',
+  ].join("; ");
+  const command = buildDockerShellCommand(containerId, script, [targetPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法读取容器文件").message);
+  }
+  return String(result.stdout);
+}
+
+async function writeSessionTempFile(sessionId, content) {
+  const command = [
+    'tmp=$(mktemp /tmp/netcatty-docker-write.XXXXXX 2>/dev/null || mktemp -t netcatty-docker-write.XXXXXX)',
+    '[ -n "$tmp" ] || exit 1',
+    'cat > "$tmp"',
+    'printf "%s" "$tmp"',
+  ].join("; ");
+  const result = await execOnExistingSession(sessionId, command, {
+    timeoutMs: 20000,
+    stdin: content ?? "",
+  });
+  if (result.code !== 0) {
+    throw new Error("无法创建远端临时文件");
+  }
+  const tempPath = String(result.stdout || "").trim();
+  if (!tempPath) {
+    throw new Error("无法创建远端临时文件");
+  }
+  return tempPath;
+}
+
+async function writeDockerTextFile(_event, { sessionId, containerId, path: targetPath, content }) {
+  const ensureParentScript = [
+    'target="$1"',
+    'parent=$(dirname "$target")',
+    '[ -d "$parent" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+  ].join("; ");
+  const ensureParentCommand = buildDockerShellCommand(containerId, ensureParentScript, [targetPath]);
+  const ensureParentResult = await execOnExistingSession(sessionId, ensureParentCommand, { timeoutMs: 15000 });
+  if (ensureParentResult.code !== 0) {
+    throw new Error(normalizeDockerError(ensureParentResult.stderr || ensureParentResult.stdout, "无法保存容器文件").message);
+  }
+
+  let remoteTempPath = "";
+  try {
+    remoteTempPath = await writeSessionTempFile(sessionId, content);
+    const copyCommand = [
+      "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }",
+      "docker ps >/dev/null || exit $?",
+      `docker cp ${quoteShellValue(remoteTempPath)} ${quoteShellValue(`${containerId}:${targetPath}`)}`,
+    ].join("; ");
+    const copyResult = await execOnExistingSession(sessionId, copyCommand, { timeoutMs: 20000 });
+    if (copyResult.code !== 0) {
+      throw new Error(normalizeDockerError(copyResult.stderr || copyResult.stdout, "无法保存容器文件").message);
+    }
+
+    const verifyScript = [
+      'target="$1"',
+      '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+      'cat -- "$target"',
+    ].join("; ");
+    const verifyCommand = buildDockerShellCommand(containerId, verifyScript, [targetPath]);
+    const verifyResult = await execOnExistingSession(sessionId, verifyCommand, { timeoutMs: 20000 });
+    if (verifyResult.code !== 0) {
+      throw new Error(normalizeDockerError(verifyResult.stderr || verifyResult.stdout, "无法校验容器文件内容").message);
+    }
+    if (String(verifyResult.stdout) !== String(content ?? "")) {
+      throw new Error("容器文件保存校验失败");
+    }
+  } finally {
+    if (remoteTempPath) {
+      await execOnExistingSession(
+        sessionId,
+        `rm -f -- ${quoteShellValue(remoteTempPath)}`,
+        { timeoutMs: 10000 },
+      ).catch(() => {});
+    }
+  }
+}
+
+async function downloadDockerFile(sessionId, containerId, remotePath, localPath) {
+  const script = [
+    'target="$1"',
+    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+    'cat -- "$target"',
+  ].join("; ");
+  const command = buildDockerShellCommand(containerId, script, [remotePath]);
+  const result = await execOnExistingSession(sessionId, command, {
+    timeoutMs: 20000,
+    binaryStdout: true,
+  });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || "", "无法下载容器文件").message);
+  }
+  await fs.promises.writeFile(localPath, result.stdout);
+  return { localPath };
+}
+
+async function downloadDockerFileHandler(_event, { sessionId, containerId, remotePath, localPath }) {
+  return downloadDockerFile(sessionId, containerId, remotePath, localPath);
+}
+
+async function downloadDockerFileToTemp(_event, { sessionId, containerId, remotePath, fileName }) {
+  const tempPath = tempDirBridge.getTempFilePath(fileName || path.basename(remotePath || "download"));
+  return downloadDockerFile(sessionId, containerId, remotePath, tempPath);
+}
+
+async function mkdirDockerPath(_event, { sessionId, containerId, path: targetPath }) {
+  const command = buildDockerShellCommand(containerId, 'mkdir -p -- "$1"', [targetPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法创建目录").message);
+  }
+}
+
+async function createDockerFile(_event, { sessionId, containerId, path: targetPath }) {
+  const script = [
+    'target="$1"',
+    'parent=$(dirname "$target")',
+    '[ -d "$parent" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
+    ': > "$target"',
+  ].join("; ");
+  const command = buildDockerShellCommand(containerId, script, [targetPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法创建文件").message);
+  }
+}
+
+async function deleteDockerPath(_event, { sessionId, containerId, path: targetPath }) {
+  const command = buildDockerShellCommand(containerId, 'rm -rf -- "$1"', [targetPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法删除路径").message);
+  }
+}
+
+async function renameDockerPath(_event, { sessionId, containerId, oldPath, newPath }) {
+  const command = buildDockerShellCommand(containerId, 'mv -- "$1" "$2"', [oldPath, newPath]);
+  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
+  if (result.code !== 0) {
+    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法重命名路径").message);
+  }
+}
+
 /**
  * Generate SSH key pair
  */
@@ -2635,6 +3036,17 @@ function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:ssh:remoteInfo", getSessionRemoteInfo);
   ipcMain.handle("netcatty:ssh:distroInfo", getSessionDistroInfo);
   ipcMain.handle("netcatty:ssh:listdir", listSessionDir);
+  ipcMain.handle("netcatty:ssh:docker:check", checkDockerSessionSupport);
+  ipcMain.handle("netcatty:ssh:docker:listContainers", listDockerContainersForSession);
+  ipcMain.handle("netcatty:ssh:docker:listFiles", listDockerFilesForSession);
+  ipcMain.handle("netcatty:ssh:docker:readText", readDockerTextFile);
+  ipcMain.handle("netcatty:ssh:docker:writeText", writeDockerTextFile);
+  ipcMain.handle("netcatty:ssh:docker:downloadFile", downloadDockerFileHandler);
+  ipcMain.handle("netcatty:ssh:docker:downloadFileToTemp", downloadDockerFileToTemp);
+  ipcMain.handle("netcatty:ssh:docker:mkdir", mkdirDockerPath);
+  ipcMain.handle("netcatty:ssh:docker:createFile", createDockerFile);
+  ipcMain.handle("netcatty:ssh:docker:delete", deleteDockerPath);
+  ipcMain.handle("netcatty:ssh:docker:rename", renameDockerPath);
   ipcMain.handle("netcatty:ssh:stats", getServerStats);
   ipcMain.handle("netcatty:key:generate", generateKeyPair);
   ipcMain.handle("netcatty:ssh:setEncoding", setSessionEncoding);

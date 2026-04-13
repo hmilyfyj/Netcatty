@@ -47,6 +47,7 @@ import { sftpTreeSelectionStore, useSftpTreeSelectionState } from './hooks/useSf
 import { sftpKeyboardSelectionStore, sftpTreeEnterStore } from './hooks/useSftpKeyboardShortcuts';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { isKnownBinaryFile } from '../../lib/sftpFileUtils';
+import { isDockerSftpConnection } from '../../application/state/sftp/backend';
 
 type NodeDescriptor =
   | { type: 'node'; entry: SftpFileEntry; entryPath: string; depth: number; isExpanded: boolean; isLoading: boolean }
@@ -1195,6 +1196,7 @@ export const SftpPaneTreeView = React.memo<SftpPaneTreeViewProps>(({
     const { entry, entryPath } = target;
     const isDir = isNavigableDirectory(entry);
     const isLocal = pane.connection?.isLocal;
+    const isDocker = isDockerSftpConnection(pane.connection);
 
     const handleOpen = () => {
       if (isDir) void toggleExpand(entry, entryPath);
@@ -1282,7 +1284,7 @@ export const SftpPaneTreeView = React.memo<SftpPaneTreeViewProps>(({
         <ContextMenuItem onClick={() => openRenameDialogRef.current(entryPath)}>
           <Pencil size={14} className="mr-2" />{tRef.current('common.rename')}
         </ContextMenuItem>
-        {onEditPermissionsRef.current && !isLocal && (
+        {onEditPermissionsRef.current && !isLocal && !isDocker && (
           <ContextMenuItem onClick={() => onEditPermissionsRef.current?.(entry, entryPath)}>
             <Shield size={14} className="mr-2" />{tRef.current('sftp.context.permissions')}
           </ContextMenuItem>
@@ -1307,8 +1309,7 @@ export const SftpPaneTreeView = React.memo<SftpPaneTreeViewProps>(({
     );
   }, [
     contextTarget,
-    pane.connection?.isLocal,
-    pane.connection?.id,
+    pane.connection,
     toggleExpand,
     stableOnOpenEntry,
     stableOnRefresh,

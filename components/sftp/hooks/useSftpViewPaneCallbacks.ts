@@ -10,6 +10,7 @@ import type { FileOpenerType, SystemAppInfo } from "../../../lib/sftpFileUtils";
 import { formatFileSize, formatDate } from '../../../application/state/sftp/utils';
 import { isSessionError } from "../../../application/state/sftp/errors";
 import { filterHiddenFiles } from "../utils";
+import { isDockerSftpConnection, isLocalSftpConnection } from "../../../application/state/sftp/backend";
 
 interface UseSftpViewPaneCallbacksParams {
   sftpRef: MutableRefObject<SftpStateApi>;
@@ -111,8 +112,19 @@ export const useSftpViewPaneCallbacks = ({
           }),
           pane.showHiddenFiles,
         );
-      if (pane.connection.isLocal) {
+      if (isLocalSftpConnection(pane.connection)) {
         return normalizeEntries(await listLocalFilesRef.current(path));
+      }
+      if (isDockerSftpConnection(pane.connection)) {
+        if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+          throw new Error("容器会话不可用");
+        }
+        const rawFiles = await sftpRef.current.listDockerFiles(
+          pane.connection.sourceSessionId,
+          pane.connection.containerId,
+          path,
+        );
+        return filterHiddenFiles(rawFiles, pane.showHiddenFiles);
       }
       const sftpId = getSftpIdForConnectionRef.current?.(pane.connection.id);
       if (!sftpId) {

@@ -756,15 +756,41 @@ export interface SftpFileEntry {
   hidden?: boolean; // Windows hidden attribute (only set for local Windows filesystem)
 }
 
+export type SftpBackendType = 'local' | 'sftp' | 'docker-container';
+
+export interface DockerContainerSummary {
+  id: string;
+  name: string;
+  status: string;
+  workingDir?: string;
+}
+
+export interface DockerSessionSupportResult {
+  supported: boolean;
+  reason?:
+    | 'session-unavailable'
+    | 'unsupported-session'
+    | 'docker-missing'
+    | 'permission-denied'
+    | 'docker-unavailable'
+    | 'unknown';
+  error?: string;
+}
+
 export interface SftpConnection {
   id: string;
   hostId: string;
   hostLabel: string;
   isLocal: boolean;
+  backendType: SftpBackendType;
   status: 'connecting' | 'connected' | 'disconnected' | 'error';
   error?: string;
   currentPath: string;
   homeDir?: string;
+  sourceSessionId?: string;
+  containerId?: string;
+  containerName?: string;
+  containerWorkingDir?: string;
 }
 
 export type TransferStatus = 'pending' | 'transferring' | 'completed' | 'failed' | 'cancelled';

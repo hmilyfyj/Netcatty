@@ -668,6 +668,61 @@ const api = {
     const result = await ipcRenderer.invoke("netcatty:sftp:open", options);
     return result.sftpId;
   },
+  openSftpForSession: async (sessionId, options) => {
+    const result = await ipcRenderer.invoke("netcatty:sftp:open-for-session", {
+      sessionId,
+      ...(options || {}),
+    });
+    return result.sftpId;
+  },
+  dockerCheckSessionSupport: async (sessionId) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:check", { sessionId });
+  },
+  dockerListContainersForSession: async (sessionId) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:listContainers", { sessionId });
+  },
+  dockerListFilesForSession: async (sessionId, containerId, path) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:listFiles", { sessionId, containerId, path });
+  },
+  dockerReadTextFile: async (sessionId, containerId, path) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:readText", { sessionId, containerId, path });
+  },
+  dockerWriteTextFile: async (sessionId, containerId, path, content) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:writeText", { sessionId, containerId, path, content });
+  },
+  dockerDownloadFile: async (sessionId, containerId, remotePath, localPath) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:downloadFile", {
+      sessionId,
+      containerId,
+      remotePath,
+      localPath,
+    });
+  },
+  dockerDownloadFileToTemp: async (sessionId, containerId, remotePath, fileName) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:downloadFileToTemp", {
+      sessionId,
+      containerId,
+      remotePath,
+      fileName,
+    });
+  },
+  dockerCreateDirectory: async (sessionId, containerId, path) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:mkdir", { sessionId, containerId, path });
+  },
+  dockerCreateFile: async (sessionId, containerId, path) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:createFile", { sessionId, containerId, path });
+  },
+  dockerDeletePath: async (sessionId, containerId, path) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:delete", { sessionId, containerId, path });
+  },
+  dockerRenamePath: async (sessionId, containerId, oldPath, newPath) => {
+    return ipcRenderer.invoke("netcatty:ssh:docker:rename", {
+      sessionId,
+      containerId,
+      oldPath,
+      newPath,
+    });
+  },
   listSftp: async (sftpId, path, encoding) => {
     return ipcRenderer.invoke("netcatty:sftp:list", { sftpId, path, encoding });
   },

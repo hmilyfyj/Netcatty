@@ -9,6 +9,12 @@ export const useSftpBackend = () => {
     return bridge.openSftp(options);
   }, []);
 
+  const openSftpForSession = useCallback(async (sessionId: string, options?: { timeoutMs?: number }) => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.openSftpForSession) throw new Error("Session-backed SFTP bridge unavailable");
+    return bridge.openSftpForSession(sessionId, options);
+  }, []);
+
   const closeSftp = useCallback(async (sftpId: string) => {
     const bridge = netcattyBridge.get();
     if (!bridge?.closeSftp) throw new Error("SFTP bridge unavailable");
@@ -247,6 +253,7 @@ export const useSftpBackend = () => {
 
   return {
     openSftp,
+    openSftpForSession,
     closeSftp,
     listSftp,
     readSftp,

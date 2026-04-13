@@ -3,10 +3,12 @@ import type { MutableRefObject } from "react";
 import type { SftpFileEntry, SftpFilenameEncoding } from "../../../types";
 import { getParentPath, joinPath as joinFsPath } from "../../../application/state/sftp/utils";
 import type { SftpStateApi } from "../../../application/state/useSftpState";
+import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
 import { logger } from "../../../lib/logger";
 import { toast } from "../../ui/toast";
 import { getFileExtension, FileOpenerType, SystemAppInfo } from "../../../lib/sftpFileUtils";
 import { isNavigableDirectory } from "../index";
+import { isDockerSftpConnection } from "../../../application/state/sftp/backend";
 
 interface UseSftpViewFileOpsParams {
   sftpRef: MutableRefObject<SftpStateApi>;
@@ -415,6 +417,38 @@ export const useSftpViewFileOps = ({
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
 
+          toast.success(`${t("sftp.context.download")}: ${file.name}`, "SFTP");
+          return;
+        }
+
+        if (isDockerSftpConnection(pane.connection)) {
+          if (isDirectory) {
+            toast.error("容器模式暂不支持下载目录", "SFTP");
+            return;
+          }
+          if (!showSaveDialog) {
+            toast.error(t("sftp.error.downloadFailed"), "SFTP");
+            return;
+          }
+          if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
+            toast.error("容器会话不可用", "SFTP");
+            return;
+          }
+          const targetPath = await showSaveDialog(file.name);
+          if (!targetPath) {
+            return;
+          }
+          const bridge = netcattyBridge.get();
+          if (!bridge?.dockerDownloadFile) {
+            toast.error(t("sftp.error.downloadFailed"), "SFTP");
+            return;
+          }
+          await bridge.dockerDownloadFile(
+            pane.connection.sourceSessionId,
+            pane.connection.containerId,
+            resolvedFullPath,
+            targetPath,
+          );
           toast.success(`${t("sftp.context.download")}: ${file.name}`, "SFTP");
           return;
         }

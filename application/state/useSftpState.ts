@@ -1,11 +1,14 @@
 import { useCallback, useMemo, useRef } from "react";
 import {
+  DockerContainerSummary,
+  DockerSessionSupportResult,
   Host,
   Identity,
   SftpFilenameEncoding,
   SftpFileEntry,
   SSHKey,
 } from "../../domain/models";
+import { netcattyBridge } from "../../infrastructure/services/netcattyBridge";
 import {
   createEmptyPane,
   SftpStateOptions,
@@ -170,7 +173,7 @@ export const useSftpState = (
   useSftpSessionCleanup(sftpSessionsRef);
   useSftpFileWatch(options);
 
-  const { connect, disconnect, listLocalFiles, listRemoteFiles } = useSftpConnections({
+  const { connect, connectDockerContainer, disconnect, listLocalFiles, listRemoteFiles, listDockerFiles } = useSftpConnections({
     hosts,
     keys,
     identities,
@@ -233,6 +236,7 @@ export const useSftpState = (
     makeCacheKey,
     clearCacheForConnection,
     listLocalFiles,
+    listDockerFiles,
     listRemoteFiles,
     handleSessionError,
     isSessionError,
@@ -320,6 +324,32 @@ export const useSftpState = (
     dismissExternalUpload: dismissTransfer,
   });
 
+  const checkDockerForSession = useCallback(
+    async (sessionId: string): Promise<DockerSessionSupportResult> => {
+      const bridge = netcattyBridge.get();
+      if (!bridge?.dockerCheckSessionSupport) {
+        return {
+          supported: false,
+          reason: "unsupported-session",
+          error: "当前环境不支持容器文件模式",
+        };
+      }
+      return bridge.dockerCheckSessionSupport(sessionId);
+    },
+    [],
+  );
+
+  const listDockerContainers = useCallback(
+    async (sessionId: string): Promise<DockerContainerSummary[]> => {
+      const bridge = netcattyBridge.get();
+      if (!bridge?.dockerListContainersForSession) {
+        throw new Error("当前环境不支持容器文件模式");
+      }
+      return bridge.dockerListContainersForSession(sessionId);
+    },
+    [],
+  );
+
   // Store methods in a ref to create stable wrapper functions
   // This prevents callback reference changes from causing re-renders in consumers
   const methodsRef = useRef({
@@ -333,6 +363,7 @@ export const useSftpState = (
     getActiveTabId,
     getActivePane,
     connect,
+    connectDockerContainer,
     disconnect,
     navigateTo,
     navigateUp,
@@ -364,6 +395,9 @@ export const useSftpState = (
     uploadExternalEntries,
     cancelExternalUpload,
     selectApplication,
+    checkDockerForSession,
+    listDockerContainers,
+    listDockerFiles,
     startTransfer,
     downloadToLocal,
     addExternalUpload,
@@ -387,6 +421,7 @@ export const useSftpState = (
     getActiveTabId,
     getActivePane,
     connect,
+    connectDockerContainer,
     disconnect,
     navigateTo,
     navigateUp,
@@ -418,6 +453,9 @@ export const useSftpState = (
     uploadExternalEntries,
     cancelExternalUpload,
     selectApplication,
+    checkDockerForSession,
+    listDockerContainers,
+    listDockerFiles,
     startTransfer,
     downloadToLocal,
     addExternalUpload,
@@ -444,6 +482,7 @@ export const useSftpState = (
     getActiveTabId: (...args: Parameters<typeof getActiveTabId>) => methodsRef.current.getActiveTabId(...args),
     getActivePane: (...args: Parameters<typeof getActivePane>) => methodsRef.current.getActivePane(...args),
     connect: (...args: Parameters<typeof connect>) => methodsRef.current.connect(...args),
+    connectDockerContainer: (...args: Parameters<typeof connectDockerContainer>) => methodsRef.current.connectDockerContainer(...args),
     disconnect: (...args: Parameters<typeof disconnect>) => methodsRef.current.disconnect(...args),
     navigateTo: (...args: Parameters<typeof navigateTo>) => methodsRef.current.navigateTo(...args),
     navigateUp: (...args: Parameters<typeof navigateUp>) => methodsRef.current.navigateUp(...args),
@@ -482,6 +521,9 @@ export const useSftpState = (
       methodsRef.current.uploadExternalEntries(...args),
     cancelExternalUpload: () => methodsRef.current.cancelExternalUpload(),
     selectApplication: () => methodsRef.current.selectApplication(),
+    checkDockerForSession: (...args: Parameters<typeof checkDockerForSession>) => methodsRef.current.checkDockerForSession(...args),
+    listDockerContainers: (...args: Parameters<typeof listDockerContainers>) => methodsRef.current.listDockerContainers(...args),
+    listDockerFiles: (...args: Parameters<typeof listDockerFiles>) => methodsRef.current.listDockerFiles(...args),
     startTransfer: (...args: Parameters<typeof startTransfer>) => methodsRef.current.startTransfer(...args),
     downloadToLocal: (...args: Parameters<typeof downloadToLocal>) => methodsRef.current.downloadToLocal(...args),
     addExternalUpload: (...args: Parameters<typeof addExternalUpload>) => methodsRef.current.addExternalUpload(...args),

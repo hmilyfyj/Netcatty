@@ -11,10 +11,12 @@
  */
 
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowLeft, Box, Loader2, RefreshCw } from "lucide-react";
 import { formatHostPort } from "../domain/host";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useSftpState } from "../application/state/useSftpState";
 import { useSftpBackend } from "../application/state/useSftpBackend";
+import { isDockerSftpConnection } from "../application/state/sftp/backend";
 import { useSftpFileAssociations } from "../application/state/useSftpFileAssociations";
 import { getParentPath } from "../application/state/sftp/utils";
 import { buildCacheKey } from "../application/state/sftp/sharedRemoteHostCache";
@@ -22,6 +24,16 @@ import { logger } from "../lib/logger";
 import type { DropEntry } from "../lib/sftpFileUtils";
 import { Host, Identity, SSHKey } from "../types";
 import type { TransferTask } from "../types";
+import { Button } from "./ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "./ui/dialog";
+import { ScrollArea } from "./ui/scroll-area";
 import { toast } from "./ui/toast";
 import { DistroAvatar } from "./DistroAvatar";
 
@@ -44,6 +56,7 @@ interface SftpSidePanelProps {
   sftpDefaultViewMode: "list" | "tree";
   /** The host to connect to (follows focused terminal) */
   activeHost: Host | null;
+  sourceSessionId?: string | null;
   initialLocation?: { hostId: string; path: string } | null;
   showWorkspaceHostHeader?: boolean;
   isVisible?: boolean;
@@ -74,6 +87,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   updateHosts,
   sftpDefaultViewMode,
   activeHost,
+  sourceSessionId = null,
   initialLocation,
   showWorkspaceHostHeader = false,
   isVisible = true,
@@ -91,6 +105,15 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   onGetTerminalCwd,
 }) => {
   const { t } = useI18n();
+  const [showDockerDialog, setShowDockerDialog] = useState(false);
+  const [dockerLoading, setDockerLoading] = useState(false);
+  const [dockerError, setDockerError] = useState<string | null>(null);
+  const [dockerContainers, setDockerContainers] = useState<Array<{
+    id: string;
+    name: string;
+    status: string;
+    workingDir?: string;
+  }>>([]);
 
   const fileWatchHandlers = useMemo(() => ({
     onFileWatchSynced: (payload: { remotePath: string }) => {
@@ -269,6 +292,21 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   // correctly identify tabs when the same host ID has different overrides.
   const tabConnectionKeyMapRef = useRef<Map<string, string>>(new Map());
 
+  const remoteConnectionKey = useMemo(() => {
+    if (!activeHost || activeHost.protocol === "local" || activeHost.id?.startsWith("local-")) {
+      return null;
+    }
+    const hostKey = buildCacheKey(
+      activeHost.id,
+      activeHost.hostname,
+      activeHost.port,
+      activeHost.protocol,
+      activeHost.sftpSudo,
+      activeHost.username,
+    );
+    return `${hostKey}::${sourceSessionId ?? "standalone"}`;
+  }, [activeHost, sourceSessionId]);
+
   // NOTE: We intentionally do NOT reset lastAppliedInitialLocationKeyRef on
   // visibility changes. When the user switches terminal tabs, the panel
   // toggles isVisible but should preserve its navigation state (the user may
@@ -346,7 +384,8 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     // Build a connection key that accounts for session-time overrides
     // (same host ID may have different port/protocol in different workspace panes).
     // Uses buildCacheKey to stay consistent with the key recorded on upload tasks.
-    const connectionKey = buildCacheKey(activeHost.id, activeHost.hostname, activeHost.port, activeHost.protocol, activeHost.sftpSudo, activeHost.username);
+    const connectionKey = remoteConnectionKey;
+    if (!connectionKey) return;
     if (connectedKeyRef.current === connectionKey) return;
 
     // Don't switch connections while transfers or editor are active
@@ -388,11 +427,12 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
     connectedHostObjRef.current = activeHost;
     s.connect("left", activeHost, {
       ...(needsNewTab ? { forceNewTab: true } : undefined),
+      sourceSessionId,
       onTabCreated: (tabId) => {
         tabConnectionKeyMapRef.current.set(tabId, connectionKey);
       },
     });
-  }, [activeHost, hasActiveWork]); // Re-evaluate when work finishes so deferred switch can proceed
+  }, [activeHost, hasActiveWork, remoteConnectionKey, sourceSessionId]); // Re-evaluate when work finishes so deferred switch can proceed
 
   // Clear the remembered connection key when the pane disconnects or the
   // session is lost, so re-opening SFTP for the same terminal reconnects.
@@ -414,7 +454,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
 
     const activePane = sftpRef.current.leftPane;
     const connection = activePane.connection;
-    if (!connection || connection.isLocal || connection.hostId !== activeHost.id) return;
+    if (!connection || connection.isLocal || connection.backendType !== "sftp" || connection.hostId !== activeHost.id) return;
     if (connection.status !== "connected") return;
 
     // Include full endpoint key so that same-hostId sessions with
@@ -442,7 +482,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
 
     const activePane = sftp.leftPane;
     const connection = activePane.connection;
-    if (!connection || connection.isLocal || connection.hostId !== activeHost.id) return;
+    if (!connection || connection.isLocal || connection.backendType !== "sftp" || connection.hostId !== activeHost.id) return;
     if (connection.status !== "connected") return;
 
     handledPendingUploadIdRef.current = pendingUpload.requestId;
@@ -509,6 +549,9 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
       if (connection.isLocal) {
         return t.sourceConnectionId === connection.id || t.targetConnectionId === connection.id;
       }
+      if (connection.backendType === "docker-container") {
+        return false;
+      }
       return t.targetHostId === connection.hostId || t.sourceConnectionId === connection.id || t.targetConnectionId === connection.id;
     });
     return [...filtered].reverse().slice(0, MAX_VISIBLE_TRANSFERS);
@@ -517,7 +560,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
   const handleRevealTransferTarget = useCallback(
     async (task: TransferTask) => {
       const connection = sftpRef.current.leftPane.connection;
-      if (!connection || connection.isLocal) return;
+      if (!connection || connection.isLocal || connection.backendType !== "sftp") return;
 
       const revealPath = task.isDirectory ? task.targetPath : getParentPath(task.targetPath);
       await sftpRef.current.navigateTo("left", revealPath, { force: true });
@@ -531,7 +574,7 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
       if (task.direction !== "upload" && task.direction !== "remote-to-remote") return false;
 
       const connection = sftp.leftPane.connection;
-      if (!connection || connection.isLocal) return false;
+      if (!connection || connection.isLocal || connection.backendType !== "sftp") return false;
 
       if (task.targetHostId) {
         if (connection.hostId !== task.targetHostId) return false;
@@ -567,6 +610,73 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
 
   // Determine the active pane to render (without using global activeTabStore)
   const activeLeftPaneId = sftp.leftTabs.activeTabId;
+  const activeConnection = sftp.leftPane.connection;
+  const activeDockerConnection = isDockerSftpConnection(activeConnection) ? activeConnection : null;
+  const canOpenDockerFiles = !!activeHost && activeHost.protocol === "ssh" && !!sourceSessionId;
+
+  const loadDockerContainers = useCallback(async () => {
+    if (!activeHost || !sourceSessionId) return;
+    setDockerLoading(true);
+    setDockerError(null);
+    try {
+      const support = await sftp.checkDockerForSession(sourceSessionId);
+      if (!support.supported) {
+        throw new Error(support.error || "当前会话不支持 Docker 容器文件");
+      }
+      const containers = await sftp.listDockerContainers(sourceSessionId);
+      setDockerContainers(containers);
+      setShowDockerDialog(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "无法读取 Docker 容器列表";
+      setDockerError(message);
+      toast.error(message, "SFTP");
+    } finally {
+      setDockerLoading(false);
+    }
+  }, [activeHost, sourceSessionId, sftp]);
+
+  const handleOpenDockerFiles = useCallback(async () => {
+    if (!activeHost) return;
+    if (activeHost.protocol === "mosh") {
+      toast.error("首版容器文件模式仅支持 SSH 会话", "SFTP");
+      return;
+    }
+    if (activeHost.protocol !== "ssh" || !sourceSessionId) {
+      toast.error("当前会话不支持打开容器文件", "SFTP");
+      return;
+    }
+    await loadDockerContainers();
+  }, [activeHost, loadDockerContainers, sourceSessionId]);
+
+  const handleChooseDockerContainer = useCallback(async (containerId: string) => {
+    if (!activeHost || !sourceSessionId) return;
+    const container = dockerContainers.find((item) => item.id === containerId);
+    if (!container) return;
+    setShowDockerDialog(false);
+    await sftp.connectDockerContainer(
+      "left",
+      {
+        host: activeHost,
+        sourceSessionId,
+        container,
+      },
+      { forceNewTab: true },
+    );
+  }, [activeHost, dockerContainers, sftp, sourceSessionId]);
+
+  const handleReturnToHostFiles = useCallback(() => {
+    if (!activeHost) return;
+    const existingHostTab = sftp.leftTabs.tabs.find((tab) =>
+      tab.connection?.backendType === "sftp"
+      && tab.connection.hostId === activeHost.id
+      && tab.connection.sourceSessionId === sourceSessionId,
+    );
+    if (existingHostTab) {
+      sftp.selectTab("left", existingHostTab.id);
+      return;
+    }
+    void sftp.connect("left", activeHost, { forceNewTab: true, sourceSessionId });
+  }, [activeHost, sftp, sourceSessionId]);
 
   return (
     <SftpContextProvider
@@ -604,6 +714,51 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
                 <span className="font-mono text-muted-foreground">
                   {(displayHost.username || "root")}@{displayHost.hostname}:{displayHost.port || 22}
                 </span>
+              </div>
+            </div>
+          </div>
+        )}
+        {activeHost && (activeHost.protocol === "ssh" || activeHost.protocol === "mosh") && (
+          <div className="shrink-0 border-b border-border/50 bg-background/95 px-3 py-2">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-xs font-medium">
+                  {activeDockerConnection
+                    ? `容器文件 · ${activeHost.label} / ${activeDockerConnection.containerName || activeDockerConnection.containerId}`
+                    : "宿主机文件"}
+                </div>
+                <div className="text-[11px] text-muted-foreground truncate">
+                  {activeHost.protocol === "mosh"
+                    ? "首版仅支持 SSH 会话打开 Docker 容器文件"
+                    : activeDockerConnection
+                      ? "容器模式下支持浏览、内置编辑、基础管理和下载"
+                      : "可手动打开当前 SSH 宿主机上的 Docker 容器文件"}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {activeDockerConnection ? (
+                  <>
+                    <Button variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={handleReturnToHostFiles}>
+                      <ArrowLeft size={12} className="mr-1" />
+                      返回宿主机
+                    </Button>
+                    <Button variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={handleOpenDockerFiles} disabled={dockerLoading}>
+                      <RefreshCw size={12} className="mr-1" />
+                      重新选择容器
+                    </Button>
+                  </>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={handleOpenDockerFiles}
+                    disabled={!canOpenDockerFiles || dockerLoading}
+                  >
+                    {dockerLoading ? <Loader2 size={12} className="mr-1 animate-spin" /> : <Box size={12} className="mr-1" />}
+                    打开容器文件
+                  </Button>
+                )}
               </div>
             </div>
           </div>
@@ -682,6 +837,59 @@ const SftpSidePanelInner: React.FC<SftpSidePanelProps> = ({
           t={t}
         />
       )}
+
+      <Dialog open={showDockerDialog} onOpenChange={setShowDockerDialog}>
+        <DialogContent className="sm:max-w-[520px]">
+          <DialogHeader>
+            <DialogTitle>选择容器</DialogTitle>
+            <DialogDescription>
+              选择当前 SSH 宿主机上的一个正在运行的 Docker 容器，以新标签页打开其文件系统。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="border rounded-md">
+            <ScrollArea className="max-h-[320px]">
+              <div className="divide-y divide-border/50">
+                {dockerContainers.length === 0 && (
+                  <div className="px-4 py-6 text-sm text-muted-foreground">
+                    {dockerError || "当前宿主机没有正在运行的容器。"}
+                  </div>
+                )}
+                {dockerContainers.map((container) => (
+                  <button
+                    key={container.id}
+                    className="w-full px-4 py-3 text-left hover:bg-muted/50 transition-colors"
+                    onClick={() => void handleChooseDockerContainer(container.id)}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium truncate">{container.name}</div>
+                        <div className="text-[11px] text-muted-foreground font-mono truncate">
+                          {container.id.slice(0, 12)}
+                        </div>
+                      </div>
+                      <div className="text-[11px] text-muted-foreground shrink-0">
+                        {container.status}
+                      </div>
+                    </div>
+                    <div className="mt-1 text-[11px] text-muted-foreground truncate">
+                      初始目录：{container.workingDir || "/"}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </ScrollArea>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowDockerDialog(false)}>
+              关闭
+            </Button>
+            <Button variant="outline" onClick={() => void loadDockerContainers()} disabled={dockerLoading}>
+              {dockerLoading ? <Loader2 size={14} className="mr-1 animate-spin" /> : <RefreshCw size={14} className="mr-1" />}
+              刷新列表
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </SftpContextProvider>
   );
 };
@@ -693,6 +901,7 @@ const sidePanelAreEqual = (prev: SftpSidePanelProps, next: SftpSidePanelProps): 
   prev.updateHosts === next.updateHosts &&
   prev.sftpDefaultViewMode === next.sftpDefaultViewMode &&
   prev.activeHost === next.activeHost &&
+  prev.sourceSessionId === next.sourceSessionId &&
   prev.showWorkspaceHostHeader === next.showWorkspaceHostHeader &&
   prev.isVisible === next.isVisible &&
   prev.renderOverlays === next.renderOverlays &&

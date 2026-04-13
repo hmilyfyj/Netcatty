@@ -676,6 +676,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   // The host to pass to the SFTP panel - stored when the user opens SFTP
   const [sftpHostForTab, setSftpHostForTab] = useState<Map<string, Host>>(new Map());
+  const [sftpSourceSessionIdForTab, setSftpSourceSessionIdForTab] = useState<Map<string, string>>(new Map());
   const [sftpInitialLocationForTab, setSftpInitialLocationForTab] = useState<
     Map<string, { hostId: string; path: string }>
   >(new Map());
@@ -811,6 +812,15 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
         next.delete(tabId);
       } else {
         next.set(tabId, host);
+      }
+      return next;
+    });
+    setSftpSourceSessionIdForTab(prev => {
+      const next = new Map(prev);
+      if (isClosing || !sourceSessionId) {
+        next.delete(tabId);
+      } else {
+        next.set(tabId, sourceSessionId);
       }
       return next;
     });
@@ -1062,6 +1072,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   useEffect(() => {
     setSidePanelOpenTabs(prev => filterTabsMap(prev, validTerminalTabIds));
     setSftpHostForTab(prev => filterTabsMap(prev, validTerminalTabIds));
+    setSftpSourceSessionIdForTab(prev => filterTabsMap(prev, validTerminalTabIds));
     setSftpInitialLocationForTab(prev => filterTabsMap(prev, validTerminalTabIds));
     setSftpPendingUploadsForTab(prev => filterTabsMap(prev, validTerminalTabIds));
     sessionActivityStore.prune(validSessionActivityIds);
@@ -1319,6 +1330,56 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     return sftpHostForTab.get(activeTabId) ?? null;
   }, [isSftpOpenForCurrentTab, activeTabId, activeWorkspace, focusedSessionId, sessionHostsMap, sftpHostForTab]);
 
+  const sftpActiveSourceSessionId = useMemo((): string | null => {
+    if (!isSftpOpenForCurrentTab || !activeTabId) return null;
+
+    const storedSessionId = sftpSourceSessionIdForTab.get(activeTabId) ?? null;
+    const isConnected = (sessionId: string | null | undefined) => (
+      !!sessionId && sessions.some((session) => session.id === sessionId && session.status === 'connected')
+    );
+
+    if (activeWorkspace) {
+      if (isConnected(focusedSessionId)) {
+        return focusedSessionId ?? null;
+      }
+      if (isConnected(storedSessionId)) {
+        return storedSessionId;
+      }
+      return sessions
+        .filter((session) => session.workspaceId === activeWorkspace.id)
+        .find((session) => session.status === 'connected')
+        ?.id ?? storedSessionId ?? focusedSessionId ?? null;
+    }
+
+    if (activeGroup) {
+      if (activeSession?.status === 'connected') {
+        return activeSession.id;
+      }
+      if (isConnected(storedSessionId)) {
+        return storedSessionId;
+      }
+      return activeGroupSessions.find((session) => session.status === 'connected')?.id
+        ?? storedSessionId
+        ?? activeSession?.id
+        ?? null;
+    }
+
+    if (activeSession?.status === 'connected') {
+      return activeSession.id;
+    }
+    return storedSessionId ?? activeSession?.id ?? null;
+  }, [
+    activeGroup,
+    activeGroupSessions,
+    activeSession,
+    activeTabId,
+    activeWorkspace,
+    focusedSessionId,
+    isSftpOpenForCurrentTab,
+    sessions,
+    sftpSourceSessionIdForTab,
+  ]);
+
   // Keep sftpHostForTab in sync with focus changes in workspace mode
   // so that the toggle check uses the currently displayed host.
   useEffect(() => {
@@ -1335,6 +1396,17 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       return next;
     });
   }, [activeTabId, sftpActiveHost, sidePanelOpenTabs, sftpHostForTab]);
+
+  useEffect(() => {
+    if (!activeTabId || !sftpActiveSourceSessionId) return;
+    if (sidePanelOpenTabs.get(activeTabId) !== 'sftp') return;
+    if (sftpSourceSessionIdForTab.get(activeTabId) === sftpActiveSourceSessionId) return;
+    setSftpSourceSessionIdForTab(prev => {
+      const next = new Map(prev);
+      next.set(activeTabId, sftpActiveSourceSessionId);
+      return next;
+    });
+  }, [activeTabId, sftpActiveSourceSessionId, sidePanelOpenTabs, sftpSourceSessionIdForTab]);
 
   const mountedSftpTabIds = useMemo(
     () => Array.from(sftpHostForTab.keys()),
@@ -1385,6 +1457,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       next.delete(activeTabId);
       return next;
     });
+    setSftpSourceSessionIdForTab(prev => {
+      const next = new Map(prev);
+      next.delete(activeTabId);
+      return next;
+    });
     setSftpPendingUploadsForTab(prev => {
       const next = new Map(prev);
       next.delete(activeTabId);
@@ -1408,10 +1485,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     // If switching to SFTP and no host is stored yet, resolve it
     if (tab === 'sftp' && !sftpHostForTabRef.current.has(activeTabId)) {
       let host: Host | null = null;
+      let sourceSessionId: string | null = null;
       if (activeWorkspace && focusedSessionId) {
         host = sessionHostsMap.get(focusedSessionId) ?? null;
+        sourceSessionId = focusedSessionId;
       } else if (activeSession) {
         host = sessionHostsMap.get(activeSession.id) ?? null;
+        sourceSessionId = activeSession.id;
       }
       if (!host) return;
       setSftpHostForTab(prev => {
@@ -1419,6 +1499,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
         next.set(activeTabId, host);
         return next;
       });
+      if (sourceSessionId) {
+        setSftpSourceSessionIdForTab(prev => {
+          const next = new Map(prev);
+          next.set(activeTabId, sourceSessionId);
+          return next;
+        });
+      }
     }
 
     // Note: When switching away from SFTP, we keep the SFTP host state
@@ -2302,6 +2389,11 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                           updateHosts={updateHosts}
                           sftpDefaultViewMode={sftpDefaultViewMode}
                           activeHost={isVisibleSftpPanel ? sftpActiveHost : null}
+                          sourceSessionId={
+                            isVisibleSftpPanel
+                              ? (sftpSourceSessionIdForTab.get(tabId) ?? null)
+                              : null
+                          }
                           initialLocation={
                             isVisibleSftpPanel
                               ? (sftpInitialLocationForTab.get(tabId) ?? null)
