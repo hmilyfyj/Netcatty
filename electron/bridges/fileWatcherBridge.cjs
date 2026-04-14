@@ -10,8 +10,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-// Lazy-load encodePathForSession to avoid circular dependency issues
+// Lazy-load encodePathForSession and requireSftpChannel to avoid circular dependency issues
 let encodePathForSession = null;
+let requireSftpChannel = null;
 
 // Map of watchId -> { watcher, localPath, remotePath, sftpId, lastModified, lastSize }
 const activeWatchers = new Map();
@@ -164,9 +165,9 @@ async function handleFileChange(watchId, webContents) {
   
   const { localPath, remotePath, sftpId, encoding, lastModified: previousModified, lastSize: previousSize } = watchInfo;
 
-  // Lazy-load encodePathForSession to avoid circular dependency
-  if (encodePathForSession === null) {
-    ({ encodePathForSession } = require("./sftpBridge.cjs"));
+  // Lazy-load encodePathForSession and requireSftpChannel to avoid circular dependency
+  if (encodePathForSession === null || requireSftpChannel === null) {
+    ({ encodePathForSession, requireSftpChannel } = require("./sftpBridge.cjs"));
   }
 
   // Extract file name once for notifications and logging
@@ -198,14 +199,52 @@ async function handleFileChange(watchId, webContents) {
       throw new Error("SFTP session not found or expired");
     }
     
+    // Preserve remote file permissions and owner before upload
+    const encodedPath = encodePathForSession(sftpId, remotePath, encoding);
+    let existingMode = null;
+    let existingUid = null;
+    let existingGid = null;
+    try {
+      const remoteStat = await client.stat(encodedPath);
+      if (typeof remoteStat.mode === "number") {
+        existingMode = remoteStat.mode & 0o7777;
+      }
+      if (typeof remoteStat.uid === "number") existingUid = remoteStat.uid;
+      if (typeof remoteStat.gid === "number") existingGid = remoteStat.gid;
+    } catch (_err) {
+      // Remote file may not exist anymore, proceed without preserving attrs
+    }
+    
     // Read the local file
     const content = await fs.promises.readFile(localPath);
     
     console.log(`[FileWatcher] Syncing ${content.length} bytes to ${remotePath}`);
     
     // Upload to remote
-    const encodedPath = encodePathForSession(sftpId, remotePath, encoding);
     await client.put(content, encodedPath);
+    
+    // Restore permissions if they were preserved
+    if (existingMode !== null) {
+      try {
+        await client.chmod(encodedPath, existingMode);
+      } catch (err) {
+        console.warn(`[FileWatcher] Failed to restore permissions on ${remotePath}:`, err.message);
+      }
+    }
+    
+    // Restore owner (uid/gid) if they were preserved
+    if (existingUid !== null || existingGid !== null) {
+      try {
+        const sftp = await requireSftpChannel(client);
+        await new Promise((resolve, reject) => {
+          sftp.setstat(encodedPath, { uid: existingUid, gid: existingGid }, (err) =>
+            err ? reject(err) : resolve(),
+          );
+        });
+      } catch (err) {
+        console.warn(`[FileWatcher] Failed to restore owner on ${remotePath}:`, err.message);
+      }
+    }
     
     console.log(`[FileWatcher] Sync complete: ${remotePath}`);
     

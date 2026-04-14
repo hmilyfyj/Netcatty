@@ -1521,7 +1521,7 @@ function App({ settings }: { settings: SettingsState }) {
             showRecentHosts={settings.showRecentHosts}
             showOnlyUngroupedHostsInRoot={settings.showOnlyUngroupedHostsInRoot}
             vaultHostsSortMode={settings.vaultHostsSortMode}
-            onSetVaultHostsSortMode={settings.setVaultHostsSortMode}
+            onVaultHostsSortModeChange={settings.setVaultHostsSortMode}
             navigateToSection={navigateToSection}
             onNavigateToSectionHandled={() => setNavigateToSection(null)}
           />

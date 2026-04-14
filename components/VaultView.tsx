@@ -153,6 +153,8 @@ interface VaultViewProps {
   onUpdateGroupConfigs: (configs: GroupConfig[]) => void;
   showRecentHosts: boolean;
   showOnlyUngroupedHostsInRoot: boolean;
+  vaultHostsSortMode: SortMode;
+  onVaultHostsSortModeChange: (mode: SortMode) => void;
   // Optional: navigate to a specific section on mount or when changed
   navigateToSection?: VaultSection | null;
   onNavigateToSectionHandled?: () => void;
@@ -201,6 +203,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   onUpdateGroupConfigs,
   showRecentHosts,
   showOnlyUngroupedHostsInRoot,
+  vaultHostsSortMode,
+  onVaultHostsSortModeChange,
   navigateToSection,
   onNavigateToSectionHandled,
 }) => {
@@ -260,7 +264,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     "grid",
   );
   const treeExpandedState = useTreeExpandedState(STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED);
-  const [sortMode, setSortMode] = useState<SortMode>("az");
+  const sortMode = vaultHostsSortMode;
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(new Set());
   const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
@@ -1851,7 +1855,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               />
               <SortDropdown
                 value={sortMode}
-                onChange={setSortMode}
+                onChange={onVaultHostsSortModeChange}
                 className="h-10 w-10"
               />
               <Button

@@ -1868,12 +1868,17 @@ async function writeSftp(event, payload) {
   const encodedPath = encodePath(payload.path, encoding);
 
   let existingMode = null;
+  let existingUid = null;
+  let existingGid = null;
   try {
     const stat = await client.stat(encodedPath);
     if (typeof stat.mode === "number") {
       // Mask with 0o7777 so special bits (setuid/setgid/sticky) are preserved too.
       existingMode = stat.mode & 0o7777;
     }
+    // Preserve owner (uid/gid) if available
+    if (typeof stat.uid === "number") existingUid = stat.uid;
+    if (typeof stat.gid === "number") existingGid = stat.gid;
   } catch (_err) {
     // File does not exist — treat as a new file and let the server apply defaults.
   }
@@ -1891,6 +1896,23 @@ async function writeSftp(event, payload) {
     } catch (err) {
       console.warn(
         `[sftp] Failed to restore permissions on ${payload.path}:`,
+        err && err.message ? err.message : err,
+      );
+    }
+  }
+
+  // Restore owner (uid/gid) if they were preserved
+  if (existingUid !== null || existingGid !== null) {
+    try {
+      const sftp = await requireSftpChannel(client);
+      await new Promise((resolve, reject) => {
+        sftp.setstat(encodedPath, { uid: existingUid, gid: existingGid }, (err) =>
+          err ? reject(err) : resolve(),
+        );
+      });
+    } catch (err) {
+      console.warn(
+        `[sftp] Failed to restore owner on ${payload.path}:`,
         err && err.message ? err.message : err,
       );
     }
