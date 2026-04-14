@@ -42,7 +42,7 @@ import { ThemeSidePanel } from './terminal/ThemeSidePanel';
 import { useServerStats } from './terminal/hooks/useServerStats';
 import { isServerStatsSupportedHost } from './terminal/serverStatsSupport';
 import { AIChatSidePanel } from './AIChatSidePanel';
-import { cleanupOrphanedAISessions, useAIState } from '../application/state/useAIState';
+import { useAIState } from '../application/state/useAIState';
 import { TerminalComposeBar } from './terminal/TerminalComposeBar';
 import { TERMINAL_THEMES } from '../infrastructure/config/terminalThemes';
 import { useCustomThemes } from '../application/state/customThemeStore';
@@ -268,6 +268,10 @@ interface AIChatPanelsHostProps {
   }) => ExecutorContext;
 }
 
+interface AIStateMaintenanceHostProps {
+  validTerminalTabIds: Set<string>;
+}
+
 const AIStateProviderInner: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const aiState = useAIState();
   return (
@@ -279,6 +283,27 @@ const AIStateProviderInner: React.FC<{ children: React.ReactNode }> = ({ childre
 
 const AIStateProvider = memo(AIStateProviderInner);
 AIStateProvider.displayName = 'AIStateProvider';
+
+const AIStateMaintenanceHostInner: React.FC<AIStateMaintenanceHostProps> = ({
+  validTerminalTabIds,
+}) => {
+  const aiState = useContext(AIStateContext);
+
+  if (!aiState) {
+    throw new Error('AIStateMaintenanceHost must be rendered inside AIStateProvider');
+  }
+
+  const { cleanupOrphanedSessions } = aiState;
+
+  useEffect(() => {
+    cleanupOrphanedSessions(validTerminalTabIds);
+  }, [cleanupOrphanedSessions, validTerminalTabIds]);
+
+  return null;
+};
+
+const AIStateMaintenanceHost = memo(AIStateMaintenanceHostInner);
+AIStateMaintenanceHost.displayName = 'AIStateMaintenanceHost';
 
 const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
   mountedTabIds,
@@ -309,7 +334,16 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
             <AIChatSidePanel
               sessions={aiState.sessions}
               activeSessionIdMap={aiState.activeSessionIdMap}
+              draftsByScope={aiState.draftsByScope}
+              panelViewByScope={aiState.panelViewByScope}
               setActiveSessionId={aiState.setActiveSessionId}
+              ensureDraftForScope={aiState.ensureDraftForScope}
+              updateDraft={aiState.updateDraft}
+              showDraftView={aiState.showDraftView}
+              showSessionView={aiState.showSessionView}
+              clearDraftForScope={aiState.clearDraftForScope}
+              addDraftFiles={aiState.addDraftFiles}
+              removeDraftFile={aiState.removeDraftFile}
               createSession={aiState.createSession}
               deleteSession={aiState.deleteSession}
               updateSessionTitle={aiState.updateSessionTitle}
@@ -1193,10 +1227,6 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     setSftpPendingUploadsForTab(prev => filterTabsMap(prev, validTerminalTabIds));
     sessionActivityStore.prune(validSessionActivityIds);
   }, [validSessionActivityIds, validTerminalTabIds]);
-
-  useEffect(() => {
-    cleanupOrphanedAISessions(validTerminalTabIds);
-  }, [validTerminalTabIds]);
 
   const computeWorkspaceRects = useCallback((workspace?: Workspace, size?: { width: number; height: number }): Record<string, WorkspaceRect> => {
     if (!workspace) return {} as Record<string, WorkspaceRect>;
@@ -2386,6 +2416,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   return (
     <AIStateProvider>
+      <AIStateMaintenanceHost validTerminalTabIds={validTerminalTabIds} />
       <div
         ref={workspaceOuterRef}
         className="absolute inset-0 bg-background flex flex-col"
