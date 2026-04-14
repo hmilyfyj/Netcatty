@@ -683,18 +683,21 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
 
   const handleSend = useCallback(async () => {
     const draft = currentDraftRef.current;
-  const currentPanelView = panelViewRef.current;
-  const currentSessionView = activeSessionRef.current;
-  const trimmed = draft?.text.trim() ?? '';
-  const sendScopeKey = scopeKey;
-  if (!trimmed || isStreaming) return;
-  const selectedSkillSlugs = draft?.selectedUserSkillSlugs ?? [];
-  const attachments = (draft?.attachments ?? []).map((file) => ({
-    base64Data: file.base64Data,
-    mediaType: file.mediaType,
-    filename: file.filename,
-    filePath: file.filePath,
-  }));
+    const currentPanelView = panelViewRef.current;
+    const currentSessionView = activeSessionRef.current;
+    const trimmed = draft?.text.trim() ?? '';
+    const sendScopeKey = scopeKey;
+    // Double-submit protection currently relies on the draft being cleared
+    // immediately after the first send path starts; `isStreaming` alone does
+    // not protect the initial draft->session transition.
+    if (!trimmed || isStreaming) return;
+    const selectedSkillSlugs = draft?.selectedUserSkillSlugs ?? [];
+    const attachments = (draft?.attachments ?? []).map((file) => ({
+      base64Data: file.base64Data,
+      mediaType: file.mediaType,
+      filename: file.filename,
+      filePath: file.filePath,
+    }));
 
     let sessionId = currentSessionView?.id ?? null;
     let currentSession = currentSessionView ?? null;
@@ -772,6 +775,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
           providers,
           selectedAgentModel,
           toolIntegrationMode,
+          selectedUserSkillSlugs: selectedSkillSlugs,
         });
       } catch (err) {
         reportStreamError(sessionId, abortController.signal, err);
@@ -799,6 +803,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
         webSearchConfig,
         getExecutorContext: () => buildExecutorContextForScope(toolScope),
         autoTitleSession,
+        selectedUserSkillSlugs: selectedSkillSlugs,
       }, attachments.length > 0 ? attachments : undefined);
     }
   }, [
