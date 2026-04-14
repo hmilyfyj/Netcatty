@@ -2471,7 +2471,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="sftp"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'sftp' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'sftp'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2485,7 +2488,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="scripts"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'scripts' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'scripts'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2499,7 +2505,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="theme"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'theme' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'theme'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2513,7 +2522,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="ai"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'ai' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'ai'
                           ? 'var(--terminal-sidepanel-fg)'
