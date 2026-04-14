@@ -1253,6 +1253,7 @@ const en: Messages = {
   'terminal.search.nextMatch': 'Next match (Enter)',
   'terminal.menu.copy': 'Copy',
   'terminal.menu.paste': 'Paste',
+  'terminal.menu.pasteSelection': 'Paste Selection',
   'terminal.menu.selectAll': 'Select All',
   'terminal.menu.splitHorizontal': 'Split Horizontal',
   'terminal.menu.splitVertical': 'Split Vertical',

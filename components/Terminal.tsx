@@ -1775,6 +1775,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       isAlternateScreen={hasMouseTracking}
       onCopy={terminalContextActions.onCopy}
       onPaste={terminalContextActions.onPaste}
+      onPasteSelection={terminalContextActions.onPasteSelection}
       onSelectAll={terminalContextActions.onSelectAll}
       onClear={terminalContextActions.onClear}
       onSelectWord={terminalContextActions.onSelectWord}
