@@ -1257,6 +1257,12 @@ const api = {
   aiSyncWebSearch: async (apiHost, apiKey) => {
     return ipcRenderer.invoke("netcatty:ai:sync-web-search", { apiHost, apiKey });
   },
+  aiUserSkillsGetStatus: async () => {
+    return ipcRenderer.invoke("netcatty:ai:user-skills:get-status");
+  },
+  aiUserSkillsBuildContext: async (prompt, selectedSkillSlugs) => {
+    return ipcRenderer.invoke("netcatty:ai:user-skills:build-context", { prompt, selectedSkillSlugs });
+  },
   aiChatStream: async (requestId, url, headers, body, providerId) => {
     return ipcRenderer.invoke("netcatty:ai:chat:stream", { requestId, url, headers, body, providerId });
   },

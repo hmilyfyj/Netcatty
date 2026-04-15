@@ -42,6 +42,11 @@ import ChatInput from './ai/ChatInput';
 import ChatMessageList from './ai/ChatMessageList';
 import ConversationExport from './ai/ConversationExport';
 import {
+  getReadyUserSkillOptions,
+  getNextSelectedUserSkillSlugsMap,
+  type UserSkillOption,
+} from './ai/userSkillsState';
+import {
   applyDraftEntrySelection,
   applyHistorySessionSelection,
   resolveDisplayedPanelView,
@@ -226,6 +231,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
 
   const [showHistory, setShowHistory] = useState(false);
   const [runtimeAgentModelPresets, setRuntimeAgentModelPresets] = useState<Record<string, ReturnType<typeof getAgentModelPresets>>>({});
+  const [userSkillOptions, setUserSkillOptions] = useState<UserSkillOption[]>([]);
   const { openSettingsWindow } = useWindowControls();
   const terminalSessionsRef = useRef(terminalSessions);
   terminalSessionsRef.current = terminalSessions;
@@ -414,6 +420,56 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   const removeFile = useCallback((fileId: string) => {
     removeDraftFile(scopeKey, currentAgentId, fileId);
   }, [removeDraftFile, scopeKey, currentAgentId]);
+
+  useEffect(() => {
+    if (!isVisible) return;
+
+    let cancelled = false;
+    const applyUserSkillsStatus = (result) => {
+      const nextOptions = getReadyUserSkillOptions(result);
+      setUserSkillOptions(nextOptions);
+
+      const draft = currentDraftRef.current;
+      if (!draft) return;
+
+      const nextSelectedUserSkillSlugs =
+        getNextSelectedUserSkillSlugsMap(
+          { [scopeKey]: draft.selectedUserSkillSlugs },
+          result,
+        )[scopeKey] ?? [];
+
+      const selectedUserSkillsChanged =
+        nextSelectedUserSkillSlugs.length !== draft.selectedUserSkillSlugs.length
+        || nextSelectedUserSkillSlugs.some((slug, index) => slug !== draft.selectedUserSkillSlugs[index]);
+
+      if (!selectedUserSkillsChanged) return;
+
+      updateScopeDraft(draft.agentId, (currentScopeDraft) => ({
+        ...currentScopeDraft,
+        selectedUserSkillSlugs: nextSelectedUserSkillSlugs,
+      }));
+    };
+
+    const bridge = getNetcattyBridge();
+    if (!bridge?.aiUserSkillsGetStatus) {
+      applyUserSkillsStatus(null);
+      return;
+    }
+
+    void bridge.aiUserSkillsGetStatus()
+      .then((result) => {
+        if (cancelled) return;
+        applyUserSkillsStatus(result);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        applyUserSkillsStatus(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isVisible, scopeKey, toolIntegrationMode, updateScopeDraft]);
   // Sync provider configs to main process so it can decrypt API keys server-side.
   // Keys stay encrypted in transit; main process decrypts only when making HTTP requests.
   useEffect(() => {
@@ -458,6 +514,18 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   );
 
   const messages = activeSession?.messages ?? [];
+  const selectedUserSkillSlugs = useMemo(
+    () => currentDraft?.selectedUserSkillSlugs ?? [],
+    [currentDraft],
+  );
+  const selectedUserSkills = useMemo(
+    () =>
+      selectedUserSkillSlugs.map((slug) => {
+        const option = userSkillOptions.find((skill) => skill.slug === slug);
+        return option ?? { id: slug, slug, name: slug, description: '' };
+      }),
+    [selectedUserSkillSlugs, userSkillOptions],
+  );
 
   // ── Export hook ──
   const { handleExport } = useConversationExport(activeSession);
@@ -650,6 +718,39 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
       workspaceName: scope.type === 'workspace' ? scope.label : undefined,
     };
   }, []);
+
+  const addSelectedUserSkill = useCallback((slug: string) => {
+    const normalizedSlug = String(slug || '').trim().toLowerCase();
+    if (!normalizedSlug) return;
+    enterScopeDraftMode(currentAgentId, panelViewRef.current.mode === 'session');
+    updateScopeDraft(currentAgentId, (draft) => {
+      if (draft.selectedUserSkillSlugs.includes(normalizedSlug)) {
+        return draft;
+      }
+      return {
+        ...draft,
+        selectedUserSkillSlugs: [...draft.selectedUserSkillSlugs, normalizedSlug],
+      };
+    });
+  }, [currentAgentId, enterScopeDraftMode, updateScopeDraft]);
+
+  const removeSelectedUserSkill = useCallback((slug: string) => {
+    const normalizedSlug = String(slug || '').trim().toLowerCase();
+    if (!normalizedSlug) return;
+    enterScopeDraftMode(currentAgentId, panelViewRef.current.mode === 'session');
+    updateScopeDraft(currentAgentId, (draft) => {
+      const nextSelectedUserSkillSlugs = draft.selectedUserSkillSlugs.filter(
+        (entry) => entry !== normalizedSlug,
+      );
+      if (nextSelectedUserSkillSlugs.length === draft.selectedUserSkillSlugs.length) {
+        return draft;
+      }
+      return {
+        ...draft,
+        selectedUserSkillSlugs: nextSelectedUserSkillSlugs,
+      };
+    });
+  }, [currentAgentId, enterScopeDraftMode, updateScopeDraft]);
 
   // -------------------------------------------------------------------
   // Main send handler (thin orchestrator)
@@ -962,6 +1063,10 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
             onAddFiles={addFiles}
             onRemoveFile={removeFile}
             hosts={terminalSessions.map(s => ({ sessionId: s.sessionId, hostname: s.hostname, label: s.label, connected: s.connected }))}
+            selectedUserSkills={selectedUserSkills}
+            userSkills={userSkillOptions}
+            onAddUserSkill={addSelectedUserSkill}
+            onRemoveUserSkill={removeSelectedUserSkill}
             permissionMode={globalPermissionMode}
             onPermissionModeChange={setGlobalPermissionMode}
           />

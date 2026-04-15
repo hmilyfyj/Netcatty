@@ -47,6 +47,11 @@ const {
   getCodexValidationCache,
   setCodexValidationCache,
 } = require("./ai/codexHelpers.cjs");
+const {
+  scanUserSkills,
+  buildUserSkillsContext,
+  toPublicUserSkillsStatus,
+} = require("./ai/userSkills.cjs");
 
 const DEBUG_MCP = process.env.NETCATTY_MCP_DEBUG === "1";
 const NETCATTY_TOOL_SKILL_PATH = toUnpackedAsarPath(
@@ -783,6 +788,44 @@ function registerHandlers(ipcMain) {
     webSearchApiKeyEncrypted = typeof apiKey === "string" ? apiKey : null;
     rebuildProviderFetchHosts();
     return { ok: true };
+  });
+
+  ipcMain.handle("netcatty:ai:user-skills:get-status", async (event) => {
+    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    try {
+      const status = await scanUserSkills(electronModule?.app);
+      return {
+        ok: true,
+        ...toPublicUserSkillsStatus(status),
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err?.message || String(err),
+      };
+    }
+  });
+
+  ipcMain.handle("netcatty:ai:user-skills:build-context", async (event, { prompt, selectedSkillSlugs }) => {
+    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    try {
+      const result = await buildUserSkillsContext(
+        electronModule?.app,
+        typeof prompt === "string" ? prompt : "",
+        Array.isArray(selectedSkillSlugs) ? selectedSkillSlugs : [],
+      );
+      return {
+        ok: true,
+        context: result.context,
+        status: toPublicUserSkillsStatus(result.status),
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        context: "",
+        error: err?.message || String(err),
+      };
+    }
   });
 
   /**
