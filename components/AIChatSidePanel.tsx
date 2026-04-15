@@ -42,11 +42,17 @@ import ChatInput from './ai/ChatInput';
 import ChatMessageList from './ai/ChatMessageList';
 import ConversationExport from './ai/ConversationExport';
 import {
+  applyDraftEntrySelection,
   applyHistorySessionSelection,
   resolveDisplayedPanelView,
   resolveDisplayedSession,
-  shouldRetargetSessionForScope,
 } from './ai/aiPanelViewState';
+import {
+  endDraftSend,
+  tryBeginDraftSend,
+} from './ai/draftSendGate';
+import { getSessionScopeMatchRank } from './ai/sessionScopeMatch';
+import { SESSION_HISTORY_ROW_CLASSNAMES } from './ai/sessionHistoryLayout';
 import type { CodexIntegrationStatus } from './settings/tabs/ai/types';
 import {
   useAIChatStreaming,
@@ -98,7 +104,6 @@ interface AIChatSidePanelProps {
   deleteSession: (sessionId: string, scopeKey?: string) => void;
   updateSessionTitle: (sessionId: string, title: string) => void;
   updateSessionExternalSessionId: (sessionId: string, externalSessionId: string | undefined) => void;
-  retargetSessionScope: (sessionId: string, scope: AISessionScope) => void;
   addMessageToSession: (sessionId: string, message: ChatMessage) => void;
   updateLastMessage: (
     sessionId: string,
@@ -167,27 +172,6 @@ interface AIChatSidePanelProps {
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
-
-function getSessionScopeMatchRank(
-  session: AISession,
-  scopeType: 'terminal' | 'workspace',
-  scopeTargetId?: string,
-  scopeHostIds?: string[],
-  activeTerminalTargetIds?: Set<string>,
-): number {
-  if (session.scope.type !== scopeType) return 0;
-  if (session.scope.targetId === scopeTargetId) return 2;
-
-  if (scopeType !== 'terminal' || !scopeHostIds?.length || !session.scope.hostIds?.length) {
-    return 0;
-  }
-
-  if (session.scope.targetId && activeTerminalTargetIds?.has(session.scope.targetId)) {
-    return 0;
-  }
-
-  return session.scope.hostIds.some((hostId) => scopeHostIds.includes(hostId)) ? 1 : 0;
-}
 // -------------------------------------------------------------------
 // Component
 // -------------------------------------------------------------------
@@ -209,7 +193,6 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   deleteSession,
   updateSessionTitle,
   updateSessionExternalSessionId,
-  retargetSessionScope,
   addMessageToSession,
   updateLastMessage,
   updateMessageById,
@@ -267,36 +250,42 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     setActiveSessionIdForScope(scopeKey, id);
   }, [scopeKey, setActiveSessionIdForScope]);
 
-  const activeTerminalTargetIds = useMemo(() => {
-    const targetIds = new Set<string>();
-    for (const [sessionScopeKey, sessionId] of Object.entries(activeSessionIdMap)) {
+  const activeTerminalSessionIds = useMemo(() => {
+    const sessionIds = new Set<string>();
+    const entries = Object.entries(activeSessionIdMap) as Array<[string, string | null]>;
+    for (const [sessionScopeKey, sessionId] of entries) {
       if (!sessionScopeKey.startsWith('terminal:') || !sessionId) continue;
-      const targetId = sessionScopeKey.slice('terminal:'.length);
-      if (!targetId || targetId === scopeTargetId) continue;
-      targetIds.add(targetId);
+      if (sessionScopeKey === scopeKey) continue;
+      sessionIds.add(sessionId);
     }
-    return targetIds;
-  }, [activeSessionIdMap, scopeTargetId]);
+    return sessionIds;
+  }, [activeSessionIdMap, scopeKey]);
 
   const historySessions = useMemo(
     () =>
       sessions
         .map((session) => ({
           session,
-          matchRank: getSessionScopeMatchRank(session, scopeType, scopeTargetId, scopeHostIds, activeTerminalTargetIds),
+          matchRank: getSessionScopeMatchRank(
+            session,
+            scopeType,
+            scopeTargetId,
+            scopeHostIds,
+            activeTerminalSessionIds,
+          ),
         }))
         .filter(({ matchRank }) => matchRank > 0)
         .sort((a, b) => b.matchRank - a.matchRank || b.session.updatedAt - a.session.updatedAt)
         .map(({ session }) => session),
-    [sessions, scopeType, scopeTargetId, scopeHostIds, activeTerminalTargetIds],
+    [sessions, scopeType, scopeTargetId, scopeHostIds, activeTerminalSessionIds],
   );
 
   const explicitPanelView = panelViewByScope[scopeKey];
   const currentDraft = draftsByScope[scopeKey] ?? null;
   const persistedSessionId = activeSessionIdMap[scopeKey] ?? null;
   const normalizedPanelView = useMemo<AIPanelView>(
-    () => resolveDisplayedPanelView(explicitPanelView, currentDraft != null, historySessions, persistedSessionId),
-    [explicitPanelView, currentDraft, historySessions, persistedSessionId],
+    () => resolveDisplayedPanelView(explicitPanelView, currentDraft != null, historySessions, persistedSessionId, scopeType),
+    [explicitPanelView, currentDraft, historySessions, persistedSessionId, scopeType],
   );
   const activeSession = useMemo(
     () => resolveDisplayedSession(normalizedPanelView, historySessions),
@@ -313,6 +302,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   currentDraftRef.current = currentDraft;
   const activeSessionRef = useRef(activeSession);
   activeSessionRef.current = activeSession;
+  const draftSendInFlightRef = useRef(false);
 
   const defaultTargetSession = useMemo<DefaultTargetSessionHint | undefined>(() => {
     const connectedSessions = terminalSessions.filter((session) => session.connected !== false);
@@ -350,39 +340,8 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     showDraftView(scopeKey);
   }, [normalizedPanelView, explicitPanelView, scopeKey, showDraftView]);
 
-  const shouldRetargetActiveSession = useMemo(() => {
-    return shouldRetargetSessionForScope(
-      activeSession,
-      scopeType,
-      scopeTargetId,
-      scopeHostIds,
-      activeTerminalTargetIds,
-    );
-  }, [activeSession, scopeType, scopeTargetId, scopeHostIds, activeTerminalTargetIds]);
-
   useEffect(() => {
     if (!activeSession) return;
-
-    if (shouldRetargetActiveSession && isVisible) {
-      if (streamingSessionIds.has(activeSession.id)) {
-        const controller = abortControllersRef.current.get(activeSession.id);
-        if (controller) {
-          controller.abort();
-          abortControllersRef.current.delete(activeSession.id);
-        }
-        setStreamingForScope(activeSession.id, false);
-        clearAllPendingApprovals(activeSession.id);
-        const bridge = getNetcattyBridge();
-        bridge?.aiCattyCancelExec?.(activeSession.id);
-        bridge?.aiAcpCancel?.('', activeSession.id);
-      }
-      retargetSessionScope(activeSession.id, {
-        type: scopeType,
-        targetId: scopeTargetId,
-        hostIds: scopeHostIds,
-      });
-      return;
-    }
 
     if (isVisible && activeSessionIdMap[scopeKey] !== activeSession.id) {
       setActiveSessionId(activeSession.id);
@@ -391,17 +350,21 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     activeSession,
     activeSessionIdMap,
     scopeKey,
-    retargetSessionScope,
     isVisible,
-    scopeHostIds,
-    scopeTargetId,
-    scopeType,
     setActiveSessionId,
-    setStreamingForScope,
-    shouldRetargetActiveSession,
-    streamingSessionIds,
-    abortControllersRef,
   ]);
+
+  // When the resolved view is draft but activeSessionIdMap still points at a
+  // previously-shown session, clear that stale entry. Otherwise
+  // activeTerminalTargetIds keeps claiming ownership of the old session's
+  // target and getSessionScopeMatchRank suppresses matching history from
+  // other terminals until another action rewrites the map.
+  useEffect(() => {
+    if (!isVisible) return;
+    if (normalizedPanelView.mode !== 'draft') return;
+    if (persistedSessionId == null) return;
+    setActiveSessionId(null);
+  }, [isVisible, normalizedPanelView.mode, persistedSessionId, setActiveSessionId]);
 
   const ensureScopeDraft = useCallback((agentId: string) => {
     ensureDraftForScope(scopeKey, agentId);
@@ -426,16 +389,26 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     clearDraftForScope(scopeKey);
   }, [clearDraftForScope, scopeKey]);
 
+  const enterScopeDraftMode = useCallback((agentId: string, preserveSessionView = false) => {
+    applyDraftEntrySelection({
+      ensureDraft: () => ensureScopeDraft(agentId),
+      showDraftView: showScopeDraftView,
+      preserveSessionView,
+    });
+  }, [ensureScopeDraft, showScopeDraftView]);
+
   const setInputValue = useCallback((value: string) => {
+    enterScopeDraftMode(currentAgentId, panelViewRef.current.mode === 'session');
     updateScopeDraft(currentAgentId, (draft) => ({
       ...draft,
       text: value,
     }));
-  }, [currentAgentId, updateScopeDraft]);
+  }, [currentAgentId, enterScopeDraftMode, updateScopeDraft]);
 
   const addFiles = useCallback(async (inputFiles: File[]) => {
+    enterScopeDraftMode(currentAgentId, panelViewRef.current.mode === 'session');
     await addDraftFiles(scopeKey, currentAgentId, inputFiles);
-  }, [addDraftFiles, scopeKey, currentAgentId]);
+  }, [addDraftFiles, currentAgentId, enterScopeDraftMode, scopeKey]);
 
   const removeFile = useCallback((fileId: string) => {
     removeDraftFile(scopeKey, currentAgentId, fileId);
@@ -698,113 +671,120 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
       filename: file.filename,
       filePath: file.filePath,
     }));
+    const isDraftMode = currentPanelView.mode === 'draft';
 
-    let sessionId = currentSessionView?.id ?? null;
-    let currentSession = currentSessionView ?? null;
-    let sendAgentId = currentSessionView?.agentId ?? draft?.agentId ?? currentAgentId;
-
-    if (currentPanelView.mode === 'draft') {
-      const scope: AISessionScope = { type: scopeType, targetId: scopeTargetId, hostIds: scopeHostIds };
-      const createdSession = createSession(scope, sendAgentId);
-      sessionId = createdSession.id;
-      currentSession = createdSession;
-      clearScopeDraft();
-      showScopeSessionView(createdSession.id);
-      setActiveSessionId(createdSession.id);
-    }
-
-    if (!sessionId) {
+    if (isDraftMode && !tryBeginDraftSend(draftSendInFlightRef)) {
       return;
     }
 
-    const isExternalAgent = sendAgentId !== 'catty';
+    try {
+      let sessionId = currentSessionView?.id ?? null;
+      let currentSession = currentSessionView ?? null;
+      const sendAgentId = currentSessionView?.agentId ?? draft?.agentId ?? currentAgentId;
 
-    // No provider configured for built-in agent
-    if (!isExternalAgent && !activeProvider) {
-      addMessageToSession(sessionId, { id: generateId(), role: 'user', content: trimmed, timestamp: Date.now() });
-      addMessageToSession(sessionId, { id: generateId(), role: 'assistant', content: t('ai.chat.noProvider'), timestamp: Date.now() });
-      if (currentPanelView.mode === 'session') {
+      if (isDraftMode) {
+        const scope: AISessionScope = { type: scopeType, targetId: scopeTargetId, hostIds: scopeHostIds };
+        const createdSession = createSession(scope, sendAgentId);
+        sessionId = createdSession.id;
+        currentSession = createdSession;
         clearScopeDraft();
-        showScopeSessionView(sessionId);
+        showScopeSessionView(createdSession.id);
+        setActiveSessionId(createdSession.id);
       }
-      return;
-    }
 
-    // Add user message
-    addMessageToSession(sessionId, {
-      id: generateId(), role: 'user', content: trimmed,
-      ...(attachments.length > 0 ? { attachments } : {}),
-      timestamp: Date.now(),
-    });
-    clearScopeDraft();
-    showScopeSessionView(sessionId);
-    setActiveSessionId(sessionId);
-    setStreamingForScope(sessionId, true);
-
-    // Create assistant message placeholder with a tracked ID
-    const agentConfig = isExternalAgent ? externalAgents.find((agent) => agent.id === sendAgentId) : undefined;
-    const assistantMsgId = generateId();
-    addMessageToSession(sessionId, {
-      id: assistantMsgId, role: 'assistant', content: '', timestamp: Date.now(),
-      model: isExternalAgent
-        ? (selectedAgentModel || agentConfig?.name || 'external')
-        : (activeModelId || activeProvider?.defaultModel || ''),
-      providerId: isExternalAgent ? undefined : activeProvider?.providerId,
-    });
-
-    const abortController = new AbortController();
-    abortControllersRef.current.set(sessionId, abortController);
-    currentSession = currentSession ?? sessionsRef.current.find((session) => session.id === sessionId) ?? null;
-
-    if (isExternalAgent) {
-      if (!agentConfig) {
-        updateMessageById(sessionId, assistantMsgId, msg => ({ ...msg, content: 'External agent not found. Please check settings.', executionStatus: 'failed' }));
-        setStreamingForScope(sessionId, false);
+      if (!sessionId) {
         return;
       }
-      try {
-        await sendToExternalAgent(sessionId, trimmed, agentConfig, abortController, attachments, {
-          existingSessionId: currentSession?.externalSessionId,
-          updateExternalSessionId: updateSessionExternalSessionId,
-          historyMessages: buildAcpHistoryMessagesForBridge(
-            currentSession?.messages ?? [],
-            currentSession?.externalSessionId,
-          ),
-          terminalSessions,
-          defaultTargetSession,
-          providers,
-          selectedAgentModel,
-          toolIntegrationMode,
-          selectedUserSkillSlugs: selectedSkillSlugs,
-        });
-      } catch (err) {
-        reportStreamError(sessionId, abortController.signal, err);
+
+      const isExternalAgent = sendAgentId !== 'catty';
+
+      if (!isExternalAgent && !activeProvider) {
+        addMessageToSession(sessionId, { id: generateId(), role: 'user', content: trimmed, timestamp: Date.now() });
+        addMessageToSession(sessionId, { id: generateId(), role: 'assistant', content: t('ai.chat.noProvider'), timestamp: Date.now() });
+        if (currentPanelView.mode === 'session') {
+          clearScopeDraft();
+          showScopeSessionView(sessionId);
+        }
+        return;
       }
-      // Clear any lingering statusText when the external agent stream finishes
-      updateLastMessage(sessionId, msg => msg.statusText ? { ...msg, statusText: '' } : msg);
-      setStreamingForScope(sessionId, false);
-      abortControllersRef.current.delete(sessionId);
-      autoTitleSession(sessionId, trimmed);
-    } else {
-      const toolScope = {
-        type: scopeType,
-        targetId: scopeTargetId,
-        label: scopeLabel,
-      } as const;
-      await sendToCattyAgent(sessionId, sendScopeKey, trimmed, abortController, currentSession ?? undefined, assistantMsgId, {
-        activeProvider,
-        activeModelId,
-        scopeType,
-        scopeTargetId,
-        scopeLabel,
-        globalPermissionMode,
-        commandBlocklist,
-        terminalSessions,
-        webSearchConfig,
-        getExecutorContext: () => buildExecutorContextForScope(toolScope),
-        autoTitleSession,
-        selectedUserSkillSlugs: selectedSkillSlugs,
-      }, attachments.length > 0 ? attachments : undefined);
+
+      addMessageToSession(sessionId, {
+        id: generateId(), role: 'user', content: trimmed,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        timestamp: Date.now(),
+      });
+      clearScopeDraft();
+      showScopeSessionView(sessionId);
+      setActiveSessionId(sessionId);
+      setStreamingForScope(sessionId, true);
+
+      const agentConfig = isExternalAgent ? externalAgents.find((agent) => agent.id === sendAgentId) : undefined;
+      const assistantMsgId = generateId();
+      addMessageToSession(sessionId, {
+        id: assistantMsgId, role: 'assistant', content: '', timestamp: Date.now(),
+        model: isExternalAgent
+          ? (selectedAgentModel || agentConfig?.name || 'external')
+          : (activeModelId || activeProvider?.defaultModel || ''),
+        providerId: isExternalAgent ? undefined : activeProvider?.providerId,
+      });
+
+      const abortController = new AbortController();
+      abortControllersRef.current.set(sessionId, abortController);
+      currentSession = currentSession ?? sessionsRef.current.find((session) => session.id === sessionId) ?? null;
+
+      if (isExternalAgent) {
+        if (!agentConfig) {
+          updateMessageById(sessionId, assistantMsgId, msg => ({ ...msg, content: 'External agent not found. Please check settings.', executionStatus: 'failed' }));
+          setStreamingForScope(sessionId, false);
+          return;
+        }
+        try {
+          await sendToExternalAgent(sessionId, trimmed, agentConfig, abortController, attachments, {
+            existingSessionId: currentSession?.externalSessionId,
+            updateExternalSessionId: updateSessionExternalSessionId,
+            historyMessages: buildAcpHistoryMessagesForBridge(
+              currentSession?.messages ?? [],
+              currentSession?.externalSessionId,
+            ),
+            terminalSessions,
+            defaultTargetSession,
+            providers,
+            selectedAgentModel,
+            toolIntegrationMode,
+            selectedUserSkillSlugs: selectedSkillSlugs,
+          });
+        } catch (err) {
+          reportStreamError(sessionId, abortController.signal, err);
+        }
+        updateLastMessage(sessionId, msg => msg.statusText ? { ...msg, statusText: '' } : msg);
+        setStreamingForScope(sessionId, false);
+        abortControllersRef.current.delete(sessionId);
+        autoTitleSession(sessionId, trimmed);
+      } else {
+        const toolScope = {
+          type: scopeType,
+          targetId: scopeTargetId,
+          label: scopeLabel,
+        } as const;
+        await sendToCattyAgent(sessionId, sendScopeKey, trimmed, abortController, currentSession ?? undefined, assistantMsgId, {
+          activeProvider,
+          activeModelId,
+          scopeType,
+          scopeTargetId,
+          scopeLabel,
+          globalPermissionMode,
+          commandBlocklist,
+          terminalSessions,
+          webSearchConfig,
+          getExecutorContext: () => buildExecutorContextForScope(toolScope),
+          autoTitleSession,
+          selectedUserSkillSlugs: selectedSkillSlugs,
+        }, attachments.length > 0 ? attachments : undefined);
+      }
+    } finally {
+      if (isDraftMode) {
+        endDraftSend(draftSendInFlightRef);
+      }
     }
   }, [
     isStreaming, activeProvider, scopeKey, currentAgentId,
@@ -1041,20 +1021,20 @@ const SessionHistoryDrawer: React.FC<SessionHistoryDrawerProps> = ({
                   onClick={() => onSelect(session.id)}
                   onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSelect(session.id); }}
                   className={cn(
-                    'w-full flex items-center justify-between py-2.5 border-b border-border/20 text-left transition-colors cursor-pointer group',
+                    SESSION_HISTORY_ROW_CLASSNAMES.row,
                     isActive ? 'text-foreground' : 'text-foreground/70 hover:text-foreground',
                   )}
                 >
-                  <span className="text-[13px] truncate pr-3 flex-1 min-w-0">
+                  <span className={SESSION_HISTORY_ROW_CLASSNAMES.title}>
                     {session.title || t('ai.chat.untitled')}
                   </span>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <span className="text-[12px] text-muted-foreground/50">
+                  <div className={SESSION_HISTORY_ROW_CLASSNAMES.meta}>
+                    <span className={SESSION_HISTORY_ROW_CLASSNAMES.time}>
                       {timeStr}
                     </span>
                     <button
                       onClick={(e) => onDelete(e, session.id)}
-                      className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-destructive transition-all cursor-pointer"
+                      className={SESSION_HISTORY_ROW_CLASSNAMES.deleteButton}
                       title="Delete"
                     >
                       <Trash2 size={12} />
