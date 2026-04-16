@@ -412,6 +412,8 @@ interface TerminalLayerProps {
   sessionLogsEnabled?: boolean;
   sessionLogsDir?: string;
   sessionLogsFormat?: string;
+  closeSidePanelRef?: React.MutableRefObject<(() => void) | null>;
+  activeSidePanelTabRef?: React.MutableRefObject<string | null>;
 }
 
 const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
@@ -470,6 +472,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   sessionLogsEnabled,
   sessionLogsDir,
   sessionLogsFormat,
+  closeSidePanelRef,
+  activeSidePanelTabRef,
 }) => {
   // Subscribe to activeTabId from external store
   const activeTabId = useActiveTabId();
@@ -673,6 +677,9 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   // Whether side panel is open for the currently active tab and which sub-panel
   const isSidePanelOpenForCurrentTab = activeTabId ? sidePanelOpenTabs.has(activeTabId) : false;
   const activeSidePanelTab = activeTabId ? sidePanelOpenTabs.get(activeTabId) ?? null : null;
+  if (activeSidePanelTabRef) {
+    activeSidePanelTabRef.current = activeSidePanelTab;
+  }
 
   // Legacy compatibility helpers for SFTP-specific logic
   const isSftpOpenForCurrentTab = activeSidePanelTab === 'sftp';
@@ -1586,6 +1593,14 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       return next;
     });
   }, [activeTabId]);
+
+  useEffect(() => {
+    if (!closeSidePanelRef) return;
+    closeSidePanelRef.current = handleCloseSidePanel;
+    return () => {
+      closeSidePanelRef.current = null;
+    };
+  }, [closeSidePanelRef, handleCloseSidePanel]);
 
   // Switch side panel to a specific tab (or toggle if already on that tab)
   const handleSwitchSidePanelTab = useCallback((tab: SidePanelTab) => {
