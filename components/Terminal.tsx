@@ -939,6 +939,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
           // Autocomplete integration
           onAutocompleteKeyEvent: (e: KeyboardEvent) => autocompleteKeyEventRef.current?.(e) ?? true,
           onAutocompleteInput: (data: string) => autocompleteInputRef.current?.(data),
+          isRestoringSelectionRef,
         });
 
         xtermRuntimeRef.current = runtime;
@@ -1376,7 +1377,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       const hasText = !!selection && selection.length > 0;
       setHasSelection(hasText);
 
-      if (hasText && terminalSettings?.copyOnSelect) {
+      if (hasText && terminalSettings?.copyOnSelect && !isRestoringSelectionRef.current) {
         navigator.clipboard.writeText(selection).catch((err) => {
           logger.warn("Copy on select failed:", err);
         });
@@ -1466,6 +1467,12 @@ const TerminalComponent: React.FC<TerminalProps> = ({
 
   const disableBracketedPasteRef = useRef(terminalSettings?.disableBracketedPaste ?? false);
   disableBracketedPasteRef.current = terminalSettings?.disableBracketedPaste ?? false;
+
+  // True only while createXTermRuntime is programmatically restoring the
+  // selection right after a keystroke (preserveSelectionOnInput). Lets
+  // copy-on-select skip a redundant clipboard write that would otherwise
+  // clobber whatever the user copied elsewhere in the meantime.
+  const isRestoringSelectionRef = useRef(false);
 
   const scrollOnPasteRef = useRef(terminalSettings?.scrollOnPaste ?? true);
   scrollOnPasteRef.current = terminalSettings?.scrollOnPaste ?? true;
