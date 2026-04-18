@@ -45,6 +45,7 @@ import {
   getNetcattyBridge,
   type DefaultTargetSessionHint,
 } from './ai/hooks/useAIChatStreaming';
+import { buildAcpHistoryMessagesForBridge } from './ai/acpHistory';
 import { clearAllPendingApprovals } from '../infrastructure/ai/shared/approvalGate';
 import { useConversationExport } from './ai/hooks/useConversationExport';
 import type { ExecutorContext } from '../infrastructure/ai/cattyAgent/executor';
@@ -146,35 +147,6 @@ function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function buildAcpHistoryMessages(messages: ChatMessage[]): Array<{ role: 'user' | 'assistant'; content: string }> {
-  return messages.flatMap((message) => {
-    if (message.role === 'system') return [];
-
-    if (message.role === 'user') {
-      return message.content ? [{ role: 'user' as const, content: message.content }] : [];
-    }
-
-    if (message.role === 'assistant') {
-      const parts: string[] = [];
-      if (message.content) parts.push(message.content);
-      if (message.toolCalls?.length) {
-        parts.push(...message.toolCalls.map((tc) => `Tool call: ${tc.name}(${JSON.stringify(tc.arguments ?? {})})`));
-      }
-      if (!parts.length) return [];
-      return [{ role: 'assistant' as const, content: parts.join('\n\n') }];
-    }
-
-    if (message.role === 'tool' && message.toolResults?.length) {
-      return message.toolResults.map((tr) => ({
-        role: 'assistant' as const,
-        content: `Tool result:\n${tr.content}`,
-      }));
-    }
-
-    return [];
-  });
-}
-
 function getSessionScopeMatchRank(
   session: AISession,
   scopeType: 'terminal' | 'workspace',
@@ -195,7 +167,6 @@ function getSessionScopeMatchRank(
 
   return session.scope.hostIds.some((hostId) => scopeHostIds.includes(hostId)) ? 1 : 0;
 }
-
 // -------------------------------------------------------------------
 // Component
 // -------------------------------------------------------------------
@@ -755,7 +726,10 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
         await sendToExternalAgent(sessionId, trimmed, agentConfig, abortController, attachments, {
           existingSessionId: currentSession?.externalSessionId,
           updateExternalSessionId: updateSessionExternalSessionId,
-          historyMessages: buildAcpHistoryMessages(currentSession?.messages ?? []),
+          historyMessages: buildAcpHistoryMessagesForBridge(
+            currentSession?.messages ?? [],
+            currentSession?.externalSessionId,
+          ),
           terminalSessions,
           defaultTargetSession,
           providers,
