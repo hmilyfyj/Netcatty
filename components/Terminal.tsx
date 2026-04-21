@@ -1640,7 +1640,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     setIsDisconnectedDialogDismissed(false);
     setStatus("connecting");
     setError(null);
-    setProgressLogs(["Retrying secure channel..."]);
+    setProgressLogs((prev) => [...prev, "Retrying secure channel..."]);
     setShowLogs(true);
 
     const startNewSession = () => {
