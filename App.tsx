@@ -1360,7 +1360,6 @@ function App({ settings }: { settings: SettingsState }) {
         break;
       }
     }
-  }, [orderedTabs, sessions, workspaces, setActiveTabId, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast, settings.showSftpTab, confirmIfBusyLocalTerminal]);
 }, [orderedTabs, groups, sessions, workspaces, setActiveTabId, closeConsoleInGroup, closeGroup, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast, settings.showSftpTab, confirmIfBusyLocalTerminal]);
 
   // Callback for terminal to invoke app-level hotkey actions
