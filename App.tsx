@@ -18,14 +18,24 @@ import { resolveGroupDefaults, applyGroupDefaults } from './domain/groupConfig';
 import { resolveHostAuth } from './domain/sshAuth';
 import { resolveHostTerminalThemeId } from './domain/terminalAppearance';
 import { collectSessionIds } from './domain/workspace';
+import { resolveCloseIntent } from './application/state/resolveCloseIntent';
 import { TERMINAL_THEMES } from './infrastructure/config/terminalThemes';
 import { useCustomThemes } from './application/state/customThemeStore';
-import { applySyncPayload } from './application/syncPayload';
+import type { SyncPayload } from './domain/sync';
+import { applySyncPayload, buildSyncPayload, hasMeaningfulSyncData } from './application/syncPayload';
+import {
+  applyProtectedSyncPayload,
+  ensureVersionChangeBackup,
+} from './application/localVaultBackups';
 import { getCredentialProtectionAvailability } from './infrastructure/services/credentialProtection';
 import { netcattyBridge } from './infrastructure/services/netcattyBridge';
 import { localStorageAdapter } from './infrastructure/persistence/localStorageAdapter';
 import { AlertTriangle, Download, Trash2 } from 'lucide-react';
-import { STORAGE_KEY_DEBUG_HOTKEYS } from './infrastructure/config/storageKeys';
+import {
+  STORAGE_KEY_DEBUG_HOTKEYS,
+  STORAGE_KEY_PORT_FORWARDING,
+} from './infrastructure/config/storageKeys';
+import { getEffectiveKnownHosts } from './infrastructure/syncHelpers';
 import { TopTabs } from './components/TopTabs';
 import { Button } from './components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from './components/ui/dialog';
@@ -222,6 +232,7 @@ function App({ settings }: { settings: SettingsState }) {
   }, [workspaceFocusStyle]);
 
   const {
+    isInitialized: isVaultInitialized,
     hosts,
     keys,
     identities,
@@ -414,6 +425,129 @@ function App({ settings }: { settings: SettingsState }) {
     [portForwardingRules],
   );
 
+  const buildCurrentSyncPayload = useCallback(() => {
+    let effectivePortForwardingRules = portForwardingRulesForSync;
+    if (effectivePortForwardingRules.length === 0) {
+      const stored = localStorageAdapter.read<typeof portForwardingRulesForSync>(
+        STORAGE_KEY_PORT_FORWARDING,
+      );
+      if (stored && Array.isArray(stored) && stored.length > 0) {
+        effectivePortForwardingRules = stored.map((rule) => ({
+          ...rule,
+          status: 'inactive' as const,
+          error: undefined,
+          lastUsedAt: undefined,
+        }));
+      }
+    }
+
+    return buildSyncPayload(
+      {
+        hosts,
+        keys,
+        identities,
+        snippets,
+        customGroups,
+        snippetPackages,
+        knownHosts: getEffectiveKnownHosts(knownHosts),
+        groupConfigs,
+      },
+      effectivePortForwardingRules,
+    );
+  }, [
+    customGroups,
+    groupConfigs,
+    hosts,
+    identities,
+    keys,
+    knownHosts,
+    portForwardingRulesForSync,
+    snippetPackages,
+    snippets,
+  ]);
+
+  const [startupSyncSafetyReady, setStartupSyncSafetyReady] = useState(false);
+  // buildCurrentSyncPayload's identity changes each time the vault
+  // settles. The retry effect below watches the underlying data arrays
+  // for hydration progress, and uses the ref to always read the latest
+  // builder without pulling buildCurrentSyncPayload itself into deps
+  // (its identity churns on unrelated state updates too).
+  const buildCurrentSyncPayloadRef = useRef(buildCurrentSyncPayload);
+  useEffect(() => {
+    buildCurrentSyncPayloadRef.current = buildCurrentSyncPayload;
+  }, [buildCurrentSyncPayload]);
+
+  const versionBackupAttemptedRef = useRef(false);
+  // Two-stage gate: once the vault has initialized we open the auto-sync
+  // gate immediately — the hook's own hasMeaningfulSyncData guard and
+  // the cross-window restore barrier prevent an empty-but-not-yet-
+  // hydrated snapshot from overwriting cloud data. The version-change
+  // backup itself is best-effort and retries below as vault data arrives.
+  useEffect(() => {
+    if (isVaultInitialized && !startupSyncSafetyReady) {
+      setStartupSyncSafetyReady(true);
+    }
+  }, [isVaultInitialized, startupSyncSafetyReady]);
+
+  // Retry the version-change backup as hosts/keys/snippets become
+  // available. ensureVersionChangeBackup refuses to advance the stored
+  // version stamp when the observed payload is empty, so running this
+  // effect repeatedly is safe and eventually latches once the vault has
+  // hydrated enough to be backed up (or the user genuinely stays empty,
+  // in which case the effect continues to no-op).
+  useEffect(() => {
+    if (!isVaultInitialized || versionBackupAttemptedRef.current) return;
+    const payload = buildCurrentSyncPayloadRef.current();
+    if (!hasMeaningfulSyncData(payload)) return;
+    versionBackupAttemptedRef.current = true;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const info = await netcattyBridge.get()?.getAppInfo?.();
+        await ensureVersionChangeBackup(payload, info?.version ?? null);
+      } catch (error) {
+        if (!cancelled) {
+          // Reset the latch so a later data change (or the next mount)
+          // can retry. ensureVersionChangeBackup already leaves the
+          // version stamp untouched on failure, so retrying is safe.
+          versionBackupAttemptedRef.current = false;
+        }
+        console.error('[App] Failed to create version-change backup:', error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isVaultInitialized, hosts, keys, identities, snippets, customGroups, snippetPackages, knownHosts]);
+
+  // Memoized "apply a remote payload safely" callback. Stable identity
+  // across renders so useAutoSync's `syncNow` useCallback doesn't rebuild
+  // on unrelated App-level state changes (which would churn the debounced
+  // auto-sync useEffect dep chain).
+  const handleApplySyncPayload = useCallback(
+    (payload: SyncPayload) =>
+      applyProtectedSyncPayload({
+        buildPreApplyPayload: () => buildCurrentSyncPayload(),
+        applyPayload: () =>
+          applySyncPayload(payload, {
+            importVaultData: importDataFromString,
+            importPortForwardingRules,
+            onSettingsApplied: settings.rehydrateAllFromStorage,
+          }),
+        translateProtectiveBackupFailure: (message) =>
+          t('cloudSync.localBackups.protectiveBackupFailed', { message }),
+      }),
+    [
+      buildCurrentSyncPayload,
+      importDataFromString,
+      importPortForwardingRules,
+      settings.rehydrateAllFromStorage,
+      t,
+    ],
+  );
+
   // Auto-sync hook for cloud sync
   const { syncNow: handleSyncNow, emptyVaultConflict, resolveEmptyVaultConflict } = useAutoSync({
     hosts,
@@ -426,13 +560,8 @@ function App({ settings }: { settings: SettingsState }) {
     knownHosts,
     groupConfigs,
     settingsVersion: settings.settingsVersion,
-    onApplyPayload: (payload) => {
-      applySyncPayload(payload, {
-        importVaultData: importDataFromString,
-        importPortForwardingRules,
-        onSettingsApplied: settings.rehydrateAllFromStorage,
-      });
-    },
+    startupReady: startupSyncSafetyReady,
+    onApplyPayload: handleApplySyncPayload,
   });
 
   const { clearAndRemoveSource, clearAndRemoveSources, unmanageSource } = useManagedSourceSync({
@@ -583,7 +712,7 @@ function App({ settings }: { settings: SettingsState }) {
       if (binding.category === 'sftp') {
         continue;
       }
-      const terminalActions = ['copy', 'paste', 'selectAll', 'clearBuffer', 'searchTerminal'];
+      const terminalActions = ['copy', 'paste', 'pasteSelection', 'selectAll', 'clearBuffer', 'searchTerminal'];
       if (terminalActions.includes(binding.action)) {
         if (isTerminalElement) {
           return;
@@ -891,6 +1020,10 @@ function App({ settings }: { settings: SettingsState }) {
   const addConnectionLogRef = useRef(addConnectionLog);
   addConnectionLogRef.current = addConnectionLog;
 
+  const closeSidePanelRef = useRef<(() => void) | null>(null);
+  const activeSidePanelTabRef = useRef<string | null>(null);
+  const closeTabInFlightRef = useRef(false);
+
   const createLocalTerminalWithCurrentShell = useCallback(() => {
     const resolved = resolveShellSetting(terminalSettings.localShell, discoveredShells);
     const matchedShell = discoveredShells.find(s => s.id === terminalSettings.localShell);
@@ -923,6 +1056,88 @@ function App({ settings }: { settings: SettingsState }) {
     if (!closeTabBinding) return null;
     return hotkeyScheme === 'mac' ? closeTabBinding.mac : closeTabBinding.pc;
   }, [hotkeyScheme, keyBindings]);
+
+  const confirmIfBusyLocalTerminal = useCallback(
+    async (sessionIds: string[]): Promise<boolean> => {
+      const bridge = netcattyBridge.get();
+      const localIds = sessionIds.filter((id) => {
+        const s = sessions.find((x) => x.id === id);
+        return s?.protocol === 'local';
+      });
+      const busyCommands: string[] = [];
+      for (const id of localIds) {
+        const children = (await bridge?.ptyGetChildProcesses?.(id)) ?? [];
+        if (children.length > 0) {
+          busyCommands.push(children[0].command);
+        }
+      }
+      if (busyCommands.length === 0) return true;
+
+      const primary = busyCommands[0];
+      const extraCount = busyCommands.length - 1;
+      const message =
+        extraCount > 0
+          ? t('confirm.closeBusyTerminal.messageWithMore', {
+              command: primary,
+              count: extraCount,
+            })
+          : t('confirm.closeBusyTerminal.message', { command: primary });
+
+      const ok = await bridge?.confirmCloseBusy?.({
+        command: primary,
+        title: t('confirm.closeBusyTerminal.title'),
+        message,
+        cancelLabel: t('confirm.closeBusyTerminal.cancel'),
+        closeLabel: t('confirm.closeBusyTerminal.close'),
+      });
+      return ok === true;
+    },
+    [sessions, t],
+  );
+
+  const closeTabsInFlightRef = useRef(false);
+
+  // Close many tabs at once with a single batched busy-shell confirmation.
+  // Used by the "Close all / Close others / Close to the right" context-menu
+  // actions on tabs (#748).
+  const closeTabsBatch = useCallback(
+    async (targetIds: string[]) => {
+      if (targetIds.length === 0) return;
+      if (closeTabsInFlightRef.current) return;
+
+      // Expand workspace ids into their constituent session ids so the busy
+      // probe sees every local shell that's about to be killed.
+      const sessionIdsToProbe: string[] = [];
+      for (const tabId of targetIds) {
+        const ws = workspaces.find((w) => w.id === tabId);
+        if (ws) {
+          for (const s of sessions) {
+            if (s.workspaceId === tabId) sessionIdsToProbe.push(s.id);
+          }
+        } else if (sessions.find((s) => s.id === tabId)) {
+          sessionIdsToProbe.push(tabId);
+        }
+      }
+
+      closeTabsInFlightRef.current = true;
+      try {
+        const ok = await confirmIfBusyLocalTerminal(sessionIdsToProbe);
+        if (!ok) return;
+        for (const tabId of targetIds) {
+          if (workspaces.find((w) => w.id === tabId)) {
+            closeWorkspace(tabId);
+          } else if (sessions.find((s) => s.id === tabId)) {
+            closeSession(tabId);
+          } else if (logViews.find((lv) => lv.id === tabId)) {
+            closeLogView(tabId);
+          }
+        }
+      } finally {
+        closeTabsInFlightRef.current = false;
+      }
+    },
+    [workspaces, sessions, logViews, confirmIfBusyLocalTerminal, closeWorkspace, closeSession, closeLogView],
+  );
 
   // Shared hotkey action handler - used by both global handler and terminal callback
   const executeHotkeyAction = useCallback((action: string, e: KeyboardEvent) => {
@@ -968,27 +1183,71 @@ function App({ settings }: { settings: SettingsState }) {
       }
       case 'closeTab': {
         const currentId = activeTabStore.getActiveTabId();
-        if (currentId !== 'vault' && currentId !== 'sftp') {
-          const group = groups.find(g => g.id === currentId);
-          if (group) {
-            if (group.activeSessionId && group.sessionIds.length > 1) {
-              closeConsoleInGroup(group.id, group.activeSessionId);
-            } else {
-              closeGroup(group.id);
-            }
+        if (!currentId || currentId === 'vault' || currentId === 'sftp') break;
+        if (closeTabInFlightRef.current) break;
+
+        const group = groups.find((g) => g.id === currentId) ?? null;
+        const session = sessions.find((s) => s.id === currentId)
+          ?? (group?.activeSessionId
+            ? sessions.find((s) => s.id === group.activeSessionId) ?? null
+            : null);
+        const workspace = workspaces.find((w) => w.id === currentId) ?? null;
+
+        const focusIsInsideTerminal = !!document.activeElement?.closest('[data-session-id]');
+        const activeSidePanel = activeSidePanelTabRef.current;
+
+        if (group) {
+          if (activeSidePanel !== null) {
+            closeSidePanelRef.current?.();
             break;
           }
-          // Find if it's a session or workspace
-          const session = sessions.find(s => s.id === currentId);
-          if (session) {
-            closeSession(currentId);
+
+          const activeSessionId = group.activeSessionId || group.sessionIds[0];
+          if (activeSessionId && group.sessionIds.length > 1) {
+            closeConsoleInGroup(group.id, activeSessionId);
           } else {
-            const workspace = workspaces.find(w => w.id === currentId);
-            if (workspace) {
-              closeWorkspace(currentId);
-            }
+            closeGroup(group.id);
           }
+          break;
         }
+
+        const intent = resolveCloseIntent({
+          activeTabId: currentId,
+          workspace: workspace ? { id: workspace.id, focusedSessionId: workspace.focusedSessionId } : null,
+          sessionForTab: session,
+          activeSidePanelTab: activeSidePanel,
+          focusIsInsideTerminal,
+        });
+
+        closeTabInFlightRef.current = true;
+        (async () => {
+          try {
+            switch (intent.kind) {
+              case 'closeTerminal':
+              case 'closeSingleTab': {
+                const ok = await confirmIfBusyLocalTerminal([intent.sessionId]);
+                if (ok) closeSession(intent.sessionId);
+                return;
+              }
+              case 'closeSidePanel': {
+                closeSidePanelRef.current?.();
+                return;
+              }
+              case 'closeWorkspace': {
+                const ids = sessions.filter((s) => s.workspaceId === intent.workspaceId).map((s) => s.id);
+                const ok = await confirmIfBusyLocalTerminal(ids);
+                if (ok) closeWorkspace(intent.workspaceId);
+                return;
+              }
+              case 'noop':
+              default:
+                return;
+            }
+          } finally {
+            closeTabInFlightRef.current = false;
+          }
+        })();
+
         break;
       }
       case 'newTab':
@@ -1101,7 +1360,7 @@ function App({ settings }: { settings: SettingsState }) {
         break;
       }
     }
-}, [orderedTabs, groups, sessions, workspaces, setActiveTabId, closeConsoleInGroup, closeGroup, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast, settings.showSftpTab]);
+}, [orderedTabs, groups, sessions, workspaces, setActiveTabId, closeConsoleInGroup, closeGroup, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast, settings.showSftpTab, confirmIfBusyLocalTerminal]);
 
   // Callback for terminal to invoke app-level hotkey actions
   const handleHotkeyAction = useCallback((action: string, e: KeyboardEvent) => {
@@ -1464,6 +1723,7 @@ function App({ settings }: { settings: SettingsState }) {
         onCloseGroup={closeGroup}
         onCloseWorkspace={closeWorkspace}
         onCloseLogView={closeLogView}
+        onCloseTabsBatch={closeTabsBatch}
         onOpenQuickSwitcher={handleOpenQuickSwitcher}
         onToggleTheme={handleToggleTheme}
         onOpenSettings={handleOpenSettings}
@@ -1602,6 +1862,8 @@ function App({ settings }: { settings: SettingsState }) {
           sessionLogsEnabled={sessionLogsEnabled}
           sessionLogsDir={sessionLogsDir}
           sessionLogsFormat={sessionLogsFormat}
+          closeSidePanelRef={closeSidePanelRef}
+          activeSidePanelTabRef={activeSidePanelTabRef}
         />
 
         {/* Log Views - readonly terminal replays */}

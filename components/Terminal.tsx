@@ -48,6 +48,8 @@ import { ZmodemProgressIndicator } from "./terminal/ZmodemProgressIndicator";
 import { useZmodemTransfer } from "./terminal/hooks/useZmodemTransfer";
 import { createTerminalSessionStarters, type PendingAuth } from "./terminal/runtime/createTerminalSessionStarters";
 import { createXTermRuntime, primaryFontFamily, type XTermRuntime } from "./terminal/runtime/createXTermRuntime";
+import { shouldPreserveTerminalFocusOnMouseDown } from "./terminal/toolbarFocus";
+import { preserveTerminalViewportInScrollback } from "./terminal/clearTerminalViewport";
 import { XTERM_PERFORMANCE_CONFIG } from "../infrastructure/config/xtermPerformance";
 import { useTerminalSearch } from "./terminal/hooks/useTerminalSearch";
 import { useTerminalContextActions } from "./terminal/hooks/useTerminalContextActions";
@@ -258,6 +260,11 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const sessionRef = useRef<string | null>(null);
   const hasConnectedRef = useRef(false);
   const hasRunStartupCommandRef = useRef(false);
+  // Token for an in-flight retry chain. handleRetry sets this to a fresh
+  // symbol; any cancel/close/teardown/subsequent-retry invalidates it. The
+  // chained xterm.write callbacks verify the token before proceeding so a
+  // cancelled retry can't fire a startNewSession after the fact.
+  const retryTokenRef = useRef<symbol | null>(null);
   const terminalDataCapturedRef = useRef(false);
   const onTerminalDataCaptureRef = useRef(onTerminalDataCapture);
   const commandBufferRef = useRef<string>("");
@@ -753,6 +760,12 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     termRef.current?.focus();
   }, []);
 
+  const handleTopOverlayMouseDownCapture = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if (!shouldPreserveTerminalFocusOnMouseDown(e.target)) return;
+    e.preventDefault();
+  }, []);
+
   // Subscribe to custom theme changes so editing triggers re-render
   const customThemes = useCustomThemes();
   const hasFontSizeOverride = host.fontSizeOverride === true || (host.fontSizeOverride === undefined && host.fontSize != null);
@@ -823,6 +836,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   };
 
   const teardown = () => {
+    retryTokenRef.current = null;
     cleanupSession();
     xtermRuntimeRef.current?.dispose();
     xtermRuntimeRef.current = null;
@@ -931,6 +945,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
           // Autocomplete integration
           onAutocompleteKeyEvent: (e: KeyboardEvent) => autocompleteKeyEventRef.current?.(e) ?? true,
           onAutocompleteInput: (data: string) => autocompleteInputRef.current?.(data),
+          isRestoringSelectionRef,
         });
 
         xtermRuntimeRef.current = runtime;
@@ -1368,7 +1383,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       const hasText = !!selection && selection.length > 0;
       setHasSelection(hasText);
 
-      if (hasText && terminalSettings?.copyOnSelect) {
+      if (hasText && terminalSettings?.copyOnSelect && !isRestoringSelectionRef.current) {
         navigator.clipboard.writeText(selection).catch((err) => {
           logger.warn("Copy on select failed:", err);
         });
@@ -1459,6 +1474,12 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const disableBracketedPasteRef = useRef(terminalSettings?.disableBracketedPaste ?? false);
   disableBracketedPasteRef.current = terminalSettings?.disableBracketedPaste ?? false;
 
+  // True only while createXTermRuntime is programmatically restoring the
+  // selection right after a keystroke (preserveSelectionOnInput). Lets
+  // copy-on-select skip a redundant clipboard write that would otherwise
+  // clobber whatever the user copied elsewhere in the meantime.
+  const isRestoringSelectionRef = useRef(false);
+
   const scrollOnPasteRef = useRef(terminalSettings?.scrollOnPaste ?? true);
   scrollOnPasteRef.current = terminalSettings?.scrollOnPaste ?? true;
 
@@ -1543,6 +1564,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   };
 
   const handleCancelConnect = () => {
+    retryTokenRef.current = null;
     setIsCancelling(true);
     auth.setNeedsAuth(false);
     auth.setAuthRetryMessage(null);
@@ -1562,6 +1584,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   };
 
   const handleCloseDisconnectedSession = () => {
+    retryTokenRef.current = null;
     onCloseSession?.(sessionId);
   };
 
@@ -1603,10 +1626,14 @@ const TerminalComponent: React.FC<TerminalProps> = ({
   const handleRetry = () => {
     if (!termRef.current) return;
     cleanupSession();
-    // Reset terminal state: disable mouse tracking modes and clear screen so
-    // stale SGR mouse sequences don't leak into the new session as text input.
-    termRef.current.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
-    termRef.current.reset();
+    const term = termRef.current;
+    // Claim a fresh retry token. If the user cancels / closes / unmounts /
+    // kicks off another retry while the chained writes below are still
+    // queued, the token will be invalidated and our callbacks will abort
+    // before opening a ghost backend session with no owning UI.
+    const retryToken = Symbol("retry");
+    retryTokenRef.current = retryToken;
+    const retryStillActive = () => retryTokenRef.current === retryToken && termRef.current === term;
     auth.resetForRetry();
     terminalDataCapturedRef.current = false;
     hasRunStartupCommandRef.current = false;
@@ -1615,17 +1642,41 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     setError(null);
     setProgressLogs(["Retrying secure channel..."]);
     setShowLogs(true);
-    if (host.protocol === "serial") {
-      sessionStarters.startSerial(termRef.current);
-    } else if (host.protocol === "local" || host.hostname === "localhost") {
-      sessionStarters.startLocal(termRef.current);
-    } else if (host.protocol === "telnet") {
-      sessionStarters.startTelnet(termRef.current);
-    } else if (host.moshEnabled) {
-      sessionStarters.startMosh(termRef.current);
-    } else {
-      sessionStarters.startSSH(termRef.current);
-    }
+
+    const startNewSession = () => {
+      if (!retryStillActive()) return;
+      if (host.protocol === "serial") {
+        sessionStarters.startSerial(term);
+      } else if (host.protocol === "local" || host.hostname === "localhost") {
+        sessionStarters.startLocal(term);
+      } else if (host.protocol === "telnet") {
+        sessionStarters.startTelnet(term);
+      } else if (host.moshEnabled) {
+        sessionStarters.startMosh(term);
+      } else {
+        sessionStarters.startSSH(term);
+      }
+    };
+
+    // Chain the whole preparation through xterm.write callbacks so everything
+    // lands in strict order — see #695. xterm.write is async, so without
+    // chaining, a fast reconnect path (local/serial especially) can interleave
+    // the new session's first bytes with our reset sequence, corrupting the
+    // first screen.
+    //
+    // 1. Exit the alternate screen first. preserveTerminalViewportInScrollback
+    //    is a no-op on the alt buffer (disconnect while in vim/less/top), so
+    //    we must be on the normal buffer before preserving.
+    term.write('\x1b[?1049l', () => {
+      if (!retryStillActive()) return;
+      // 2. Push the previous session's viewport into scrollback so the user
+      //    can still read it after reconnect.
+      preserveTerminalViewportInScrollback(term);
+      term.write(
+        '\x1b[!p\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[H',
+        startNewSession,
+      );
+    });
   };
 
   const shouldShowConnectionDialog = status !== "connected"
@@ -1760,6 +1811,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
       isAlternateScreen={hasMouseTracking}
       onCopy={terminalContextActions.onCopy}
       onPaste={terminalContextActions.onPaste}
+      onPasteSelection={terminalContextActions.onPasteSelection}
       onSelectAll={terminalContextActions.onSelectAll}
       onClear={terminalContextActions.onClear}
       onSelectWord={terminalContextActions.onSelectWord}
@@ -1802,6 +1854,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
         <div className="absolute left-0 right-0 top-0 z-20 pointer-events-none">
           <div
             className="flex items-center gap-1 px-2 py-0.5 backdrop-blur-md pointer-events-auto min-w-0"
+            onMouseDownCapture={handleTopOverlayMouseDownCapture}
             style={{
               backgroundColor: 'var(--terminal-ui-bg)',
               color: 'var(--terminal-ui-fg)',

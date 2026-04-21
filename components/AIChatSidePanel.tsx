@@ -19,8 +19,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '../lib/utils';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { useWindowControls } from '../application/state/useWindowControls';
-import { useFileUpload } from '../application/state/useFileUpload';
 import type {
+  AIDraft,
+  AIPanelView,
   AIPermissionMode,
   AIToolIntegrationMode,
   AISession,
@@ -41,10 +42,30 @@ import ChatInput from './ai/ChatInput';
 import ChatMessageList from './ai/ChatMessageList';
 import ConversationExport from './ai/ConversationExport';
 import {
+  getReadyUserSkillOptions,
+  getNextSelectedUserSkillSlugsMap,
+  type UserSkillOption,
+} from './ai/userSkillsState';
+import {
+  applyDraftEntrySelection,
+  applyHistorySessionSelection,
+  resolveDisplayedPanelView,
+  resolveDisplayedSession,
+} from './ai/aiPanelViewState';
+import {
+  endDraftSend,
+  tryBeginDraftSend,
+} from './ai/draftSendGate';
+import { getSessionScopeMatchRank } from './ai/sessionScopeMatch';
+import { SESSION_HISTORY_ROW_CLASSNAMES } from './ai/sessionHistoryLayout';
+import { selectDraftForAgentSwitch } from '../application/state/aiDraftState';
+import type { CodexIntegrationStatus } from './settings/tabs/ai/types';
+import {
   useAIChatStreaming,
   getNetcattyBridge,
   type DefaultTargetSessionHint,
 } from './ai/hooks/useAIChatStreaming';
+import { buildAcpHistoryMessagesForBridge } from './ai/acpHistory';
 import { clearAllPendingApprovals } from '../infrastructure/ai/shared/approvalGate';
 import { useConversationExport } from './ai/hooks/useConversationExport';
 import type { ExecutorContext } from '../infrastructure/ai/cattyAgent/executor';
@@ -71,12 +92,24 @@ interface AIChatSidePanelProps {
   // Session state (per-scope)
   sessions: AISession[];
   activeSessionIdMap: Record<string, string | null>;
+  draftsByScope: Partial<Record<string, AIDraft>>;
+  panelViewByScope: Partial<Record<string, AIPanelView>>;
   setActiveSessionId: (scopeKey: string, id: string | null) => void;
+  ensureDraftForScope: (scopeKey: string, agentId: string) => void;
+  updateDraft: (
+    scopeKey: string,
+    fallbackAgentId: string,
+    updater: (draft: AIDraft) => AIDraft,
+  ) => void;
+  showDraftView: (scopeKey: string) => void;
+  showSessionView: (scopeKey: string, sessionId: string) => void;
+  clearDraftForScope: (scopeKey: string) => void;
+  addDraftFiles: (scopeKey: string, fallbackAgentId: string, inputFiles: File[]) => Promise<void>;
+  removeDraftFile: (scopeKey: string, fallbackAgentId: string, fileId: string) => void;
   createSession: (scope: AISessionScope, agentId?: string) => AISession;
   deleteSession: (sessionId: string, scopeKey?: string) => void;
   updateSessionTitle: (sessionId: string, title: string) => void;
   updateSessionExternalSessionId: (sessionId: string, externalSessionId: string | undefined) => void;
-  retargetSessionScope: (sessionId: string, scope: AISessionScope) => void;
   addMessageToSession: (sessionId: string, message: ChatMessage) => void;
   updateLastMessage: (
     sessionId: string,
@@ -146,56 +179,33 @@ function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function buildAcpHistoryMessages(messages: ChatMessage[]): Array<{ role: 'user' | 'assistant'; content: string }> {
-  return messages.flatMap((message) => {
-    if (message.role === 'system') return [];
+const USER_SKILL_TOKEN_REGEX = /(^|\s)\/([a-z0-9][a-z0-9-]*)\b/g;
 
-    if (message.role === 'user') {
-      return message.content ? [{ role: 'user' as const, content: message.content }] : [];
-    }
+function extractExplicitUserSkills(
+  input: string,
+  availableSkills: UserSkillOption[],
+): { cleanedText: string; selectedSkillSlugs: string[] } {
+  const validSlugs = new Set(availableSkills.map((skill) => skill.slug.toLowerCase()));
+  const selectedSkillSlugs: string[] = [];
 
-    if (message.role === 'assistant') {
-      const parts: string[] = [];
-      if (message.content) parts.push(message.content);
-      if (message.toolCalls?.length) {
-        parts.push(...message.toolCalls.map((tc) => `Tool call: ${tc.name}(${JSON.stringify(tc.arguments ?? {})})`));
+  const cleanedText = String(input || "")
+    .replace(USER_SKILL_TOKEN_REGEX, (match, prefix, slug) => {
+      const normalizedSlug = String(slug || "").toLowerCase();
+      if (!validSlugs.has(normalizedSlug)) {
+        return match;
       }
-      if (!parts.length) return [];
-      return [{ role: 'assistant' as const, content: parts.join('\n\n') }];
-    }
+      if (!selectedSkillSlugs.includes(normalizedSlug)) {
+        selectedSkillSlugs.push(normalizedSlug);
+      }
+      return prefix;
+    })
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
-    if (message.role === 'tool' && message.toolResults?.length) {
-      return message.toolResults.map((tr) => ({
-        role: 'assistant' as const,
-        content: `Tool result:\n${tr.content}`,
-      }));
-    }
-
-    return [];
-  });
+  return { cleanedText, selectedSkillSlugs };
 }
-
-function getSessionScopeMatchRank(
-  session: AISession,
-  scopeType: 'terminal' | 'workspace',
-  scopeTargetId?: string,
-  scopeHostIds?: string[],
-  activeTerminalTargetIds?: Set<string>,
-): number {
-  if (session.scope.type !== scopeType) return 0;
-  if (session.scope.targetId === scopeTargetId) return 2;
-
-  if (scopeType !== 'terminal' || !scopeHostIds?.length || !session.scope.hostIds?.length) {
-    return 0;
-  }
-
-  if (session.scope.targetId && activeTerminalTargetIds?.has(session.scope.targetId)) {
-    return 0;
-  }
-
-  return session.scope.hostIds.some((hostId) => scopeHostIds.includes(hostId)) ? 1 : 0;
-}
-
 // -------------------------------------------------------------------
 // Component
 // -------------------------------------------------------------------
@@ -203,12 +213,20 @@ function getSessionScopeMatchRank(
 const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   sessions,
   activeSessionIdMap,
+  draftsByScope,
+  panelViewByScope,
   setActiveSessionId: setActiveSessionIdForScope,
+  ensureDraftForScope,
+  updateDraft,
+  showDraftView,
+  showSessionView,
+  clearDraftForScope,
+  addDraftFiles,
+  removeDraftFile,
   createSession,
   deleteSession,
   updateSessionTitle,
   updateSessionExternalSessionId,
-  retargetSessionScope,
   addMessageToSession,
   updateLastMessage,
   updateMessageById,
@@ -239,18 +257,9 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   // Derive scope key for per-scope isolation
   const scopeKey = `${scopeType}:${scopeTargetId ?? ''}`;
 
-  // Per-scope input values
-  const [inputValueMap, setInputValueMap] = useState<Record<string, string>>({});
-  const inputValue = inputValueMap[scopeKey] ?? '';
-  const setInputValue = useCallback((val: string) => {
-    setInputValueMap(prev => ({ ...prev, [scopeKey]: val }));
-  }, [scopeKey]);
-
   const [showHistory, setShowHistory] = useState(false);
-  const [currentAgentId, setCurrentAgentId] = useState(defaultAgentId);
   const [runtimeAgentModelPresets, setRuntimeAgentModelPresets] = useState<Record<string, ReturnType<typeof getAgentModelPresets>>>({});
-
-  const { files, addFiles, removeFile, clearFiles } = useFileUpload();
+  const [userSkillOptions, setUserSkillOptions] = useState<UserSkillOption[]>([]);
   const { openSettingsWindow } = useWindowControls();
   const terminalSessionsRef = useRef(terminalSessions);
   terminalSessionsRef.current = terminalSessions;
@@ -272,46 +281,63 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     updateMessageById,
   });
 
-
-  // Per-scope active session ID
-  const activeSessionIdForScope = activeSessionIdMap[scopeKey] ?? null;
   const setActiveSessionId = useCallback((id: string | null) => {
     setActiveSessionIdForScope(scopeKey, id);
   }, [scopeKey, setActiveSessionIdForScope]);
 
-  const activeTerminalTargetIds = useMemo(() => {
-    const targetIds = new Set<string>();
-    for (const [sessionScopeKey, sessionId] of Object.entries(activeSessionIdMap)) {
+  const activeTerminalSessionIds = useMemo(() => {
+    const sessionIds = new Set<string>();
+    const entries = Object.entries(activeSessionIdMap) as Array<[string, string | null]>;
+    for (const [sessionScopeKey, sessionId] of entries) {
       if (!sessionScopeKey.startsWith('terminal:') || !sessionId) continue;
-      const targetId = sessionScopeKey.slice('terminal:'.length);
-      if (!targetId || targetId === scopeTargetId) continue;
-      targetIds.add(targetId);
+      if (sessionScopeKey === scopeKey) continue;
+      sessionIds.add(sessionId);
     }
-    return targetIds;
-  }, [activeSessionIdMap, scopeTargetId]);
+    return sessionIds;
+  }, [activeSessionIdMap, scopeKey]);
 
   const historySessions = useMemo(
     () =>
       sessions
         .map((session) => ({
           session,
-          matchRank: getSessionScopeMatchRank(session, scopeType, scopeTargetId, scopeHostIds, activeTerminalTargetIds),
+          matchRank: getSessionScopeMatchRank(
+            session,
+            scopeType,
+            scopeTargetId,
+            scopeHostIds,
+            activeTerminalSessionIds,
+          ),
         }))
         .filter(({ matchRank }) => matchRank > 0)
         .sort((a, b) => b.matchRank - a.matchRank || b.session.updatedAt - a.session.updatedAt)
         .map(({ session }) => session),
-    [sessions, scopeType, scopeTargetId, scopeHostIds, activeTerminalTargetIds],
+    [sessions, scopeType, scopeTargetId, scopeHostIds, activeTerminalSessionIds],
   );
 
-  const activeSession = useMemo(() => {
-    if (activeSessionIdForScope) {
-      const session = sessions.find((s) => s.id === activeSessionIdForScope);
-      if (session && getSessionScopeMatchRank(session, scopeType, scopeTargetId, scopeHostIds, activeTerminalTargetIds) > 0) {
-        return session;
-      }
-    }
-    return historySessions[0] ?? null;
-  }, [sessions, activeSessionIdForScope, historySessions, scopeType, scopeTargetId, scopeHostIds, activeTerminalTargetIds]);
+  const explicitPanelView = panelViewByScope[scopeKey];
+  const currentDraft = draftsByScope[scopeKey] ?? null;
+  const persistedSessionId = activeSessionIdMap[scopeKey] ?? null;
+  const normalizedPanelView = useMemo<AIPanelView>(
+    () => resolveDisplayedPanelView(explicitPanelView, currentDraft != null, historySessions, persistedSessionId, scopeType),
+    [explicitPanelView, currentDraft, historySessions, persistedSessionId, scopeType],
+  );
+  const activeSession = useMemo(
+    () => resolveDisplayedSession(normalizedPanelView, historySessions),
+    [normalizedPanelView, historySessions],
+  );
+  const activeSessionId = normalizedPanelView.mode === 'session' ? normalizedPanelView.sessionId : null;
+  const isStreaming = activeSessionId ? streamingSessionIds.has(activeSessionId) : false;
+  const currentAgentId = activeSession?.agentId ?? currentDraft?.agentId ?? defaultAgentId;
+  const inputValue = currentDraft?.text ?? '';
+  const files = currentDraft?.attachments ?? [];
+  const panelViewRef = useRef(normalizedPanelView);
+  panelViewRef.current = normalizedPanelView;
+  const currentDraftRef = useRef(currentDraft);
+  currentDraftRef.current = currentDraft;
+  const activeSessionRef = useRef(activeSession);
+  activeSessionRef.current = activeSession;
+  const draftSendInFlightRef = useRef(false);
 
   const defaultTargetSession = useMemo<DefaultTargetSessionHint | undefined>(() => {
     const connectedSessions = terminalSessions.filter((session) => session.connected !== false);
@@ -336,77 +362,6 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     return undefined;
   }, [terminalSessions, scopeType, scopeTargetId]);
 
-  const activeSessionId = activeSession?.id ?? activeSessionIdForScope;
-  const isStreaming = activeSessionId ? streamingSessionIds.has(activeSessionId) : false;
-
-  const shouldRetargetActiveSession = useMemo(() => {
-    if (!activeSession || scopeType !== 'terminal' || !scopeTargetId || !scopeHostIds?.length) {
-      return false;
-    }
-
-    if (activeSession.scope.type !== scopeType || activeSession.scope.targetId === scopeTargetId) {
-      return false;
-    }
-
-    // Don't retarget sessions that are actively owned by another terminal
-    if (activeSession.scope.targetId && activeTerminalTargetIds.has(activeSession.scope.targetId)) {
-      return false;
-    }
-
-    return activeSession.scope.hostIds?.some((hostId) => scopeHostIds.includes(hostId)) ?? false;
-  }, [activeSession, scopeType, scopeTargetId, scopeHostIds, activeTerminalTargetIds]);
-
-  useEffect(() => {
-    if (!activeSession) return;
-
-    if (shouldRetargetActiveSession && isVisible) {
-      // Full cleanup of any in-flight work — the session came from a disconnected
-      // terminal, so any active response, pending approvals, or exec is dead.
-      if (streamingSessionIds.has(activeSession.id)) {
-        const controller = abortControllersRef.current.get(activeSession.id);
-        if (controller) {
-          controller.abort();
-          abortControllersRef.current.delete(activeSession.id);
-        }
-        setStreamingForScope(activeSession.id, false);
-        clearAllPendingApprovals(activeSession.id);
-        const bridge = getNetcattyBridge();
-        bridge?.aiCattyCancelExec?.(activeSession.id);
-        bridge?.aiAcpCancel?.('', activeSession.id);
-      }
-      retargetSessionScope(activeSession.id, {
-        type: scopeType,
-        targetId: scopeTargetId,
-        hostIds: scopeHostIds,
-      });
-      return;
-    }
-
-    if (isVisible && activeSessionIdForScope !== activeSession.id) {
-      setActiveSessionId(activeSession.id);
-    }
-  }, [
-    activeSession,
-    activeSessionIdForScope,
-    retargetSessionScope,
-    isVisible,
-    scopeHostIds,
-    scopeTargetId,
-    scopeType,
-    setActiveSessionId,
-    setStreamingForScope,
-    shouldRetargetActiveSession,
-    streamingSessionIds,
-    abortControllersRef,
-  ]);
-
-  // Restore agent selector from active session when scope changes
-  useEffect(() => {
-    if (activeSession) {
-      setCurrentAgentId(activeSession.agentId);
-    }
-  }, [scopeKey, activeSession]);
-
   // Proactively sync terminal session metadata to main process whenever scope or sessions change
   useEffect(() => {
     const bridge = getNetcattyBridge();
@@ -415,6 +370,133 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     }
   }, [terminalSessions, scopeKey, activeSessionId]);
 
+  useEffect(() => {
+    if (!explicitPanelView || normalizedPanelView === explicitPanelView) return;
+    showDraftView(scopeKey);
+  }, [normalizedPanelView, explicitPanelView, scopeKey, showDraftView]);
+
+  useEffect(() => {
+    if (!activeSession) return;
+
+    if (isVisible && activeSessionIdMap[scopeKey] !== activeSession.id) {
+      setActiveSessionId(activeSession.id);
+    }
+  }, [
+    activeSession,
+    activeSessionIdMap,
+    scopeKey,
+    isVisible,
+    setActiveSessionId,
+  ]);
+
+  // When the resolved view is draft but activeSessionIdMap still points at a
+  // previously-shown session, clear that stale entry. Otherwise
+  // activeTerminalTargetIds keeps claiming ownership of the old session's
+  // target and getSessionScopeMatchRank suppresses matching history from
+  // other terminals until another action rewrites the map.
+  useEffect(() => {
+    if (!isVisible) return;
+    if (normalizedPanelView.mode !== 'draft') return;
+    if (persistedSessionId == null) return;
+    setActiveSessionId(null);
+  }, [isVisible, normalizedPanelView.mode, persistedSessionId, setActiveSessionId]);
+
+  const ensureScopeDraft = useCallback((agentId: string) => {
+    ensureDraftForScope(scopeKey, agentId);
+  }, [ensureDraftForScope, scopeKey]);
+
+  const updateScopeDraft = useCallback((
+    fallbackAgentId: string,
+    updater: (draft: AIDraft) => AIDraft,
+  ) => {
+    updateDraft(scopeKey, fallbackAgentId, updater);
+  }, [scopeKey, updateDraft]);
+
+  const showScopeDraftView = useCallback(() => {
+    showDraftView(scopeKey);
+  }, [scopeKey, showDraftView]);
+
+  const showScopeSessionView = useCallback((sessionId: string) => {
+    showSessionView(scopeKey, sessionId);
+  }, [scopeKey, showSessionView]);
+
+  const clearScopeDraft = useCallback(() => {
+    clearDraftForScope(scopeKey);
+  }, [clearDraftForScope, scopeKey]);
+
+  const enterScopeDraftMode = useCallback((agentId: string, preserveSessionView = false) => {
+    applyDraftEntrySelection({
+      ensureDraft: () => ensureScopeDraft(agentId),
+      showDraftView: showScopeDraftView,
+      preserveSessionView,
+    });
+  }, [ensureScopeDraft, showScopeDraftView]);
+
+  const setInputValue = useCallback((value: string) => {
+    enterScopeDraftMode(currentAgentId, panelViewRef.current.mode === 'session');
+    updateScopeDraft(currentAgentId, (draft) => ({
+      ...draft,
+      text: value,
+    }));
+  }, [currentAgentId, enterScopeDraftMode, updateScopeDraft]);
+
+  const addFiles = useCallback(async (inputFiles: File[]) => {
+    enterScopeDraftMode(currentAgentId, panelViewRef.current.mode === 'session');
+    await addDraftFiles(scopeKey, currentAgentId, inputFiles);
+  }, [addDraftFiles, currentAgentId, enterScopeDraftMode, scopeKey]);
+
+  const removeFile = useCallback((fileId: string) => {
+    removeDraftFile(scopeKey, currentAgentId, fileId);
+  }, [removeDraftFile, scopeKey, currentAgentId]);
+
+  useEffect(() => {
+    if (!isVisible) return;
+
+    let cancelled = false;
+    const applyUserSkillsStatus = (result) => {
+      const nextOptions = getReadyUserSkillOptions(result);
+      setUserSkillOptions(nextOptions);
+
+      const draft = currentDraftRef.current;
+      if (!draft) return;
+
+      const nextSelectedUserSkillSlugs =
+        getNextSelectedUserSkillSlugsMap(
+          { [scopeKey]: draft.selectedUserSkillSlugs },
+          result,
+        )[scopeKey] ?? [];
+
+      const selectedUserSkillsChanged =
+        nextSelectedUserSkillSlugs.length !== draft.selectedUserSkillSlugs.length
+        || nextSelectedUserSkillSlugs.some((slug, index) => slug !== draft.selectedUserSkillSlugs[index]);
+
+      if (!selectedUserSkillsChanged) return;
+
+      updateScopeDraft(draft.agentId, (currentScopeDraft) => ({
+        ...currentScopeDraft,
+        selectedUserSkillSlugs: nextSelectedUserSkillSlugs,
+      }));
+    };
+
+    const bridge = getNetcattyBridge();
+    if (!bridge?.aiUserSkillsGetStatus) {
+      applyUserSkillsStatus(null);
+      return;
+    }
+
+    void bridge.aiUserSkillsGetStatus()
+      .then((result) => {
+        if (cancelled) return;
+        applyUserSkillsStatus(result);
+      })
+      .catch(() => {
+        // Keep the last known options and selections when refresh fails.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isVisible, scopeKey, toolIntegrationMode, updateScopeDraft]);
   // Sync provider configs to main process so it can decrypt API keys server-side.
   // Keys stay encrypted in transit; main process decrypts only when making HTTP requests.
   useEffect(() => {
@@ -459,6 +541,18 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   );
 
   const messages = activeSession?.messages ?? [];
+  const selectedUserSkillSlugs = useMemo(
+    () => currentDraft?.selectedUserSkillSlugs ?? [],
+    [currentDraft],
+  );
+  const selectedUserSkills = useMemo(
+    () =>
+      selectedUserSkillSlugs.map((slug) => {
+        const option = userSkillOptions.find((skill) => skill.slug === slug);
+        return option ?? { id: slug, slug, name: slug, description: '' };
+      }),
+    [selectedUserSkillSlugs, userSkillOptions],
+  );
 
   // ── Export hook ──
   const { handleExport } = useConversationExport(activeSession);
@@ -485,6 +579,10 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     () => currentAgentConfig ? matchesManagedAgentConfig(currentAgentConfig, 'codex') : false,
     [currentAgentConfig],
   );
+  const isClaudeManagedAgent = useMemo(
+    () => currentAgentConfig ? matchesManagedAgentConfig(currentAgentConfig, 'claude') : false,
+    [currentAgentConfig],
+  );
 
   // For Codex, pick up the model declared in ~/.codex/config.toml (if any)
   // so the picker can show just that model instead of the hardcoded ChatGPT
@@ -501,7 +599,9 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     const bridge = getNetcattyBridge();
     if (!bridge?.aiCodexGetIntegration) return;
     let cancelled = false;
-    void bridge.aiCodexGetIntegration().then((info) => {
+    void Promise.resolve(
+      bridge.aiCodexGetIntegration() as Promise<CodexIntegrationStatus>,
+    ).then((info) => {
       if (cancelled) return;
       const hasCustom = info?.state === 'connected_custom_config';
       setCodexConfigModel(info?.customConfig?.model ?? null);
@@ -523,7 +623,12 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
 
   useEffect(() => {
     if (!currentAgentConfig?.acpCommand) return;
-    if (!isCopilotExternalAgent) return;
+    // Codex has its own path via aiCodexGetIntegration (reads config.toml).
+    // Everyone else that speaks ACP can be asked for their available models
+    // directly — in particular, Claude Code through claude-agent-acp
+    // advertises the real catalog (including Bedrock/Vertex model ids when
+    // the user configured those) instead of the hardcoded CLAUDE_MODEL_PRESETS.
+    if (!isCopilotExternalAgent && !isClaudeManagedAgent) return;
 
     const bridge = getNetcattyBridge();
     if (!bridge?.aiAcpListModels) return;
@@ -537,6 +642,19 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
       `models_${currentAgentId}`,
     ).then((result) => {
       if (cancelled || !result?.ok || !Array.isArray(result.models)) return;
+      // If the probe came back empty, drop any stale cached catalog for this
+      // agent so `agentModelPresets` falls back to the hardcoded presets via
+      // the `?? getAgentModelPresets(...)` branch. Without this, a previously
+      // successful probe would keep surfacing models the backend no longer
+      // advertises.
+      if (result.models.length === 0) {
+        setRuntimeAgentModelPresets((prev) => {
+          if (!(currentAgentId in prev)) return prev;
+          const { [currentAgentId]: _removed, ...rest } = prev;
+          return rest;
+        });
+        return;
+      }
       const knownModelIds = new Set(result.models.map((model) => model.id));
       setRuntimeAgentModelPresets((prev) => ({
         ...prev,
@@ -555,7 +673,7 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [currentAgentConfig, currentAgentId, isCopilotExternalAgent, setAgentModel]);
+  }, [currentAgentConfig, currentAgentId, isCopilotExternalAgent, isClaudeManagedAgent, setAgentModel]);
 
   // When Codex is backed by a ~/.codex/config.toml custom provider, the
   // stock CODEX_MODEL_PRESETS catalog is invalid for that endpoint.
@@ -604,24 +722,17 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   // -------------------------------------------------------------------
 
   const handleNewChat = useCallback(() => {
-    const scope: AISessionScope = {
-      type: scopeType,
-      targetId: scopeTargetId,
-      hostIds: scopeHostIds,
-    };
-    const session = createSession(scope, currentAgentId);
-    setActiveSessionId(session.id);
+    clearScopeDraft();
+    updateScopeDraft(currentAgentId, () => ({
+      text: '',
+      agentId: currentAgentId,
+      attachments: [],
+      selectedUserSkillSlugs: [],
+      updatedAt: Date.now(),
+    }));
+    showScopeDraftView();
     setShowHistory(false);
-    setInputValue('');
-  }, [
-    scopeType,
-    scopeTargetId,
-    scopeHostIds,
-    currentAgentId,
-    createSession,
-    setActiveSessionId,
-    setInputValue,
-  ]);
+  }, [clearScopeDraft, currentAgentId, showScopeDraftView, updateScopeDraft]);
 
   const handleOpenSettings = useCallback(() => {
     void openSettingsWindow();
@@ -634,12 +745,6 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   /** Ref to always access latest sessions (avoids stale closure in autoTitleSession). */
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
-
-  /** Refs to avoid re-creating handleSend on every keystroke / image change. */
-  const inputValueRef = useRef(inputValue);
-  inputValueRef.current = inputValue;
-  const filesRef = useRef(files);
-  filesRef.current = files;
 
   /** Auto-title a session from the first user message if untitled. */
   const autoTitleSession = useCallback((sessionId: string, text: string) => {
@@ -663,142 +768,188 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
     };
   }, []);
 
-  /** Ensure a session exists for the current scope and return its ID. */
-  const ensureSession = useCallback((): string => {
-    if (activeSession && sessionsRef.current.some((session) => session.id === activeSession.id)) {
-      if (shouldRetargetActiveSession) {
-        retargetSessionScope(activeSession.id, {
-          type: scopeType,
-          targetId: scopeTargetId,
-          hostIds: scopeHostIds,
-        });
-      } else if (activeSessionIdForScope !== activeSession.id) {
-        setActiveSessionId(activeSession.id);
+  const addSelectedUserSkill = useCallback((slug: string) => {
+    const normalizedSlug = String(slug || '').trim().toLowerCase();
+    if (!normalizedSlug) return;
+    enterScopeDraftMode(currentAgentId, panelViewRef.current.mode === 'session');
+    updateScopeDraft(currentAgentId, (draft) => {
+      if (draft.selectedUserSkillSlugs.includes(normalizedSlug)) {
+        return draft;
       }
-      return activeSession.id;
-    }
-    const scope: AISessionScope = { type: scopeType, targetId: scopeTargetId, hostIds: scopeHostIds };
-    const session = createSession(scope, currentAgentId);
-    setActiveSessionId(session.id);
-    return session.id;
-  }, [
-    activeSession,
-    activeSessionIdForScope,
-    createSession,
-    currentAgentId,
-    retargetSessionScope,
-    scopeHostIds,
-    scopeTargetId,
-    scopeType,
-    setActiveSessionId,
-    shouldRetargetActiveSession,
-  ]);
+      return {
+        ...draft,
+        selectedUserSkillSlugs: [...draft.selectedUserSkillSlugs, normalizedSlug],
+      };
+    });
+  }, [currentAgentId, enterScopeDraftMode, updateScopeDraft]);
+
+  const removeSelectedUserSkill = useCallback((slug: string) => {
+    const normalizedSlug = String(slug || '').trim().toLowerCase();
+    if (!normalizedSlug) return;
+    enterScopeDraftMode(currentAgentId, panelViewRef.current.mode === 'session');
+    updateScopeDraft(currentAgentId, (draft) => {
+      const nextSelectedUserSkillSlugs = draft.selectedUserSkillSlugs.filter(
+        (entry) => entry !== normalizedSlug,
+      );
+      if (nextSelectedUserSkillSlugs.length === draft.selectedUserSkillSlugs.length) {
+        return draft;
+      }
+      return {
+        ...draft,
+        selectedUserSkillSlugs: nextSelectedUserSkillSlugs,
+      };
+    });
+  }, [currentAgentId, enterScopeDraftMode, updateScopeDraft]);
 
   // -------------------------------------------------------------------
   // Main send handler (thin orchestrator)
   // -------------------------------------------------------------------
 
   const handleSend = useCallback(async () => {
-    const trimmed = inputValueRef.current.trim();
+    const draft = currentDraftRef.current;
+    const currentPanelView = panelViewRef.current;
+    const currentSessionView = activeSessionRef.current;
+    const trimmed = draft?.text.trim() ?? '';
     const sendScopeKey = scopeKey;
+    // Double-submit protection currently relies on the draft being cleared
+    // immediately after the first send path starts; `isStreaming` alone does
+    // not protect the initial draft->session transition.
     if (!trimmed || isStreaming) return;
+    const draftSelectedSkillSlugs = draft?.selectedUserSkillSlugs ?? [];
+    const attachments = (draft?.attachments ?? []).map((file) => ({
+      base64Data: file.base64Data,
+      mediaType: file.mediaType,
+      filename: file.filename,
+      filePath: file.filePath,
+    }));
+    const isDraftMode = currentPanelView.mode === 'draft';
+    const { cleanedText, selectedSkillSlugs: explicitSelectedSkillSlugs } = extractExplicitUserSkills(trimmed, userSkillOptions);
+    const selectedSkillSlugs = [...new Set([...draftSelectedSkillSlugs, ...explicitSelectedSkillSlugs])];
+    const promptText = cleanedText || trimmed;
 
-    const isExternalAgent = currentAgentId !== 'catty';
-
-    // No provider configured for built-in agent
-    if (!isExternalAgent && !activeProvider) {
-      const errSessionId = ensureSession();
-      addMessageToSession(errSessionId, { id: generateId(), role: 'user', content: trimmed, timestamp: Date.now() });
-      addMessageToSession(errSessionId, { id: generateId(), role: 'assistant', content: t('ai.chat.noProvider'), timestamp: Date.now() });
-      setInputValue('');
+    if (isDraftMode && !tryBeginDraftSend(draftSendInFlightRef)) {
       return;
     }
 
-    // Ensure session exists
-    const sessionId = ensureSession();
+    try {
+      let sessionId = currentSessionView?.id ?? null;
+      let currentSession = currentSessionView ?? null;
+      const sendAgentId = currentSessionView?.agentId ?? draft?.agentId ?? currentAgentId;
 
-    // Capture images before clearing
-    const attachments = filesRef.current.map(f => ({ base64Data: f.base64Data, mediaType: f.mediaType, filename: f.filename, filePath: f.filePath }));
+      if (isDraftMode) {
+        const scope: AISessionScope = { type: scopeType, targetId: scopeTargetId, hostIds: scopeHostIds };
+        const createdSession = createSession(scope, sendAgentId);
+        sessionId = createdSession.id;
+        currentSession = createdSession;
+        clearScopeDraft();
+        showScopeSessionView(createdSession.id);
+        setActiveSessionId(createdSession.id);
+      }
 
-    // Add user message
-    addMessageToSession(sessionId, {
-      id: generateId(), role: 'user', content: trimmed,
-      ...(attachments.length > 0 ? { attachments } : {}),
-      timestamp: Date.now(),
-    });
-    setInputValue('');
-    clearFiles();
-    setStreamingForScope(sessionId, true);
-
-    // Create assistant message placeholder with a tracked ID
-    const agentConfig = isExternalAgent ? externalAgents.find(a => a.id === currentAgentId) : undefined;
-    const assistantMsgId = generateId();
-    addMessageToSession(sessionId, {
-      id: assistantMsgId, role: 'assistant', content: '', timestamp: Date.now(),
-      model: isExternalAgent
-        ? (selectedAgentModel || agentConfig?.name || 'external')
-        : (activeModelId || activeProvider?.defaultModel || ''),
-      providerId: isExternalAgent ? undefined : activeProvider?.providerId,
-    });
-
-    const abortController = new AbortController();
-    abortControllersRef.current.set(sessionId, abortController);
-    const currentSession = sessionsRef.current.find(s => s.id === sessionId);
-
-    if (isExternalAgent) {
-      if (!agentConfig) {
-        updateMessageById(sessionId, assistantMsgId, msg => ({ ...msg, content: 'External agent not found. Please check settings.', executionStatus: 'failed' }));
-        setStreamingForScope(sessionId, false);
+      if (!sessionId) {
         return;
       }
-      try {
-        await sendToExternalAgent(sessionId, trimmed, agentConfig, abortController, attachments, {
-          existingSessionId: currentSession?.externalSessionId,
-          updateExternalSessionId: updateSessionExternalSessionId,
-          historyMessages: buildAcpHistoryMessages(currentSession?.messages ?? []),
-          terminalSessions,
-          defaultTargetSession,
-          providers,
-          selectedAgentModel,
-          toolIntegrationMode,
-        });
-      } catch (err) {
-        reportStreamError(sessionId, abortController.signal, err);
+
+      const isExternalAgent = sendAgentId !== 'catty';
+
+      if (!isExternalAgent && !activeProvider) {
+        addMessageToSession(sessionId, { id: generateId(), role: 'user', content: promptText, timestamp: Date.now() });
+        addMessageToSession(sessionId, { id: generateId(), role: 'assistant', content: t('ai.chat.noProvider'), timestamp: Date.now() });
+        if (currentPanelView.mode === 'session') {
+          clearScopeDraft();
+          showScopeSessionView(sessionId);
+        }
+        return;
       }
-      // Clear any lingering statusText when the external agent stream finishes
-      updateLastMessage(sessionId, msg => msg.statusText ? { ...msg, statusText: '' } : msg);
-      setStreamingForScope(sessionId, false);
-      abortControllersRef.current.delete(sessionId);
-      autoTitleSession(sessionId, trimmed);
-    } else {
-      const toolScope = {
-        type: scopeType,
-        targetId: scopeTargetId,
-        label: scopeLabel,
-      } as const;
-      await sendToCattyAgent(sessionId, sendScopeKey, trimmed, abortController, currentSession ?? undefined, assistantMsgId, {
-        activeProvider,
-        activeModelId,
-        scopeType,
-        scopeTargetId,
-        scopeLabel,
-        globalPermissionMode,
-        commandBlocklist,
-        terminalSessions,
-        webSearchConfig,
-        getExecutorContext: () => buildExecutorContextForScope(toolScope),
-        autoTitleSession,
-      }, attachments.length > 0 ? attachments : undefined);
+
+      addMessageToSession(sessionId, {
+        id: generateId(), role: 'user', content: promptText,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        timestamp: Date.now(),
+      });
+      clearScopeDraft();
+      showScopeSessionView(sessionId);
+      setActiveSessionId(sessionId);
+      setStreamingForScope(sessionId, true);
+
+      const agentConfig = isExternalAgent ? externalAgents.find((agent) => agent.id === sendAgentId) : undefined;
+      const assistantMsgId = generateId();
+      addMessageToSession(sessionId, {
+        id: assistantMsgId, role: 'assistant', content: '', timestamp: Date.now(),
+        model: isExternalAgent
+          ? (selectedAgentModel || agentConfig?.name || 'external')
+          : (activeModelId || activeProvider?.defaultModel || ''),
+        providerId: isExternalAgent ? undefined : activeProvider?.providerId,
+      });
+
+      const abortController = new AbortController();
+      abortControllersRef.current.set(sessionId, abortController);
+      currentSession = currentSession ?? sessionsRef.current.find((session) => session.id === sessionId) ?? null;
+
+      if (isExternalAgent) {
+        if (!agentConfig) {
+          updateMessageById(sessionId, assistantMsgId, msg => ({ ...msg, content: 'External agent not found. Please check settings.', executionStatus: 'failed' }));
+          setStreamingForScope(sessionId, false);
+          return;
+        }
+        try {
+          await sendToExternalAgent(sessionId, promptText, agentConfig, abortController, attachments, {
+            existingSessionId: currentSession?.externalSessionId,
+            updateExternalSessionId: updateSessionExternalSessionId,
+            historyMessages: buildAcpHistoryMessagesForBridge(
+              currentSession?.messages ?? [],
+              currentSession?.externalSessionId,
+            ),
+            terminalSessions,
+            defaultTargetSession,
+            providers,
+            selectedAgentModel,
+            toolIntegrationMode,
+            selectedUserSkillSlugs: selectedSkillSlugs,
+          });
+        } catch (err) {
+          reportStreamError(sessionId, abortController.signal, err);
+        }
+        updateLastMessage(sessionId, msg => msg.statusText ? { ...msg, statusText: '' } : msg);
+        setStreamingForScope(sessionId, false);
+        abortControllersRef.current.delete(sessionId);
+        autoTitleSession(sessionId, promptText);
+      } else {
+        const toolScope = {
+          type: scopeType,
+          targetId: scopeTargetId,
+          label: scopeLabel,
+        } as const;
+        await sendToCattyAgent(sessionId, sendScopeKey, promptText, abortController, currentSession ?? undefined, assistantMsgId, {
+          activeProvider,
+          activeModelId,
+          scopeType,
+          scopeTargetId,
+          scopeLabel,
+          globalPermissionMode,
+          commandBlocklist,
+          terminalSessions,
+          webSearchConfig,
+          getExecutorContext: () => buildExecutorContextForScope(toolScope),
+          autoTitleSession,
+          selectedUserSkillSlugs: selectedSkillSlugs,
+        }, attachments.length > 0 ? attachments : undefined);
+      }
+    } finally {
+      if (isDraftMode) {
+        endDraftSend(draftSendInFlightRef);
+      }
     }
   }, [
     isStreaming, activeProvider, scopeKey, currentAgentId,
     activeModelId, externalAgents,
-    ensureSession, addMessageToSession, updateMessageById, updateLastMessage,
-    setStreamingForScope, setInputValue, clearFiles,
+    createSession, addMessageToSession, updateMessageById, updateLastMessage,
+    setStreamingForScope,
     sendToExternalAgent, sendToCattyAgent, reportStreamError, autoTitleSession, t,
     abortControllersRef, terminalSessions, defaultTargetSession, providers, selectedAgentModel, updateSessionExternalSessionId,
-    scopeType, scopeTargetId, scopeLabel, globalPermissionMode, commandBlocklist, webSearchConfig, buildExecutorContextForScope,
+    scopeType, scopeTargetId, scopeHostIds, scopeLabel, globalPermissionMode, commandBlocklist, webSearchConfig, buildExecutorContextForScope,
     toolIntegrationMode,
+    clearScopeDraft, showScopeSessionView, setActiveSessionId, userSkillOptions,
   ]);
 
   const handleStop = useCallback(() => {
@@ -823,15 +974,13 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
 
   const handleSelectSession = useCallback(
     (sessionId: string) => {
-      setActiveSessionId(sessionId);
-      // Restore agent selector to match the session's bound agent
-      const session = sessions.find((s) => s.id === sessionId);
-      if (session) {
-        setCurrentAgentId(session.agentId);
-      }
-      setShowHistory(false);
+      applyHistorySessionSelection(sessionId, {
+        showSessionView: showScopeSessionView,
+        setActiveSessionId,
+        closeHistory: () => setShowHistory(false),
+      });
     },
-    [setActiveSessionId, sessions],
+    [setActiveSessionId, showScopeSessionView],
   );
 
   const handleDeleteSession = useCallback(
@@ -844,12 +993,17 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
   );
 
   const handleAgentChange = useCallback((agentId: string) => {
-    setCurrentAgentId(agentId);
-    // Preserve the current session in history and start a new one with the selected agent
-    const scope: AISessionScope = { type: scopeType, targetId: scopeTargetId, hostIds: scopeHostIds };
-    const session = createSession(scope, agentId);
-    setActiveSessionId(session.id);
-  }, [scopeType, scopeTargetId, scopeHostIds, createSession, setActiveSessionId]);
+    showScopeDraftView();
+    ensureScopeDraft(agentId);
+    updateScopeDraft(agentId, (draft) => ({
+      ...selectDraftForAgentSwitch(
+        draft,
+        agentId,
+        Boolean(activeSessionRef.current?.messages.length),
+      ),
+    }));
+    setShowHistory(false);
+  }, [ensureScopeDraft, showScopeDraftView, updateScopeDraft]);
 
   // -------------------------------------------------------------------
   // Render
@@ -961,6 +1115,10 @@ const AIChatSidePanelInner: React.FC<AIChatSidePanelProps> = ({
             onAddFiles={addFiles}
             onRemoveFile={removeFile}
             hosts={terminalSessions.map(s => ({ sessionId: s.sessionId, hostname: s.hostname, label: s.label, connected: s.connected }))}
+            selectedUserSkills={selectedUserSkills}
+            userSkills={userSkillOptions}
+            onAddUserSkill={addSelectedUserSkill}
+            onRemoveUserSkill={removeSelectedUserSkill}
             permissionMode={globalPermissionMode}
             onPermissionModeChange={setGlobalPermissionMode}
           />
@@ -1024,20 +1182,20 @@ const SessionHistoryDrawer: React.FC<SessionHistoryDrawerProps> = ({
                   onClick={() => onSelect(session.id)}
                   onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSelect(session.id); }}
                   className={cn(
-                    'w-full flex items-center justify-between py-2.5 border-b border-border/20 text-left transition-colors cursor-pointer group',
+                    SESSION_HISTORY_ROW_CLASSNAMES.row,
                     isActive ? 'text-foreground' : 'text-foreground/70 hover:text-foreground',
                   )}
                 >
-                  <span className="text-[13px] truncate pr-3 flex-1 min-w-0">
+                  <span className={SESSION_HISTORY_ROW_CLASSNAMES.title}>
                     {session.title || t('ai.chat.untitled')}
                   </span>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <span className="text-[12px] text-muted-foreground/50">
+                  <div className={SESSION_HISTORY_ROW_CLASSNAMES.meta}>
+                    <span className={SESSION_HISTORY_ROW_CLASSNAMES.time}>
                       {timeStr}
                     </span>
                     <button
                       onClick={(e) => onDelete(e, session.id)}
-                      className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-destructive transition-all cursor-pointer"
+                      className={SESSION_HISTORY_ROW_CLASSNAMES.deleteButton}
                       title="Delete"
                     >
                       <Trash2 size={12} />

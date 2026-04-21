@@ -42,7 +42,7 @@ import { ThemeSidePanel } from './terminal/ThemeSidePanel';
 import { useServerStats } from './terminal/hooks/useServerStats';
 import { isServerStatsSupportedHost } from './terminal/serverStatsSupport';
 import { AIChatSidePanel } from './AIChatSidePanel';
-import { cleanupOrphanedAISessions, useAIState } from '../application/state/useAIState';
+import { useAIState } from '../application/state/useAIState';
 import { TerminalComposeBar } from './terminal/TerminalComposeBar';
 import { TERMINAL_THEMES } from '../infrastructure/config/terminalThemes';
 import { useCustomThemes } from '../application/state/customThemeStore';
@@ -268,6 +268,10 @@ interface AIChatPanelsHostProps {
   }) => ExecutorContext;
 }
 
+interface AIStateMaintenanceHostProps {
+  validAIScopeTargetIds: Set<string>;
+}
+
 const AIStateProviderInner: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const aiState = useAIState();
   return (
@@ -279,6 +283,27 @@ const AIStateProviderInner: React.FC<{ children: React.ReactNode }> = ({ childre
 
 const AIStateProvider = memo(AIStateProviderInner);
 AIStateProvider.displayName = 'AIStateProvider';
+
+const AIStateMaintenanceHostInner: React.FC<AIStateMaintenanceHostProps> = ({
+  validAIScopeTargetIds,
+}) => {
+  const aiState = useContext(AIStateContext);
+
+  if (!aiState) {
+    throw new Error('AIStateMaintenanceHost must be rendered inside AIStateProvider');
+  }
+
+  const { cleanupOrphanedSessions } = aiState;
+
+  useEffect(() => {
+    cleanupOrphanedSessions(validAIScopeTargetIds);
+  }, [cleanupOrphanedSessions, validAIScopeTargetIds]);
+
+  return null;
+};
+
+const AIStateMaintenanceHost = memo(AIStateMaintenanceHostInner);
+AIStateMaintenanceHost.displayName = 'AIStateMaintenanceHost';
 
 const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
   mountedTabIds,
@@ -309,12 +334,20 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
             <AIChatSidePanel
               sessions={aiState.sessions}
               activeSessionIdMap={aiState.activeSessionIdMap}
+              draftsByScope={aiState.draftsByScope}
+              panelViewByScope={aiState.panelViewByScope}
               setActiveSessionId={aiState.setActiveSessionId}
+              ensureDraftForScope={aiState.ensureDraftForScope}
+              updateDraft={aiState.updateDraft}
+              showDraftView={aiState.showDraftView}
+              showSessionView={aiState.showSessionView}
+              clearDraftForScope={aiState.clearDraftForScope}
+              addDraftFiles={aiState.addDraftFiles}
+              removeDraftFile={aiState.removeDraftFile}
               createSession={aiState.createSession}
               deleteSession={aiState.deleteSession}
               updateSessionTitle={aiState.updateSessionTitle}
               updateSessionExternalSessionId={aiState.updateSessionExternalSessionId}
-              retargetSessionScope={aiState.retargetSessionScope}
               addMessageToSession={aiState.addMessageToSession}
               updateLastMessage={aiState.updateLastMessage}
               updateMessageById={aiState.updateMessageById}
@@ -412,6 +445,8 @@ interface TerminalLayerProps {
   sessionLogsEnabled?: boolean;
   sessionLogsDir?: string;
   sessionLogsFormat?: string;
+  closeSidePanelRef?: React.MutableRefObject<(() => void) | null>;
+  activeSidePanelTabRef?: React.MutableRefObject<string | null>;
 }
 
 const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
@@ -470,6 +505,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   sessionLogsEnabled,
   sessionLogsDir,
   sessionLogsFormat,
+  closeSidePanelRef,
+  activeSidePanelTabRef,
 }) => {
   // Subscribe to activeTabId from external store
   const activeTabId = useActiveTabId();
@@ -673,6 +710,9 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   // Whether side panel is open for the currently active tab and which sub-panel
   const isSidePanelOpenForCurrentTab = activeTabId ? sidePanelOpenTabs.has(activeTabId) : false;
   const activeSidePanelTab = activeTabId ? sidePanelOpenTabs.get(activeTabId) ?? null : null;
+  if (activeSidePanelTabRef) {
+    activeSidePanelTabRef.current = activeSidePanelTab;
+  }
 
   // Legacy compatibility helpers for SFTP-specific logic
   const isSftpOpenForCurrentTab = activeSidePanelTab === 'sftp';
@@ -1090,7 +1130,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     return map;
   }, [sessions, sessionHostsMap, hostMap, groupConfigs]);
 
-  const validTerminalTabIds = useMemo(() => {
+  const validAIScopeTargetIds = useMemo(() => {
     const ids = new Set<string>();
     for (const session of sessions) ids.add(session.id);
     for (const group of groups) ids.add(group.id);
@@ -1179,17 +1219,13 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   }, [workspaces]);
 
   useEffect(() => {
-    setSidePanelOpenTabs(prev => filterTabsMap(prev, validTerminalTabIds));
-    setSftpHostForTab(prev => filterTabsMap(prev, validTerminalTabIds));
-    setSftpSourceSessionIdForTab(prev => filterTabsMap(prev, validTerminalTabIds));
-    setSftpInitialLocationForTab(prev => filterTabsMap(prev, validTerminalTabIds));
-    setSftpPendingUploadsForTab(prev => filterTabsMap(prev, validTerminalTabIds));
+    setSidePanelOpenTabs(prev => filterTabsMap(prev, validAIScopeTargetIds));
+    setSftpHostForTab(prev => filterTabsMap(prev, validAIScopeTargetIds));
+    setSftpSourceSessionIdForTab(prev => filterTabsMap(prev, validAIScopeTargetIds));
+    setSftpInitialLocationForTab(prev => filterTabsMap(prev, validAIScopeTargetIds));
+    setSftpPendingUploadsForTab(prev => filterTabsMap(prev, validAIScopeTargetIds));
     sessionActivityStore.prune(validSessionActivityIds);
-  }, [validSessionActivityIds, validTerminalTabIds]);
-
-  useEffect(() => {
-    cleanupOrphanedAISessions(validTerminalTabIds);
-  }, [validTerminalTabIds]);
+  }, [validSessionActivityIds, validAIScopeTargetIds]);
 
   const computeWorkspaceRects = useCallback((workspace?: Workspace, size?: { width: number; height: number }): Record<string, WorkspaceRect> => {
     if (!workspace) return {} as Record<string, WorkspaceRect>;
@@ -1555,9 +1591,25 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
   }, [activeWorkspace?.focusedSessionId, activeSession?.id, syncSftpLocationToSessionCwd, terminalBackend]);
 
+  const refocusTerminalSession = useCallback((sessionId?: string | null) => {
+    if (!sessionId) return;
+
+    const focusTarget = () => {
+      const pane = document.querySelector(`[data-session-id="${sessionId}"]`);
+      const textarea = pane?.querySelector('textarea.xterm-helper-textarea') as HTMLTextAreaElement | null;
+      textarea?.focus();
+    };
+
+    requestAnimationFrame(() => {
+      focusTarget();
+      setTimeout(focusTarget, 50);
+    });
+  }, []);
+
   // Close the entire side panel for the current tab
   const handleCloseSidePanel = useCallback(() => {
     if (!activeTabId) return;
+    const sessionIdToRefocus = activeWorkspace?.focusedSessionId ?? activeSession?.id;
     setSidePanelOpenTabs(prev => {
       const next = new Map(prev);
       next.delete(activeTabId);
@@ -1585,7 +1637,16 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       next.delete(activeTabId);
       return next;
     });
-  }, [activeTabId]);
+    refocusTerminalSession(sessionIdToRefocus);
+  }, [activeTabId, activeWorkspace?.focusedSessionId, activeSession?.id, refocusTerminalSession]);
+
+  useEffect(() => {
+    if (!closeSidePanelRef) return;
+    closeSidePanelRef.current = handleCloseSidePanel;
+    return () => {
+      closeSidePanelRef.current = null;
+    };
+  }, [closeSidePanelRef, handleCloseSidePanel]);
 
   // Switch side panel to a specific tab (or toggle if already on that tab)
   const handleSwitchSidePanelTab = useCallback((tab: SidePanelTab) => {
@@ -2354,6 +2415,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   return (
     <AIStateProvider>
+      <AIStateMaintenanceHost validAIScopeTargetIds={validAIScopeTargetIds} />
       <div
         ref={workspaceOuterRef}
         className="absolute inset-0 bg-background flex flex-col"
@@ -2409,7 +2471,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="sftp"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'sftp' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'sftp'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2423,7 +2488,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="scripts"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'scripts' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'scripts'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2437,7 +2505,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="theme"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'theme' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'theme'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2451,7 +2522,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="ai"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'ai' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'ai'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2816,14 +2890,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
             onSend={handleComposeSend}
             onClose={() => {
               setIsComposeBarOpen(false);
-              // Refocus the terminal pane (matching solo-session behavior)
-              if (focusedSessionId) {
-                requestAnimationFrame(() => {
-                  const pane = document.querySelector(`[data-session-id="${focusedSessionId}"]`);
-                  const textarea = pane?.querySelector('textarea.xterm-helper-textarea') as HTMLTextAreaElement | null;
-                  textarea?.focus();
-                });
-              }
+              refocusTerminalSession(focusedSessionId);
             }}
             isBroadcastEnabled={isBroadcastEnabled?.(activeWorkspace.id)}
             themeColors={composeBarThemeColors}

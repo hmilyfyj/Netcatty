@@ -922,6 +922,39 @@ const api = {
 
   // App info
   getAppInfo: () => ipcRenderer.invoke("netcatty:app:getInfo"),
+  ptyGetChildProcesses: (sessionId) =>
+    ipcRenderer.invoke("netcatty:pty:childProcesses", sessionId),
+  confirmCloseBusy: (payload) =>
+    ipcRenderer.invoke("netcatty:dialog:confirmCloseBusy", payload),
+  getVaultBackupCapabilities: () =>
+    ipcRenderer.invoke("netcatty:vaultBackups:capabilities"),
+  createVaultBackup: (payload) =>
+    ipcRenderer.invoke("netcatty:vaultBackups:create", payload),
+  listVaultBackups: () =>
+    ipcRenderer.invoke("netcatty:vaultBackups:list"),
+  readVaultBackup: (payload) =>
+    ipcRenderer.invoke("netcatty:vaultBackups:read", payload),
+  trimVaultBackups: (payload) =>
+    ipcRenderer.invoke("netcatty:vaultBackups:trim", payload),
+  openVaultBackupDir: () =>
+    ipcRenderer.invoke("netcatty:vaultBackups:openDir"),
+  // Subscribe to cross-window "backups changed" events emitted by the
+  // main process whenever a create/trim actually mutated the on-disk
+  // set. Returns an unsubscribe function so React-style consumers can
+  // release the listener on unmount without leaking IPC handlers.
+  onVaultBackupsChanged: (handler) => {
+    if (typeof handler !== "function") return () => {};
+    const listener = () => {
+      try { handler(); } catch (error) {
+        console.warn("[preload] onVaultBackupsChanged handler threw:", error);
+      }
+    };
+    ipcRenderer.on("netcatty:vaultBackups:changed", listener);
+    return () => {
+      try { ipcRenderer.removeListener("netcatty:vaultBackups:changed", listener); }
+      catch { /* ignore */ }
+    };
+  },
 
   // Tell main process the renderer has mounted/painted (used to avoid initial blank screen).
   rendererReady: () => ipcRenderer.send("netcatty:renderer:ready"),
@@ -1224,6 +1257,15 @@ const api = {
   aiSyncWebSearch: async (apiHost, apiKey) => {
     return ipcRenderer.invoke("netcatty:ai:sync-web-search", { apiHost, apiKey });
   },
+  aiUserSkillsGetStatus: async () => {
+    return ipcRenderer.invoke("netcatty:ai:user-skills:status");
+  },
+  aiUserSkillsOpenFolder: async () => {
+    return ipcRenderer.invoke("netcatty:ai:user-skills:open");
+  },
+  aiUserSkillsBuildContext: async (prompt, selectedSkillSlugs) => {
+    return ipcRenderer.invoke("netcatty:ai:user-skills:build-context", { prompt, selectedSkillSlugs });
+  },
   aiChatStream: async (requestId, url, headers, body, providerId) => {
     return ipcRenderer.invoke("netcatty:ai:chat:stream", { requestId, url, headers, body, providerId });
   },
@@ -1310,8 +1352,8 @@ const api = {
     return () => ipcRenderer.removeListener("netcatty:ai:mcp:approval-cleared", handler);
   },
   // ACP streaming
-  aiAcpStream: async (requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession) => {
-    return ipcRenderer.invoke("netcatty:ai:acp:stream", { requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession });
+  aiAcpStream: async (requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext) => {
+    return ipcRenderer.invoke("netcatty:ai:acp:stream", { requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext });
   },
   aiAcpListModels: async (acpCommand, acpArgs, cwd, providerId, chatSessionId) => {
     return ipcRenderer.invoke("netcatty:ai:acp:list-models", { acpCommand, acpArgs, cwd, providerId, chatSessionId });
