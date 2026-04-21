@@ -131,16 +131,17 @@ export function pruneInactiveScopedSessions(
       return [session];
     }
 
-    sessionsChanged = true;
     if (!isRestorableTerminalSession(session)) {
+      sessionsChanged = true;
       return [];
     }
 
-    return [
-      session.externalSessionId
-        ? { ...session, externalSessionId: undefined }
-        : session,
-    ];
+    if (!session.externalSessionId) {
+      return [session];
+    }
+
+    sessionsChanged = true;
+    return [{ ...session, externalSessionId: undefined }];
   });
 
   return {
