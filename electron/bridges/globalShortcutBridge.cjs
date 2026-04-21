@@ -163,6 +163,14 @@ function startPendingFullscreenHideWatchdog(win) {
 
 function openMainWindow() {
   const { app } = electronModule;
+  const { BrowserWindow } = electronModule;
+  try {
+    for (const candidate of BrowserWindow.getAllWindows()) {
+      clearPendingFullscreenHide(candidate);
+    }
+  } catch {
+    // ignore
+  }
   const win = getMainWindow();
   if (!win) return;
   if (win.isMinimized()) win.restore();
@@ -467,6 +475,7 @@ function toggleWindowVisibility() {
   try {
     // Check if window is minimized first - minimized windows may still report isVisible() = true
     if (win.isMinimized()) {
+      clearPendingFullscreenHide(win);
       win.restore();
       win.show();
       win.focus();
@@ -479,9 +488,10 @@ function toggleWindowVisibility() {
     } else if (win.isVisible()) {
       if (win.isFocused()) {
         // Window is visible and focused - hide it
-        win.hide();
+        hideWindowRespectingMacFullscreen(win);
       } else {
         // Window is visible but not focused - focus it
+        clearPendingFullscreenHide(win);
         win.focus();
         const { app } = electronModule;
         try {
@@ -771,6 +781,7 @@ function setCloseToTray(enabled) {
       createTray();
     }
   } else {
+    clearPendingFullscreenHide(getMainWindow());
     // Destroy tray if it exists
     destroyTray();
   }
@@ -801,7 +812,7 @@ function getHotkeyStatus() {
 function handleWindowClose(event, win) {
   if (closeToTray && tray) {
     event.preventDefault();
-    win.hide();
+    hideWindowRespectingMacFullscreen(win);
     return true; // Prevented close
   }
   return false; // Allow close
@@ -910,6 +921,7 @@ function cleanup() {
 module.exports = {
   init,
   registerHandlers,
+  clearPendingFullscreenHide,
   handleWindowClose,
   cleanup,
 };
