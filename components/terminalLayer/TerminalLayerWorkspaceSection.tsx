@@ -159,6 +159,7 @@ function TerminalLayerWorkspaceSectionInner({ ctx }: { ctx: WorkspaceContext }) 
         )}
         <TerminalPanesHost
           sessions={sessions}
+          activeGroupedSessionId={ctx.activeGroupedSessionId}
           sessionHostsMap={sessionHostsMap}
           sessionChainHostsMap={sessionChainHostsMap}
           sessionSudoAutofillPasswordsMap={sessionSudoAutofillPasswordsMap}

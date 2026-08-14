@@ -734,6 +734,7 @@ interface TerminalPaneProps {
   workspaceById: Map<string, Workspace>;
   workspaceRectsById: Map<string, Record<string, WorkspaceRect>>;
   isTerminalLayerVisible: boolean;
+  activeGroupedSessionId?: string;
   workspaceFocusHandlersRef: React.MutableRefObject<Map<string, () => void>>;
   workspaceBroadcastHandlersRef: React.MutableRefObject<Map<string, () => void>>;
   splitHorizontalHandlersRef: React.MutableRefObject<Map<string, () => void>>;
@@ -863,6 +864,7 @@ const terminalPanePropsAreEqual = (
   prev.workspaceById === next.workspaceById &&
   workspaceRectsEqual(getPaneRenderedWorkspaceRect(prev), getPaneRenderedWorkspaceRect(next)) &&
   prev.isTerminalLayerVisible === next.isTerminalLayerVisible &&
+  prev.activeGroupedSessionId === next.activeGroupedSessionId &&
   prev.workspaceFocusHandlersRef === next.workspaceFocusHandlersRef &&
   prev.workspaceBroadcastHandlersRef === next.workspaceBroadcastHandlersRef &&
   prev.splitHorizontalHandlersRef === next.splitHorizontalHandlersRef &&
@@ -1156,6 +1158,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
   workspaceById,
   workspaceRectsById,
   isTerminalLayerVisible,
+  activeGroupedSessionId,
   workspaceFocusHandlersRef,
   workspaceBroadcastHandlersRef,
   splitHorizontalHandlersRef,
@@ -1226,10 +1229,12 @@ const TerminalPane: React.FC<TerminalPaneProps> = memo(({
       activeTabId: activeTabStore.getActiveTabId(),
       sessionId: session.id,
       sessionWorkspaceId: session.workspaceId,
+      sessionGroupId: session.groupId,
+      activeGroupedSessionId,
       workspaceById,
       isTerminalLayerVisible,
     }),
-    [isTerminalLayerVisible, session.id, session.workspaceId, workspaceById],
+    [activeGroupedSessionId, isTerminalLayerVisible, session.groupId, session.id, session.workspaceId, workspaceById],
   );
   const renderSnapshot = useSyncExternalStore(activeTabStore.subscribe, getRenderSnapshot, getRenderSnapshot);
   const { paneState, isFocusedPane } = parseTerminalPaneRenderSnapshot(renderSnapshot);
@@ -1549,6 +1554,7 @@ interface TerminalPanesHostProps {
   workspaceById: Map<string, Workspace>;
   workspaceRectsById: Map<string, Record<string, WorkspaceRect>>;
   isTerminalLayerVisible: boolean;
+  activeGroupedSessionId?: string;
   workspaceFocusHandlersRef: React.MutableRefObject<Map<string, () => void>>;
   workspaceBroadcastHandlersRef: React.MutableRefObject<Map<string, () => void>>;
   splitHorizontalHandlersRef: React.MutableRefObject<Map<string, () => void>>;
@@ -1634,6 +1640,7 @@ const terminalPanesHostPropsAreEqual = (
   if (prev.resolvedSessionHostIds !== next.resolvedSessionHostIds) return false;
   if (prev.workspaceById !== next.workspaceById) return false;
   if (prev.isTerminalLayerVisible !== next.isTerminalLayerVisible) return false;
+  if (prev.activeGroupedSessionId !== next.activeGroupedSessionId) return false;
   if (prev.workspaceFocusHandlersRef !== next.workspaceFocusHandlersRef) return false;
   if (prev.workspaceBroadcastHandlersRef !== next.workspaceBroadcastHandlersRef) return false;
   if (prev.splitHorizontalHandlersRef !== next.splitHorizontalHandlersRef) return false;

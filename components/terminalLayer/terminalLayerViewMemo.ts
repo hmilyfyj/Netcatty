@@ -340,6 +340,7 @@ const WORKSPACE_CTX_KEYS = [
   'computeSplitHint',
   'handleWorkspaceDrop',
   'sessions',
+  'activeGroupedSessionId',
   'sessionHostsMap',
   'sessionChainHostsMap',
   'sessionSudoAutofillPasswordsMap',
@@ -446,6 +447,9 @@ export function terminalLayerWorkspaceCtxEqual(prev: Ctx, next: Ctx): boolean {
 
 export function terminalLayerViewCtxEqual(prev: Ctx, next: Ctx): boolean {
   if (prev.isTerminalLayerVisible !== next.isTerminalLayerVisible) return false;
+  if (prev.activeGroup !== next.activeGroup) return false;
+  if (prev.activeGroupedSessionId !== next.activeGroupedSessionId) return false;
+  if (prev.activeGroupSessions !== next.activeGroupSessions) return false;
   if (prev.hibernateHiddenTabs !== next.hibernateHiddenTabs) return false;
   if (prev.isComposeBarOpen !== next.isComposeBarOpen) return false;
   // activeWorkspace / focusedSessionId intentionally omitted: live store +

@@ -97,6 +97,8 @@ interface GetTerminalPaneSnapshotOptions {
   activeTabId: string | null;
   sessionId: string;
   sessionWorkspaceId?: string;
+  sessionGroupId?: string;
+  activeGroupedSessionId?: string;
   workspaceById: Map<string, Workspace>;
   isTerminalLayerVisible: boolean;
 }
@@ -105,11 +107,20 @@ export function getTerminalPaneSnapshot({
   activeTabId,
   sessionId,
   sessionWorkspaceId,
+  sessionGroupId,
+  activeGroupedSessionId,
   workspaceById,
   isTerminalLayerVisible,
 }: GetTerminalPaneSnapshotOptions): TerminalPaneSnapshot {
   if (!isTerminalLayerVisible || !activeTabId) {
     return HIDDEN_TERMINAL_PANE_SNAPSHOT;
+  }
+
+  if (sessionGroupId && sessionGroupId === activeTabId) {
+    if (activeGroupedSessionId && sessionId !== activeGroupedSessionId) {
+      return HIDDEN_TERMINAL_PANE_SNAPSHOT;
+    }
+    return `solo|${sessionId}`;
   }
 
   const activeWorkspace = workspaceById.get(activeTabId);

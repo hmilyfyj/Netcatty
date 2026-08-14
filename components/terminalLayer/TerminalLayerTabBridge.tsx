@@ -657,6 +657,7 @@ export function TerminalLayerTabBridge({ stableRef }: { stableRef: StableRef }) 
     computeSplitHint,
     dropHint,
     activeGroup,
+    activeSession?.id,
     focusedHost,
     focusedSessionId,
     s.restoreTerminalCwd,

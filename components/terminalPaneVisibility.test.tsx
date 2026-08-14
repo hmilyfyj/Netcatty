@@ -110,6 +110,42 @@ test("terminal pane snapshot distinguishes solo, split workspace, and focus work
   );
 });
 
+test("host group tab makes the active console a solo pane and hides siblings", () => {
+  const workspaceById = new Map<string, Workspace>();
+  assert.equal(
+    getTerminalPaneSnapshot({
+      activeTabId: "group-1",
+      sessionId: "c-1",
+      sessionGroupId: "group-1",
+      activeGroupedSessionId: "c-1",
+      workspaceById,
+      isTerminalLayerVisible: true,
+    }),
+    "solo|c-1",
+  );
+  assert.equal(
+    getTerminalPaneSnapshot({
+      activeTabId: "group-1",
+      sessionId: "c-2",
+      sessionGroupId: "group-1",
+      activeGroupedSessionId: "c-1",
+      workspaceById,
+      isTerminalLayerVisible: true,
+    }),
+    HIDDEN_TERMINAL_PANE_SNAPSHOT,
+  );
+  assert.equal(
+    getTerminalPaneSnapshot({
+      activeTabId: "group-1",
+      sessionId: "c-1",
+      sessionGroupId: "group-1",
+      workspaceById,
+      isTerminalLayerVisible: true,
+    }),
+    "solo|c-1",
+  );
+});
+
 test("terminal pane render snapshot combines visibility and focus in one token", () => {
   const workspaceById = new Map<string, Workspace>([
     ["ws-split", createWorkspace("ws-split", ["s-1", "s-2"], { focusedSessionId: "s-1" })],
