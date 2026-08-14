@@ -59,6 +59,19 @@ export function filterVaultHostsForDisplay({
   return filteredHosts;
 }
 
+export function filterVisibleVaultHosts({
+  displayedHosts,
+  pinnedHostIds,
+  selectedGroupPath,
+}: {
+  displayedHosts: readonly Host[];
+  pinnedHostIds: ReadonlySet<string>;
+  selectedGroupPath: string | null;
+}): Host[] {
+  if (selectedGroupPath) return [...displayedHosts];
+  return displayedHosts.filter((host) => !pinnedHostIds.has(host.id));
+}
+
 export function useVaultHostCollections({
   customGroups,
   groupConfigs,
@@ -254,14 +267,23 @@ export function useVaultHostCollections({
         .slice(0, 6);
     }, [filteredHosts, selectedGroupPath]);
   
+    const pinnedHostIds = useMemo(
+      () => new Set(pinnedHosts.map((host) => host.id)),
+      [pinnedHosts],
+    );
+
     const pinnedRecentIds = useMemo(() => new Set<string>([
-      ...pinnedHosts.map((host) => host.id),
+      ...pinnedHostIds,
       ...(showRecentHosts ? recentHosts.map((host) => host.id) : []),
-    ]), [pinnedHosts, recentHosts, showRecentHosts]);
+    ]), [pinnedHostIds, recentHosts, showRecentHosts]);
   
   const visibleDisplayedHosts = useMemo(
-      () => displayedHosts.filter((h) => selectedGroupPath || !pinnedRecentIds.has(h.id)),
-      [displayedHosts, selectedGroupPath, pinnedRecentIds],
+      () => filterVisibleVaultHosts({
+        displayedHosts,
+        pinnedHostIds,
+        selectedGroupPath,
+      }),
+      [displayedHosts, pinnedHostIds, selectedGroupPath],
     );
   
   // For tree view: apply search, tag filter, and sorting, but not group filtering
