@@ -627,7 +627,7 @@ export async function confirmIfBusyLocalTerminalImpl(getCtx: AppContextGetter, s
 }
 
 export async function closeTabsBatchImpl(getCtx: AppContextGetter, targetIds: string[]) {
-  const { closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, logViews, sessions, workspaces } = getCtx();
+  const { closeGroup, closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, groups = [], logViews, sessions, workspaces } = getCtx();
 {
       if (targetIds.length === 0) return true;
       if (closeTabsInFlightRef.current) return false;
@@ -637,10 +637,13 @@ export async function closeTabsBatchImpl(getCtx: AppContextGetter, targetIds: st
       const sessionIdsToProbe: string[] = [];
       for (const tabId of targetIds) {
         const ws = workspaces.find((w) => w.id === tabId);
+        const group = groups.find((item) => item.id === tabId);
         if (ws) {
           for (const s of sessions) {
             if (s.workspaceId === tabId) sessionIdsToProbe.push(s.id);
           }
+        } else if (group) {
+          sessionIdsToProbe.push(...group.sessionIds);
         } else if (sessions.find((s) => s.id === tabId)) {
           sessionIdsToProbe.push(tabId);
         }
@@ -659,6 +662,8 @@ export async function closeTabsBatchImpl(getCtx: AppContextGetter, targetIds: st
         for (const tabId of targetIds) {
           if (workspaces.find((w) => w.id === tabId)) {
             closeWorkspace(tabId);
+          } else if (groups.find((item) => item.id === tabId)) {
+            closeGroup?.(tabId);
           } else if (logViews.find((lv) => lv.id === tabId)) {
             closeLogView(tabId);
           }

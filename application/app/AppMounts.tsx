@@ -167,10 +167,14 @@ export const TerminalLayerMount: React.FC<TerminalLayerProps> = (props) => {
   const activeTabId = useActiveTabId();
   const sessionIds = useMemo(() => new Set(props.sessions.map((session) => session.id)), [props.sessions]);
   const workspaceIds = useMemo(() => new Set(props.workspaces.map((workspace) => workspace.id)), [props.workspaces]);
+  const groupIds = useMemo(() => new Set(
+    props.sessions.map((session) => session.groupId).filter((id): id is string => Boolean(id)),
+  ), [props.sessions]);
   const isVisible = isTerminalContentTabSurface({
     activeTabId,
     sessionIds,
     workspaceIds,
+    groupIds,
   }) || !!props.draggingSessionId;
   // Silent MCP sessions never become the activeTabId, so `isVisible` alone
   // would leave this whole layer (and its PTY-starting TerminalPane) unmounted

@@ -32,7 +32,7 @@ import { STORAGE_KEY_AI_SHOW_TERMINAL_SELECTION_ACTION } from '../../infrastruct
 import { cn } from '../../lib/utils';
 import { LazyLoadBoundary } from '../ui/lazy-load-boundary';
 import type { DropEntry } from '../../lib/sftpFileUtils';
-import type { GroupConfig, Host, Identity, KnownHost, ProxyProfile, SSHKey, Snippet, TerminalSession, VaultNote, Workspace } from '../../types';
+import type { GroupConfig, Host, Identity, KnownHost, ProxyProfile, SSHKey, Snippet, TerminalGroup, TerminalSession, VaultNote, Workspace } from '../../types';
 import type { ExecutorContext } from '../../infrastructure/ai/cattyAgent/executor';
 import type { AISession } from '../../infrastructure/ai/types';
 import Terminal from '../Terminal';
@@ -631,6 +631,10 @@ export interface TerminalLayerProps {
   onOpenVaultSectionFromChat?: (section: 'notes' | 'hosts' | 'snippets') => void;
   onOpenVaultSnippetFromChat?: (snippetId: string) => void;
   sessions: TerminalSession[];
+  groups?: TerminalGroup[];
+  onCreateConsoleInGroup?: (groupId: string) => string | null;
+  onSelectConsoleInGroup?: (groupId: string, sessionId: string) => void;
+  onCloseConsoleInGroup?: (groupId: string, sessionId: string) => void;
   workspaces: Workspace[];
   knownHosts?: KnownHost[];
   draggingSessionId: string | null;

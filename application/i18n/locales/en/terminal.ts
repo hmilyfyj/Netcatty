@@ -621,6 +621,8 @@ export const enTerminalMessages: Messages = {
   'tabs.closePluginViewAria': 'Close {title}',
   'tabs.logPrefix': 'Log:',
   'tabs.logLocal': 'Local',
+  'tabs.newConsole': 'New Console',
+  'tabs.consoleIndex': 'Console {index}',
   'tabs.copyTab': 'Copy Tab',
   'tabs.copyTabToNewWindow': 'Copy Tab to New Window',
   'tabs.copyTabToNewWindowFailed': 'Failed to open tab in a new window',

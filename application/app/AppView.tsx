@@ -267,7 +267,7 @@ function AppViewInner({ domains }: AppViewProps) {
     handleOpenHostFromVaultNote, handleOpenQuickSwitcher, handleOpenSettings, handleOpenVaultHostFromChat, handleOpenVaultNoteFromChat, handleOpenVaultSectionFromChat, handleOpenVaultSnippetFromChat, handleRootContextMenu, handlePassphraseCancel, handlePassphraseSkip, handlePassphraseSubmit, handleProtocolSelect,
     handleRequestCloseEditorTabRef, handleSessionStatusChange, handleSyncNowManual, handleTerminalDataCapture, handleUpdateHostFromTerminal,
     hostById, hosts, terminalHosts, updateTerminalHosts, hotkeyScheme, identities, importOrReuseKey, isBroadcastEnabled, isCreateWorkspaceOpen, isMacClient, isQuickSwitcherOpen,
-    keyBindings, keyboardInteractiveQueue, keys, logViews, managedSources, navigateToSection, openLogView, openNoteRequest, orderedTabsWithEditors, orphanSessions,
+    keyBindings, keyboardInteractiveQueue, keys, logViews, managedSources, navigateToSection, openLogView, openNoteRequest, orderedTabsWithEditors, orphanSessions, groups, createConsoleInGroup, selectConsoleInGroup, closeGroup,
     passphraseQueue, protocolSelectHost, proxyProfiles, portForwardingRules, quickResults, quickSearch, removeSessionFromWorkspace, reorderWorkTabs, reorderWorkspaceSessions,
     resolveEmptyVaultConflict, resolveSessionAppearance, runSnippet, sessionLogsDir, sessionLogsEnabled, sessionLogsFormat, sessionLogsTimestampsEnabled, sessionRenameTarget, sshDebugLogsEnabled,
     sessions, setActiveTabId, setDeepLinkHostDraft, setDraggingSessionId, setEditorWordWrap,
@@ -467,6 +467,9 @@ function AppViewInner({ domains }: AppViewProps) {
         hosts={hosts}
         sessions={sessions}
         orphanSessions={orphanSessions}
+        groups={groups}
+        onCreateConsoleInGroup={createConsoleInGroup}
+        onCloseGroup={closeGroup}
         workspaces={workspaces}
         logViews={logViews}
         orderedTabs={orderedTabsWithEditors}
@@ -646,6 +649,10 @@ function AppViewInner({ domains }: AppViewProps) {
           snippets={snippets}
           snippetPackages={snippetPackages}
           sessions={sessions}
+          groups={groups}
+          onCreateConsoleInGroup={createConsoleInGroup}
+          onSelectConsoleInGroup={selectConsoleInGroup}
+          onCloseConsoleInGroup={(groupId, sessionId) => closeSession(sessionId)}
           workspaces={workspaces}
           knownHosts={effectiveKnownHosts}
           draggingSessionId={draggingSessionId}

@@ -225,6 +225,7 @@ export function AppSideEffects() {
   const sessionState = useAppSessionRuntime();
   const {
     sessions,
+    groups,
     workspaces,
     setActiveTabId,
     setDraggingSessionId,
@@ -247,6 +248,9 @@ export function AppSideEffects() {
     logViews,
     closeLogView,
     copySession,
+    createConsoleInGroup,
+    selectConsoleInGroup,
+    closeGroup,
     copyWorkspace,
     createSessionFromCloneSource,
     getSessionRestoreCwd,
@@ -991,14 +995,14 @@ export function AppSideEffects() {
       const pluginIds = targetIds.filter((id) => pluginViewTabStore.getTab(id));
       const regularIds = targetIds.filter((id) => !pluginViewTabStore.getTab(id));
       const canClose = !regularIds.length || await closeTabsBatchImpl(
-        () => ({ closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, logViews, sessions, targetIds: regularIds, workspaces }),
+        () => ({ closeGroup, closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, groups, logViews, sessions, targetIds: regularIds, workspaces }),
         regularIds,
       );
       if (!canClose) return;
       for (const id of pluginIds) pluginViewTabStore.close(id);
       if (closingTabIds.has(activeBeforeClose)) activeTabStore.setActiveTabId(focusAfterClose);
     },
-    [workspaces, sessions, logViews, confirmIfBusyLocalTerminal, closeWorkspace, closeSessions, closeLogView, orderedTabsWithEditors],
+    [workspaces, sessions, groups, logViews, confirmIfBusyLocalTerminal, closeWorkspace, closeSessions, closeGroup, closeLogView, orderedTabsWithEditors],
   );
 
   // Shared hotkey action handler - used by both global handler and terminal callback.

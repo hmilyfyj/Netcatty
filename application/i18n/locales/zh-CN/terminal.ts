@@ -706,6 +706,8 @@ export const zhCNTerminalMessages: Messages = {
   'tabs.closePluginViewAria': '关闭 {title}',
   'tabs.logPrefix': '日志：',
   'tabs.logLocal': '本地',
+  'tabs.newConsole': '新建控制台',
+  'tabs.consoleIndex': '控制台 {index}',
   'tabs.copyTab': '复制标签页',
   'tabs.copyTabToNewWindow': '复制标签页到新窗口',
   'tabs.copyTabToNewWindowFailed': '无法在新窗口打开标签页',

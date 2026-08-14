@@ -877,6 +877,118 @@ export const SessionTopTab: React.FC<SessionTopTabProps> = memo(({
 });
 SessionTopTab.displayName = 'SessionTopTab';
 
+export const GroupTopTab: React.FC<{
+  group: import('../../types').TerminalGroup;
+  host?: Host;
+  sessionCount: number;
+  activeSession?: TerminalSession;
+  isBeingDragged: boolean;
+  isDraggingForReorder: boolean;
+  shiftStyle: React.CSSProperties;
+  showDropIndicatorBefore: boolean;
+  showDropIndicatorAfter: boolean;
+  onTabDragStart: (e: React.DragEvent, tabId: string) => void;
+  onTabDragEnd: () => void;
+  onTabDragOver: (e: React.DragEvent, tabId: string) => void;
+  onTabDragLeave: (e: React.DragEvent) => void;
+  onTabDrop: (e: React.DragEvent, targetTabId: string) => void;
+  onCloseGroup: (groupId: string) => void;
+  onCreateConsoleInGroup: (groupId: string) => void;
+  renderBulkCloseItems: RenderBulkCloseItems;
+  t: TranslateFn;
+  tabAnimationClass?: string;
+  shortcutNumber?: number;
+}> = memo(({
+  group,
+  host,
+  sessionCount,
+  activeSession,
+  isBeingDragged,
+  isDraggingForReorder,
+  shiftStyle,
+  showDropIndicatorBefore,
+  showDropIndicatorAfter,
+  onTabDragStart,
+  onTabDragEnd,
+  onTabDragOver,
+  onTabDragLeave,
+  onTabDrop,
+  onCloseGroup,
+  onCreateConsoleInGroup,
+  renderBulkCloseItems,
+  t,
+  tabAnimationClass,
+  shortcutNumber,
+}) => {
+  const isActive = useIsTabActive(group.id);
+  const hasActivity = useAnySessionActivity(group.sessionIds);
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <div
+          data-tab-id={group.id}
+          data-tab-type="group"
+          data-state={isActive ? 'active' : 'inactive'}
+          onClick={() => activeTabStore.setActiveTabId(group.id)}
+          onDoubleClick={() => onCreateConsoleInGroup(group.id)}
+          onMouseDown={handleTabMiddleMouseDown}
+          onAuxClick={(e) => handleTabMiddleClickClose(e, () => onCloseGroup(group.id))}
+          draggable
+          onDragStart={(e) => onTabDragStart(e, group.id)}
+          onDragEnd={onTabDragEnd}
+          onDragOver={(e) => onTabDragOver(e, group.id)}
+          onDragLeave={onTabDragLeave}
+          onDrop={(e) => onTabDrop(e, group.id)}
+          className={cn(
+            "netcatty-tab relative h-7 pl-3 pr-2 min-w-[150px] max-w-[260px] rounded-t-md overflow-hidden text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
+            "transition-transform duration-150",
+            isBeingDragged && isDraggingForReorder ? "opacity-40 scale-95" : "",
+            tabAnimationClass,
+          )}
+          style={{
+            ...shiftStyle,
+            backgroundColor: isActive
+              ? 'var(--top-tabs-active-bg, hsl(var(--background)))'
+              : 'transparent',
+            color: isActive
+              ? 'var(--top-tabs-fg, hsl(var(--foreground)))'
+              : 'var(--top-tabs-muted, hsl(var(--muted-foreground)))',
+          }}
+        >
+          {isActive && (
+            <div className="absolute top-0 left-0 right-0 h-[2px]" style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))' }} />
+          )}
+          {showDropIndicatorBefore && isDraggingForReorder && (
+            <div className="absolute -left-0.5 top-1 bottom-1 w-0.5 rounded-full" style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))' }} />
+          )}
+          {showDropIndicatorAfter && isDraggingForReorder && (
+            <div className="absolute -right-0.5 top-1 bottom-1 w-0.5 rounded-full" style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))' }} />
+          )}
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <SessionTabIcon host={host} session={activeSession ?? { hostLabel: group.title }} isActive={isActive} protocol={activeSession?.protocol} />
+            <span className="truncate">{group.title}</span>
+            {hasActivity && <span className="h-1.5 w-1.5 rounded-full bg-accent shrink-0" />}
+          </div>
+          <div className="text-[10px] px-1.5 py-0.5 rounded-full min-w-[22px] text-center shrink-0" style={{ border: '1px solid color-mix(in srgb, var(--top-tabs-fg, hsl(var(--foreground))) 18%, transparent)' }}>
+            {sessionCount}
+          </div>
+          {shortcutNumber ? <span className="text-[10px] opacity-60">{shortcutNumber}</span> : null}
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onClick={() => onCreateConsoleInGroup(group.id)}>
+          {t('tabs.newConsole')}
+        </ContextMenuItem>
+        <ContextMenuItem className="text-destructive" onClick={() => onCloseGroup(group.id)}>
+          {t('common.close')}
+        </ContextMenuItem>
+        {renderBulkCloseItems(group.id)}
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+});
+GroupTopTab.displayName = 'GroupTopTab';
+
 interface WorkspaceTopTabProps {
   workspace: Workspace;
   paneCount: number;

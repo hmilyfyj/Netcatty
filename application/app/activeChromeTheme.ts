@@ -43,6 +43,7 @@ export function isActiveChromeThemeResolvable({
   if (logViews.some((item) => item.id === activeTabId)) return true;
   if (workspaceById.has(activeTabId)) return true;
   if (sessionById.has(activeTabId)) return true;
+  if ([...sessionById.values()].some((session) => session.groupId === activeTabId)) return true;
   return false;
 }
 

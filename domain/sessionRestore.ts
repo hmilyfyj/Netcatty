@@ -11,6 +11,9 @@ export type RestoredTerminalSession = {
   username: string;
   status: "disconnected";
   workspaceId?: string;
+  groupId?: string;
+  groupConsoleIndex?: number;
+  groupTitle?: string;
   protocol?: TerminalSession["protocol"];
   pluginConnection?: PluginConnectionConfig;
   port?: number;
@@ -134,6 +137,9 @@ const restoreSession = (session: TerminalSession): RestoredTerminalSession => {
     hostname: session.hostname,
     username: session.username,
     ...(session.workspaceId ? { workspaceId: session.workspaceId } : {}),
+    ...(session.groupId ? { groupId: session.groupId } : {}),
+    ...(session.groupConsoleIndex !== undefined ? { groupConsoleIndex: session.groupConsoleIndex } : {}),
+    ...(session.groupTitle ? { groupTitle: session.groupTitle } : {}),
     ...(protocol ? { protocol } : {}),
     ...(pluginConnection ? { pluginConnection } : {}),
     ...(session.port !== undefined ? { port: session.port } : {}),
@@ -176,6 +182,9 @@ const restoreSessionFromUnknown = (value: unknown): RestoredTerminalSession | nu
     hostname,
     username,
     ...(readString(value, "workspaceId") ? { workspaceId: readString(value, "workspaceId") } : {}),
+    ...(readString(value, "groupId") ? { groupId: readString(value, "groupId") } : {}),
+    ...(readNumber(value, "groupConsoleIndex") !== undefined ? { groupConsoleIndex: readNumber(value, "groupConsoleIndex") } : {}),
+    ...(readString(value, "groupTitle") ? { groupTitle: readString(value, "groupTitle") } : {}),
     ...(protocol ? { protocol } : {}),
     ...(pluginConnection ? { pluginConnection } : {}),
     ...(readNumber(value, "port") !== undefined ? { port: readNumber(value, "port") } : {}),
@@ -385,12 +394,13 @@ const restoreWorkspace = (workspace: Workspace, root: WorkspaceNode, sessionIds:
 export function resolveRestoredActiveTabId(
   activeTabId: string,
   tabOrder: readonly string[],
-  sessions: readonly Pick<TerminalSession, "id" | "workspaceId">[],
+  sessions: readonly Pick<TerminalSession, "id" | "workspaceId" | "groupId">[],
   workspaces: readonly Pick<Workspace, "id">[],
 ): string {
   const valid = new Set([
     "vault",
-    ...sessions.filter((session) => !session.workspaceId).map((session) => session.id),
+    ...sessions.filter((session) => !session.workspaceId && !session.groupId).map((session) => session.id),
+    ...sessions.map((session) => session.groupId).filter((id): id is string => Boolean(id)),
     ...workspaces.map((workspace) => workspace.id),
   ]);
   if (valid.has(activeTabId)) return activeTabId;
@@ -438,7 +448,8 @@ export function sanitizeSessionRestorePayload(payload: unknown): SessionRestoreP
     )
   ));
   const validTabIds = new Set([
-    ...sanitizedSessions.filter((session) => !session.workspaceId).map((session) => session.id),
+    ...sanitizedSessions.filter((session) => !session.workspaceId && !session.groupId).map((session) => session.id),
+    ...sanitizedSessions.map((session) => session.groupId).filter((id): id is string => Boolean(id)),
     ...workspaces.map((workspace) => workspace.id),
   ]);
   const tabOrder = uniqueStrings(Array.isArray(record.tabOrder) ? record.tabOrder.filter((id): id is string => typeof id === "string") : [])

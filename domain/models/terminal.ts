@@ -566,6 +566,10 @@ export interface TerminalSession {
   hostname: string;
   status: 'connecting' | 'connected' | 'disconnected';
   workspaceId?: string;
+  /** Remote host console group: multiple terminals share one top tab. */
+  groupId?: string;
+  groupConsoleIndex?: number;
+  groupTitle?: string;
   /** Script to auto-run after connect (multi-host script runner). */
   pendingScriptId?: string;
   /** Snapshot used by "Run now" so unsaved editor changes run exactly as shown. */

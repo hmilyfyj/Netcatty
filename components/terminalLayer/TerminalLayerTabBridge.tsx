@@ -9,7 +9,8 @@ import { resolveSystemSidebarSession } from '../../domain/systemManager/resolveS
 import type { TerminalContextReader } from '../../domain/terminalContextRead';
 import { useSystemCapabilitiesWarmup } from '../../application/state/useSystemManager';
 import { cn } from '../../lib/utils';
-import type { Host, TerminalSession, Workspace } from '../../types';
+import type { Host, TerminalGroup, TerminalSession, Workspace } from '../../types';
+import { resolveGroupedActiveSession } from '../../application/state/terminalGroups';
 import { resolveTerminalHibernateEnabled } from '../../domain/terminalHibernate';
 import { shouldMeasureTerminalLayerLayout } from '../terminalPaneVisibility';
 import { TerminalLayerView } from './TerminalLayerView';
@@ -45,6 +46,7 @@ export function TerminalLayerTabBridge({ stableRef }: { stableRef: StableRef }) 
 
   const workspaceById = s.workspaceById as Map<string, Workspace>;
   const sessions = s.sessions as TerminalSession[];
+  const groups = (s.groups as TerminalGroup[] | undefined) ?? [];
   const sessionHostsMap = s.sessionHostsMap as Map<string, Host>;
   const sftpHostForTab = s.sftpHostForTab as Map<string, Host>;
   const sidePanelOpenTabs = s.sidePanelOpenTabs as Map<string, SidePanelTab>;
@@ -55,9 +57,13 @@ export function TerminalLayerTabBridge({ stableRef }: { stableRef: StableRef }) 
     () => (activeTabId ? workspaceById.get(activeTabId) : undefined),
     [activeTabId, workspaceById],
   );
+  const activeGroup = useMemo(
+    () => groups.find((group) => group.id === activeTabId),
+    [activeTabId, groups],
+  );
   const activeSession = useMemo(
-    () => sessions.find((session) => session.id === activeTabId),
-    [activeTabId, sessions],
+    () => resolveGroupedActiveSession(groups, sessions, activeTabId),
+    [activeTabId, groups, sessions],
   );
   const isFocusMode = activeWorkspace?.viewMode === 'focus';
   const focusedSessionId = activeWorkspace?.focusedSessionId;
@@ -84,7 +90,7 @@ export function TerminalLayerTabBridge({ stableRef }: { stableRef: StableRef }) 
   s.activeSessionRef.current = activeSession;
   s.focusedSessionIdRef.current = focusedSessionId;
 
-  const isVisible = Boolean(activeSession || activeWorkspace || s.draggingSessionId);
+  const isVisible = Boolean(activeSession || activeWorkspace || activeGroup || s.draggingSessionId);
   const isTerminalLayerVisible = isVisible || !!s.draggingSessionId;
 
   const {
@@ -407,6 +413,14 @@ export function TerminalLayerTabBridge({ stableRef }: { stableRef: StableRef }) 
     activeTerminalCwd,
     activeTerminalSessionIdForSftp,
     activeWorkspace,
+    activeGroup,
+    activeGroupSessions: sessions
+      .filter((session) => session.groupId === activeGroup?.id)
+      .sort((left, right) => (left.groupConsoleIndex ?? 0) - (right.groupConsoleIndex ?? 0)),
+    onCreateConsoleInGroup: s.onCreateConsoleInGroup,
+    onSelectConsoleInGroup: s.onSelectConsoleInGroup,
+    onCloseConsoleInGroup: s.onCloseConsoleInGroup,
+    activeGroupedSessionId: activeSession?.id,
     AIChatPanelsHost: s.AIChatPanelsHost,
     AISidePanelStateRoot: s.AISidePanelStateRoot,
     aiContextsByTabId,
@@ -642,6 +656,7 @@ export function TerminalLayerTabBridge({ stableRef }: { stableRef: StableRef }) 
     aiContextsByTabId,
     computeSplitHint,
     dropHint,
+    activeGroup,
     focusedHost,
     focusedSessionId,
     s.restoreTerminalCwd,

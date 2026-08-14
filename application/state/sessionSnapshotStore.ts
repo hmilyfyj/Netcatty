@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react';
 
-import type { TerminalSession, Workspace } from '../../domain/models';
+import type { TerminalGroup, TerminalSession, Workspace } from '../../domain/models';
 import type { LogView } from './logViewState';
 import type { useSessionState } from './useSessionState';
 
@@ -16,6 +16,7 @@ export type SessionSnapshot = {
   sessions: readonly TerminalSession[];
   /** Sessions with no workspace and not hidden from tabs; TopTabs renders these. */
   orphanSessions: readonly TerminalSession[];
+  groups: readonly TerminalGroup[];
   workspaces: readonly Workspace[];
   logViews: readonly LogView[];
   draggingSessionId: string | null;
@@ -69,6 +70,9 @@ export type SessionSnapshotActions = Pick<
   | 'toggleBroadcast'
   | 'isBroadcastEnabled'
   | 'copySession'
+  | 'createConsoleInGroup'
+  | 'selectConsoleInGroup'
+  | 'closeGroup'
   | 'copyWorkspace'
   | 'createSessionFromCloneSource'
   | 'updateSessionRestoreCwd'
@@ -78,12 +82,14 @@ export type SessionSnapshotActions = Pick<
 >;
 
 const EMPTY_SESSIONS: readonly TerminalSession[] = Object.freeze([]);
+const EMPTY_GROUPS: readonly TerminalGroup[] = Object.freeze([]);
 const EMPTY_WORKSPACES: readonly Workspace[] = Object.freeze([]);
 const EMPTY_LOG_VIEWS: readonly LogView[] = Object.freeze([]);
 
 export const EMPTY_SESSION_SNAPSHOT: SessionSnapshot = Object.freeze({
   sessions: EMPTY_SESSIONS,
   orphanSessions: EMPTY_SESSIONS,
+  groups: EMPTY_GROUPS,
   workspaces: EMPTY_WORKSPACES,
   logViews: EMPTY_LOG_VIEWS,
   draggingSessionId: null,

@@ -1,5 +1,5 @@
 import { MouseEvent,useCallback,useEffect,useMemo,useRef,useState } from 'react';
-import { ConnectionLog,Host,SerialConfig,Snippet,TerminalSession,Workspace,WorkspaceNode,WorkspaceViewMode } from '../../domain/models';
+import { ConnectionLog,Host,SerialConfig,Snippet,TerminalGroup,TerminalSession,Workspace,WorkspaceNode,WorkspaceViewMode } from '../../domain/models';
 import { addLogView, getLogViewTabId, removeLogView, type LogView } from './logViewState';
 import {
   createHostTerminalSession,
@@ -41,6 +41,15 @@ import {
   createCopiedTerminalSessionClone,
   createSplitTerminalSessionClone,
 } from './terminalConnectionReuse';
+import {
+  addConsoleToGroup,
+  createTerminalGroup,
+  createTerminalGroupId,
+  isRemoteGroupableHost,
+  rebuildTerminalGroups,
+  removeConsoleFromGroup,
+  selectConsoleInGroupState,
+} from './terminalGroups';
 import { STORAGE_KEY_RESTORE_PREVIOUS_SESSION } from '../../infrastructure/config/storageKeys';
 import {
   LOCAL_STORAGE_ADAPTER_CHANGED_EVENT,
@@ -210,7 +219,10 @@ export const useSessionState = ({
     payload: persistSessionRestore ? sessionRestoreStorage.read() : null,
   }), [persistSessionRestore]);
   const [sessions, setSessions] = useState<TerminalSession[]>(initialRestoreState.sessions);
+  const [groups, setGroups] = useState<TerminalGroup[]>(() => rebuildTerminalGroups(initialRestoreState.sessions));
   const [workspaces, setWorkspaces] = useState<Workspace[]>(initialRestoreState.workspaces);
+  const groupsRef = useRef(groups);
+  groupsRef.current = groups;
   // Latest workspaces snapshot for synchronous existence checks outside
   // setWorkspaces updaters — React doesn't guarantee updaters run
   // synchronously, so relying on a flag flipped inside them to decide
@@ -483,7 +495,21 @@ export const useSessionState = ({
 
   const connectToHost = useCallback((host: Host, options?: { hidden?: boolean }) => {
     const hidden = options?.hidden === true;
-    const newSession = createHostTerminalSession(crypto.randomUUID(), host);
+    const sessionId = crypto.randomUUID();
+    if (!hidden && isRemoteGroupableHost(host)) {
+      const groupId = createTerminalGroupId();
+      const newSession = {
+        ...createHostTerminalSession(sessionId, host),
+        groupId,
+        groupConsoleIndex: 1,
+        groupTitle: host.label,
+      };
+      setGroups((prev) => [...prev, createTerminalGroup({ id: groupId, host, sessionId })]);
+      setSessions((prev) => [...prev, newSession]);
+      setActiveTabId(groupId);
+      return sessionId;
+    }
+    const newSession = createHostTerminalSession(sessionId, host);
     const sessionToAdd = hidden ? { ...newSession, hiddenFromTabs: true } : newSession;
     setSessions(prev => [...prev, sessionToAdd]);
     if (!hidden) setActiveTabId(newSession.id);
@@ -537,6 +563,13 @@ export const useSessionState = ({
     for (const sessionId of sessionIds) {
       sessionPresentationStore.clearSession(sessionId);
     }
+    let nextGroups = groupsRef.current;
+    for (const sessionId of sessionIds) {
+      const grouped = sessionsRef.current.find((session) => session.id === sessionId && session.groupId);
+      if (!grouped?.groupId) continue;
+      nextGroups = removeConsoleFromGroup(nextGroups, grouped.groupId, sessionId).groups;
+    }
+    if (nextGroups !== groupsRef.current) setGroups(nextGroups);
     const result = closeSessionsState({
       sessions: sessionsRef.current,
       workspaces: workspacesRef.current,
@@ -549,9 +582,17 @@ export const useSessionState = ({
     setWorkspaces(result.workspaces);
     setSessions(result.sessions);
     setTabOrder(result.tabOrder);
+    const currentActiveTabId = activeTabStore.getActiveTabId();
+    const activeGroupStillOpen = nextGroups.some((group) => group.id === currentActiveTabId);
     if (result.activeTabId) {
       // Closing must not rewrite previous-tab history to the closed tab.
       activeTabStore.setActiveTabId(result.activeTabId, { recordPrevious: false });
+    } else if (currentActiveTabId?.startsWith('group-') && !activeGroupStillOpen) {
+      const fallback = nextGroups.at(-1)?.id
+        || result.workspaces.at(-1)?.id
+        || result.sessions.find((session) => !session.workspaceId && !session.groupId && !session.hiddenFromTabs)?.id
+        || 'vault';
+      activeTabStore.setActiveTabId(fallback, { recordPrevious: false });
     }
   }, []);
 
@@ -1053,7 +1094,46 @@ export const useSessionState = ({
 	    setActiveTabId(workspace.id);
 	  }, [setActiveTabId]);
 
-  const orphanSessions = useMemo(() => sessions.filter(s => !s.workspaceId && !s.hiddenFromTabs), [sessions]);
+  const orphanSessions = useMemo(
+    () => sessions.filter(s => !s.workspaceId && !s.groupId && !s.hiddenFromTabs),
+    [sessions],
+  );
+
+  const selectConsoleInGroup = useCallback((groupId: string, sessionId: string) => {
+    setGroups((prev) => selectConsoleInGroupState(prev, groupId, sessionId));
+    setActiveTabId(groupId);
+  }, [setActiveTabId]);
+
+  const createConsoleInGroup = useCallback((groupId: string, baseSessionId?: string, options?: {
+    localShellType?: TerminalSession['shellType'];
+    inheritedCwd?: string;
+  }) => {
+    const group = groupsRef.current.find((item) => item.id === groupId);
+    if (!group) return null;
+    const baseSession = sessionsRef.current.find((session) =>
+      session.id === (baseSessionId || group.activeSessionId || group.sessionIds[0]),
+    );
+    if (!baseSession) return null;
+    const newSessionId = crypto.randomUUID();
+    const newSession = createCopiedTerminalSessionClone(baseSession, {
+      id: newSessionId,
+      localShellType: options?.localShellType,
+      inheritedCwd: options?.inheritedCwd,
+      groupId,
+      groupConsoleIndex: group.nextConsoleIndex,
+      groupTitle: group.title,
+    });
+    setSessions((prev) => [...prev, newSession]);
+    setGroups((prev) => addConsoleToGroup(prev, groupId, newSessionId));
+    setActiveTabId(groupId);
+    return newSessionId;
+  }, [setActiveTabId]);
+
+  const closeGroup = useCallback((groupId: string) => {
+    const group = groupsRef.current.find((item) => item.id === groupId);
+    if (!group) return;
+    closeSessions(group.sessionIds);
+  }, [closeSessions]);
 
   const openLogView = useCallback((log: ConnectionLog) => {
     const tabId = getLogViewTabId(log);
@@ -1080,6 +1160,14 @@ export const useSessionState = ({
     // double-invocation of the functional updater doesn't mint two ids.
     const newSessionId = crypto.randomUUID();
 
+    const groupedSource = sessionsRef.current.find((session) => session.id === sessionId && session.groupId);
+    if (groupedSource?.groupId) {
+      createConsoleInGroup(groupedSource.groupId, sessionId, {
+        localShellType: options?.localShellType,
+        inheritedCwd: options?.inheritedCwd,
+      });
+      return;
+    }
     setSessions(prevSessions => {
       const session = prevSessions.find(s => s.id === sessionId);
       // Source may have been closed between the user's action and this
@@ -1107,7 +1195,7 @@ export const useSessionState = ({
 
       return [...prevSessions, newSession];
     });
-  }, [orphanSessions, workspaces, logViews, setActiveTabId]);
+  }, [createConsoleInGroup, orphanSessions, workspaces, logViews, setActiveTabId]);
 
   // Copy a whole workspace (split/focus tab): clone every pane's session and
   // reproduce the layout tree in a new tab.
@@ -1203,10 +1291,11 @@ export const useSessionState = ({
   }, [broadcastWorkspaceIds]);
 
   const baseWorkTabIds = useMemo(() => [
+    ...groups.map(g => g.id),
     ...orphanSessions.map(s => s.id),
     ...workspaces.map(w => w.id),
     ...logViews.map(lv => lv.id),
-  ], [orphanSessions, workspaces, logViews]);
+  ], [groups, orphanSessions, workspaces, logViews]);
 
   const getOrderedWorkTabs = useCallback((additionalTabIds: readonly string[] = []) => {
     const allTabIds = [...baseWorkTabIds, ...additionalTabIds];
@@ -1283,6 +1372,7 @@ export const useSessionState = ({
 
   return {
     sessions,
+    groups,
     workspaces,
     // activeTabId removed - components should subscribe via useActiveTabId() from activeTabStore
     setActiveTabId,
@@ -1337,6 +1427,9 @@ export const useSessionState = ({
     closeLogView,
     // Copy session
     copySession,
+    createConsoleInGroup,
+    selectConsoleInGroup,
+    closeGroup,
     copyWorkspace,
     createSessionFromCloneSource,
     updateSessionRestoreCwd,

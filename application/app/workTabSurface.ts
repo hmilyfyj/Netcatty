@@ -100,12 +100,14 @@ export function isTerminalContentTabSurface({
   activeTabId,
   sessionIds,
   workspaceIds,
+  groupIds,
 }: {
   activeTabId: string;
   sessionIds: ReadonlySet<string>;
   workspaceIds: ReadonlySet<string>;
+  groupIds?: ReadonlySet<string>;
 }): boolean {
-  return sessionIds.has(activeTabId) || workspaceIds.has(activeTabId);
+  return sessionIds.has(activeTabId) || workspaceIds.has(activeTabId) || Boolean(groupIds?.has(activeTabId));
 }
 
 export function resolveWorkspaceTargetSession(

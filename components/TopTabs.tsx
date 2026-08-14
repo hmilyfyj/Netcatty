@@ -23,7 +23,7 @@ import type { LogView } from '../application/state/logViewState';
 import { useWindowControls } from '../application/state/useWindowControls';
 import { useSettingsChromeStore } from '../application/state/settingsChromeStore';
 import { useI18n } from '../application/i18n/I18nProvider';
-import { Host, TerminalSession, Workspace } from '../types';
+import { Host, TerminalGroup, TerminalSession, Workspace } from '../types';
 import { cn } from '../lib/utils';
 import { Button } from './ui/button';
 import { ContextMenuItem, ContextMenuSeparator } from './ui/context-menu';
@@ -34,6 +34,7 @@ import { TopTabsQuickControls } from './TopTabsQuickControls';
 import {
   ActiveTabAutoScroller,
   EditorTopTab,
+  GroupTopTab,
   LogViewTopTab,
   PluginViewTopTab,
   RootTopTab,
@@ -129,6 +130,9 @@ interface TopTabsProps {
   hosts: Host[];
   sessions: TerminalSession[];
   orphanSessions: TerminalSession[];
+  groups?: TerminalGroup[];
+  onCreateConsoleInGroup?: (groupId: string) => string | null;
+  onCloseGroup?: (groupId: string) => void;
   workspaces: Workspace[];
   logViews: LogView[];
   orderedTabs: string[];
@@ -178,6 +182,9 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   hosts,
   sessions: sessionsProp,
   orphanSessions,
+  groups = [],
+  onCreateConsoleInGroup,
+  onCloseGroup,
   workspaces,
   logViews,
   orderedTabs,
@@ -741,6 +748,8 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
       }
       const pluginViewTab = pluginViewTabMap.get(tabId);
       if (pluginViewTab) return { type: 'pluginView' as const, id: tabId, pluginViewTab };
+      const group = groups.find((item) => item.id === tabId);
+      if (group) return { type: 'group' as const, id: tabId, group };
       const session = orphanSessionMap.get(tabId);
       const workspace = workspaceMap.get(tabId);
       const logView = logViewMap.get(tabId);
@@ -755,7 +764,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
       }
       return null;
     }).filter(Boolean);
-  }, [orderedTabs, editorTabMap, pluginViewTabMap, orphanSessionMap, workspaceMap, logViewMap, workspacePaneCounts]);
+  }, [orderedTabs, editorTabMap, pluginViewTabMap, groups, orphanSessionMap, workspaceMap, logViewMap, workspacePaneCounts]);
 
   // Bulk-close menu items shared by session and workspace context menus.
   // Anchor is the tab the user right-clicked on (matches VSCode/JetBrains UX).
@@ -850,6 +859,39 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
             onTabDragOver={handleTabDragOver}
             onTabDragLeave={handleTabDragLeave}
             onTabDrop={handleTabDrop}
+            tabAnimationClass={getTabAnimationClass(tabId)}
+            shortcutNumber={tabShortcutNumbers?.get(tabId)}
+          />
+        );
+      }
+
+      if (item.type === 'group') {
+        const group = item.group;
+        const tabId = group.id;
+        const activeSession = group.activeSessionId
+          ? sessions.find((session) => session.id === group.activeSessionId)
+          : sessions.find((session) => session.groupId === group.id);
+        return (
+          <GroupTopTab
+            key={tabId}
+            group={group}
+            host={hostMap.get(group.hostId)}
+            sessionCount={group.sessionIds.length}
+            activeSession={activeSession}
+            isBeingDragged={draggingSessionId === tabId}
+            isDraggingForReorder={isDraggingForReorder}
+            shiftStyle={tabShiftStyles[tabId] || emptyTabStyle}
+            showDropIndicatorBefore={dropIndicator?.tabId === tabId && dropIndicator.position === 'before'}
+            showDropIndicatorAfter={dropIndicator?.tabId === tabId && dropIndicator.position === 'after'}
+            onTabDragStart={handleTabDragStart}
+            onTabDragEnd={handleTabDragEnd}
+            onTabDragOver={handleTabDragOver}
+            onTabDragLeave={handleTabDragLeave}
+            onTabDrop={handleTabDrop}
+            onCloseGroup={onCloseGroup ?? (() => undefined)}
+            onCreateConsoleInGroup={(groupId) => { onCreateConsoleInGroup?.(groupId); }}
+            renderBulkCloseItems={renderBulkCloseItems}
+            t={t}
             tabAnimationClass={getTabAnimationClass(tabId)}
             shortcutNumber={tabShortcutNumbers?.get(tabId)}
           />
@@ -1243,6 +1285,9 @@ export const topTabsAreEqual = (prev: TopTabsProps, next: TopTabsProps): boolean
     // via usePresentedSession (per-tab snapshot).
     topTabsSessionsEqual(prev.sessions, next.sessions) &&
     topTabsSessionsEqual(prev.orphanSessions, next.orphanSessions) &&
+    prev.groups === next.groups &&
+    prev.onCreateConsoleInGroup === next.onCreateConsoleInGroup &&
+    prev.onCloseGroup === next.onCloseGroup &&
     prev.workspaces === next.workspaces &&
     prev.orderedTabs === next.orderedTabs &&
     prev.logViews === next.logViews &&

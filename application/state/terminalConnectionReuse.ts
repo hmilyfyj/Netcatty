@@ -18,6 +18,9 @@ type CloneSessionOptions = {
   localShellType?: TerminalSession["shellType"];
   workspaceId?: string;
   inheritedCwd?: string;
+  groupId?: string;
+  groupConsoleIndex?: number;
+  groupTitle?: string;
 };
 
 function getClonedShellType(
@@ -69,6 +72,11 @@ function createTerminalSessionClone(
 
   if (options.workspaceId) {
     clonedSession.workspaceId = options.workspaceId;
+  }
+  if (options.groupId) {
+    clonedSession.groupId = options.groupId;
+    clonedSession.groupConsoleIndex = options.groupConsoleIndex;
+    clonedSession.groupTitle = options.groupTitle;
   }
 
   return clonedSession;
