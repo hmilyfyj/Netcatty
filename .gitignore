@@ -86,6 +86,20 @@
 !types/
 !types/**
 
+# Trellis + supported AI platforms (aligned with biaoju saas-backend-node)
+!.trellis/
+!.trellis/**
+!.agents/
+!.agents/**
+!.claude/
+!.claude/**
+!.codex/
+!.codex/**
+!.pi/
+!.pi/**
+!.trae/
+!.trae/**
+
 # --- Layer 3: classical denylist (applies inside allowlisted trees) ---
 
 # Logs
@@ -129,10 +143,8 @@ coverage
 *.sln
 *.sw?
 
-# Claude Code / Codex / other local agent state
-# (Root agent dirs are also blocked by Layer 1; nested copies stay denied.)
-.claude/
-.codex/
+# Local-only agent state (tracked Trellis platform dirs stay allowlisted above)
+.claude/settings.local.json
 .omo/
 .qoder
 .workbuddy
@@ -140,6 +152,7 @@ coverage
 .serena/
 .superpowers/
 .worktrees/
+.grok/
 
 # AI / Superpowers generated docs (local only)
 /docs/superpowers/
