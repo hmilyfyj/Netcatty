@@ -11,7 +11,6 @@ import type {
   FormEvent,
   HTMLAttributes,
   KeyboardEvent,
-  ReactNode,
 } from 'react';
 import { forwardRef, useCallback, useRef } from 'react';
 import { cn } from '../../lib/utils';
@@ -30,25 +29,38 @@ import { Spinner } from '../ui/spinner';
 
 export interface PromptInputProps extends HTMLAttributes<HTMLFormElement> {
   onSubmit: (text: string, event: FormEvent<HTMLFormElement>) => void | Promise<void>;
+  /** Allow attachments that carry their own prompt context to submit without textarea text. */
+  allowEmptySubmit?: boolean;
+  /** Optional styling for the bordered input group inside the form. */
+  inputGroupClassName?: string;
 }
 
+export const shouldSubmitPromptInput = (text: string, allowEmptySubmit = false): boolean =>
+  Boolean(text.trim()) || allowEmptySubmit;
+
 export const PromptInput = forwardRef<HTMLFormElement, PromptInputProps>(
-  ({ className, onSubmit, children, ...props }, ref) => {
+  ({ className, onSubmit, allowEmptySubmit = false, inputGroupClassName, children, ...props }, ref) => {
     const handleSubmit = useCallback(
       (e: FormEvent<HTMLFormElement>) => {
         e.preventDefault();
         const form = e.currentTarget;
         const textarea = form.querySelector('textarea');
         const text = textarea?.value?.trim() ?? '';
-        if (!text) return;
+        if (!shouldSubmitPromptInput(text, allowEmptySubmit)) return;
         onSubmit(text, e);
       },
-      [onSubmit],
+      [allowEmptySubmit, onSubmit],
     );
 
     return (
-      <form ref={ref} onSubmit={handleSubmit} className={className} {...props}>
-        <InputGroup>{children}</InputGroup>
+      <form
+        ref={ref}
+        onSubmit={handleSubmit}
+        className={className}
+        data-allow-empty-submit={allowEmptySubmit ? 'true' : undefined}
+        {...props}
+      >
+        <InputGroup className={inputGroupClassName}>{children}</InputGroup>
       </form>
     );
   },
@@ -145,37 +157,6 @@ export const PromptInputTools = forwardRef<HTMLDivElement, PromptInputToolsProps
 );
 PromptInputTools.displayName = 'PromptInputTools';
 
-// ---------------------------------------------------------------------------
-// PromptInputButton (toolbar button with optional tooltip)
-// ---------------------------------------------------------------------------
-
-export interface PromptInputButtonProps extends ComponentProps<typeof InputGroupButton> {
-  tooltip?: ReactNode;
-  tooltipSide?: 'top' | 'bottom' | 'left' | 'right';
-}
-
-export const PromptInputButton = forwardRef<HTMLButtonElement, PromptInputButtonProps>(
-  ({ tooltip, tooltipSide = 'top', ...props }, ref) => {
-    const button = <InputGroupButton ref={ref} {...props} />;
-
-    if (!tooltip) return button;
-
-    return (
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>{button}</TooltipTrigger>
-          <TooltipContent side={tooltipSide}>{tooltip}</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
-    );
-  },
-);
-PromptInputButton.displayName = 'PromptInputButton';
-
-// ---------------------------------------------------------------------------
-// PromptInputSubmit
-// ---------------------------------------------------------------------------
-
 export type PromptInputStatus = 'idle' | 'submitted' | 'streaming' | 'error';
 
 export interface PromptInputSubmitProps extends ComponentProps<typeof InputGroupButton> {
@@ -221,6 +202,7 @@ export const PromptInputSubmit = forwardRef<HTMLButtonElement, PromptInputSubmit
               ref={ref}
               type={isRunning ? 'button' : 'submit'}
               onClick={isRunning ? handleClick : undefined}
+              aria-label={tooltipLabel}
               variant="ghost"
               disabled={disabled && !isRunning}
               className={cn(
@@ -244,4 +226,3 @@ export const PromptInputSubmit = forwardRef<HTMLButtonElement, PromptInputSubmit
   },
 );
 PromptInputSubmit.displayName = 'PromptInputSubmit';
-

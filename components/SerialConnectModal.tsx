@@ -7,6 +7,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { useTerminalBackend } from '../application/state/useTerminalBackend';
 import type { Host, SerialConfig, SerialFlowControl, SerialParity } from '../domain/models';
+import { prepareSerialConfigForSavedHost } from '../domain/serialBackspace';
 import { cn } from '../lib/utils';
 import { Button } from './ui/button';
 import { Combobox, type ComboboxOption } from './ui/combobox';
@@ -20,6 +21,7 @@ import {
 } from './ui/dialog';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
 
 interface SerialPort {
@@ -65,6 +67,7 @@ export const SerialConnectModal: React.FC<SerialConnectModalProps> = ({
   const [flowControl, setFlowControl] = useState<SerialFlowControl>('none');
   const [localEcho, setLocalEcho] = useState(false);
   const [lineMode, setLineMode] = useState(false);
+  const [backspaceBehavior, setBackspaceBehavior] = useState<SerialConfig['backspaceBehavior']>('default');
   const [charset, setCharset] = useState('UTF-8');
 
   // Save configuration state
@@ -115,6 +118,7 @@ export const SerialConnectModal: React.FC<SerialConnectModalProps> = ({
       flowControl,
       localEcho,
       lineMode,
+      backspaceBehavior,
     };
 
     // Save as host if checkbox is checked and onSaveHost is provided
@@ -133,7 +137,7 @@ export const SerialConnectModal: React.FC<SerialConnectModalProps> = ({
         protocol: 'serial',
         createdAt: Date.now(),
         charset,
-        serialConfig: config, // Store full serial configuration for connection
+        serialConfig: prepareSerialConfigForSavedHost(config),
       };
       onSaveHost(host);
     }
@@ -262,35 +266,41 @@ export const SerialConnectModal: React.FC<SerialConnectModalProps> = ({
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="data-bits">{t('serial.field.dataBits')}</Label>
-                  <select
-                    id="data-bits"
-                    value={dataBits}
-                    onChange={(e) => setDataBits(parseInt(e.target.value, 10) as 5 | 6 | 7 | 8)}
-                    className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  <Select
+                    value={String(dataBits)}
+                    onValueChange={(v) => setDataBits(parseInt(v, 10) as 5 | 6 | 7 | 8)}
                   >
-                    {DATA_BITS.map((bits) => (
-                      <option key={bits} value={bits}>
-                        {bits}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger id="data-bits">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {DATA_BITS.map((bits) => (
+                        <SelectItem key={bits} value={String(bits)}>
+                          {bits}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
 
                 {/* Stop Bits */}
                 <div className="space-y-2">
                   <Label htmlFor="stop-bits">{t('serial.field.stopBits')}</Label>
-                  <select
-                    id="stop-bits"
-                    value={stopBits}
-                    onChange={(e) => setStopBits(parseFloat(e.target.value) as 1 | 1.5 | 2)}
-                    className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  <Select
+                    value={String(stopBits)}
+                    onValueChange={(v) => setStopBits(parseFloat(v) as 1 | 1.5 | 2)}
                   >
-                    {STOP_BITS.map((bits) => (
-                      <option key={bits} value={bits}>
-                        {bits}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger id="stop-bits">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {STOP_BITS.map((bits) => (
+                        <SelectItem key={bits} value={String(bits)}>
+                          {bits}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                   {isStopBits15 && (
                     <p className="text-xs text-yellow-500">
                       {t('serial.field.stopBits15Warning')}
@@ -302,39 +312,64 @@ export const SerialConnectModal: React.FC<SerialConnectModalProps> = ({
               {/* Parity */}
               <div className="space-y-2">
                 <Label htmlFor="parity">{t('serial.field.parity')}</Label>
-                <select
-                  id="parity"
+                <Select
                   value={parity}
-                  onChange={(e) => setParity(e.target.value as SerialParity)}
-                  className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  onValueChange={(v) => setParity(v as SerialParity)}
                 >
-                  {PARITY_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {t(`serial.parity.${option}`)}
-                    </option>
-                  ))}
-                </select>
+                  <SelectTrigger id="parity">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PARITY_OPTIONS.map((option) => (
+                      <SelectItem key={option} value={option}>
+                        {t(`serial.parity.${option}`)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
 
               {/* Flow Control */}
               <div className="space-y-2">
                 <Label htmlFor="flow-control">{t('serial.field.flowControl')}</Label>
-                <select
-                  id="flow-control"
+                <Select
                   value={flowControl}
-                  onChange={(e) => setFlowControl(e.target.value as SerialFlowControl)}
-                  className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  onValueChange={(v) => setFlowControl(v as SerialFlowControl)}
                 >
-                  {FLOW_CONTROL_OPTIONS.map((option) => (
-                    <option key={option} value={option}>
-                      {t(`serial.flowControl.${option}`)}
-                    </option>
-                  ))}
-                </select>
+                  <SelectTrigger id="flow-control">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {FLOW_CONTROL_OPTIONS.map((option) => (
+                      <SelectItem key={option} value={option}>
+                        {t(`serial.flowControl.${option}`)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
 
               {/* Terminal Options */}
               <div className="space-y-3 pt-2 border-t border-border/60">
+                <div className="space-y-2">
+                  <Label htmlFor="serial-backspace">{t('serial.field.backspaceBehavior')}</Label>
+                  <Select
+                    value={backspaceBehavior}
+                    onValueChange={(value) => setBackspaceBehavior(value === 'ctrl-h' ? 'ctrl-h' : 'default')}
+                  >
+                    <SelectTrigger id="serial-backspace">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="default">{t('serial.backspace.default')}</SelectItem>
+                      <SelectItem value="ctrl-h">{t('serial.backspace.ctrlH')}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    {t('serial.field.backspaceBehaviorDesc')}
+                  </p>
+                </div>
+
                 <div className="flex items-center justify-between">
                   <div className="space-y-0.5">
                     <Label htmlFor="local-echo" className="text-sm font-medium cursor-pointer">

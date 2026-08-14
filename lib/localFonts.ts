@@ -1,4 +1,4 @@
-import { TerminalFont, withCjkFallback } from "../infrastructure/config/fonts"
+import { TerminalFont } from "../infrastructure/config/fonts"
 
 /**
  * Type definition for Local Font Access API
@@ -55,6 +55,8 @@ const KNOWN_MONOSPACE_FONTS = new Set([
     'sarasa mono',
     'maple mono',
     'meslolgs nf',
+    'symbols nerd font mono',
+    'symbols nerd font',
 ]);
 
 /**
@@ -87,43 +89,134 @@ function isMonospaceFont(familyName: string): boolean {
     });
 }
 
+// Cached unfiltered system family list so we don't hit the Local Font
+// Access API more than once per session. Populated as a side effect of
+// queryAllSystemFontsOnce(), which both getMonospaceFonts() and
+// fontAvailability.ts read.
+let allSystemFamiliesCache: Set<string> | null = null;
+let allSystemFamilyNamesCache: string[] | null = null;
+
+// In-flight promise dedup: when fontStore.initialize() runs
+// getMonospaceFonts() and getAllSystemFontFamilies() in parallel, both
+// would otherwise hit queryLocalFonts() before the cache is populated,
+// causing two redundant Local Font Access API calls and potential
+// permission-handling races. Caching the promise itself means
+// concurrent callers await the same single invocation.
+let queryPromise: Promise<LocalFontData[]> | null = null;
+
+/** Clears the cached font query so a user-initiated refresh sees changes. */
+export function clearLocalFontsCache(): void {
+    queryPromise = null;
+    allSystemFamiliesCache = null;
+    allSystemFamilyNamesCache = null;
+}
+
+/** Test alias kept explicit so existing tests communicate their intent. */
+export const __resetLocalFontsCacheForTesting = clearLocalFontsCache;
+
+function queryAllSystemFontsOnce(): Promise<LocalFontData[]> {
+    if (queryPromise) return queryPromise;
+    queryPromise = (async () => {
+        if (typeof window === "undefined" || !("queryLocalFonts" in window)) {
+            return [];
+        }
+        try {
+            const queryLocalFonts = (window as unknown as {
+                queryLocalFonts: () => Promise<LocalFontData[]>;
+            }).queryLocalFonts;
+            const fonts = await queryLocalFonts();
+            // A desktop OS always has fonts. Chromium can still resolve the
+            // API with an empty list when access is temporarily unavailable;
+            // do not treat that as authoritative or cache it for the session.
+            if (fonts.length === 0) {
+                queryPromise = null;
+                return [];
+            }
+            const familyNamesByLower = new Map<string, string>();
+            for (const font of fonts) {
+                const family = font.family.trim();
+                if (!family) continue;
+                const normalized = family.toLowerCase();
+                if (!familyNamesByLower.has(normalized)) {
+                    familyNamesByLower.set(normalized, family);
+                }
+            }
+            allSystemFamilyNamesCache = [...familyNamesByLower.values()].sort((a, b) =>
+                a.localeCompare(b, undefined, { sensitivity: 'base' }),
+            );
+            allSystemFamiliesCache = new Set(familyNamesByLower.keys());
+            return fonts;
+        } catch (error) {
+            // Don't sticky-cache a transient failure (e.g. LFA permission
+            // not ready yet at app boot, AbortError, etc.). Clearing the
+            // module-level promise lets the very next caller retry the
+            // API. Successful calls keep their cached promise as before,
+            // so this only retries when something actually went wrong.
+            console.warn('Failed to query local fonts:', error);
+            queryPromise = null;
+            return [];
+        }
+    })();
+    return queryPromise;
+}
+
+/**
+ * Returns the case-insensitive set of every font family installed on the
+ * system, as reported by the Local Font Access API. Used by
+ * fontAvailability.ts to decide which built-in font choices to show in
+ * the dropdown.
+ *
+ * Returns null when the API is unavailable or permission has been
+ * denied — callers should treat that as "no authoritative data" and
+ * fall back to canvas-width detection.
+ */
+export async function getAllSystemFontFamilies(): Promise<Set<string> | null> {
+    if (allSystemFamiliesCache) return allSystemFamiliesCache;
+    await queryAllSystemFontsOnce();
+    return allSystemFamiliesCache;
+}
+
+/**
+ * Returns installed font family names with display casing preserved.
+ * Families are trimmed, deduplicated case-insensitively, and sorted for
+ * stable searchable pickers.
+ */
+export async function getAllSystemFontFamilyNames(): Promise<string[] | null> {
+    if (allSystemFamilyNamesCache) return allSystemFamilyNamesCache;
+    await queryAllSystemFontsOnce();
+    return allSystemFamilyNamesCache;
+}
+
 /**
  * Queries local monospace fonts from the system using the Font Access API.
  * Returns an empty array if the API is not available or permission is denied.
  */
 export async function getMonospaceFonts(): Promise<TerminalFont[]> {
-    // Check if the Font Access API is available
-    if (typeof window === "undefined" || !("queryLocalFonts" in window)) {
-        return [];
-    }
+    const fonts = await queryAllSystemFontsOnce();
+    if (fonts.length === 0) return [];
 
-    try {
-        const queryLocalFonts = (window as unknown as { queryLocalFonts: () => Promise<LocalFontData[]> }).queryLocalFonts;
-        const fonts = await queryLocalFonts();
+    // Filter monospace fonts using robust word boundary matching
+    const monoFonts = fonts.filter(f => isMonospaceFont(f.family));
 
-        // Filter monospace fonts using robust word boundary matching
-        const monoFonts = fonts.filter(f => isMonospaceFont(f.family));
+    // Deduplicate by family name, case-insensitive (API may return multiple entries per family)
+    const uniqueFamilies = new Set<string>();
+    const dedupedFonts = monoFonts.filter(f => {
+        const key = f.family.toLowerCase();
+        if (uniqueFamilies.has(key)) return false;
+        uniqueFamilies.add(key);
+        return true;
+    });
 
-        // Deduplicate by family name, case-insensitive (API may return multiple entries per family)
-        const uniqueFamilies = new Set<string>();
-        const dedupedFonts = monoFonts.filter(f => {
-            const key = f.family.toLowerCase();
-            if (uniqueFamilies.has(key)) return false;
-            uniqueFamilies.add(key);
-            return true;
-        });
-
-        // Map to TerminalFont structure with CJK fallback applied
-        return dedupedFonts.map(f => ({
+    // Raw Latin family only; CJK fallback is composed at runtime by
+    // composeFontFamilyStack() in cjkFonts.ts.
+    return dedupedFonts.map(f => {
+        const quoted = /\s/.test(f.family) ? `"${f.family}"` : f.family;
+        return {
             id: f.family,
             name: f.family,
-            family: withCjkFallback(f.family + ', monospace'),
+            family: `${quoted}, monospace`,
             description: `Local font: ${f.family}`,
             category: 'monospace' as const,
-        }));
-    } catch (error) {
-        // Handle permission denied or other errors gracefully
-        console.warn('Failed to query local fonts:', error);
-        return [];
-    }
+        };
+    });
 }

@@ -1,32 +1,87 @@
 const { ipcRenderer, contextBridge, webUtils } = require("electron");
 const os = require("node:os");
+const { randomUUID } = require("node:crypto");
+const { SessionTombstones } = require("./preload/sessionTombstones.cjs");
+const { createPreloadApi } = require("./preload/api.cjs");
+const {
+  clearTerminalDataBacklog,
+  clearTerminalDataSession,
+  createTerminalDataBacklog,
+  createTerminalDataDispatcher,
+  hasPluginPipelineIngress,
+  hasPluginPipelineIngressMarker,
+} = require("./preload/terminalDataBacklog.cjs");
+const {
+  createTerminalOutputPortRegistry,
+} = require("./preload/terminalOutputPorts.cjs");
+const {
+  createTerminalUrgentInputPortRegistry,
+} = require("./preload/terminalUrgentInputPorts.cjs");
+const {
+  mergeTerminalDataMeta,
+} = require("./preload/terminalDataMeta.cjs");
 
 const dataListeners = new Map();
+const displayDataListeners = new Map();
+const terminalDataBacklog = createTerminalDataBacklog();
+const closedTerminalDataSessions = new SessionTombstones();
 const exitListeners = new Map();
-const transferProgressListeners = new Map();
-const transferCompleteListeners = new Map();
-const transferErrorListeners = new Map();
-const transferCancelledListeners = new Map();
+const globalSftpTransferListeners = new Set();
+const pluginContributionsChangedListeners = new Set();
 const chainProgressListeners = new Map();
+const connectionReuseFallbackListeners = new Set();
 const zmodemListeners = new Map();
+const zmodemOverwriteListeners = new Map(); // sessionId -> Set<cb>
 const sftpConnectionProgressListeners = new Set();
 const authFailedListeners = new Map();
+const telnetAutoLoginCompleteListeners = new Map();
+const telnetAutoLoginCancelledListeners = new Map();
+const telnetEchoModeListeners = new Map();
+const moshSessionReadyListeners = new Map();
 const languageChangeListeners = new Set();
 const fullscreenChangeListeners = new Set();
+const windowShownListeners = new Set();
+const windowFocusRequestedListeners = new Set();
+const windowWillHideListeners = new Set();
 const keyboardInteractiveListeners = new Set();
+const keyboardInteractiveCancelledListeners = new Set();
+const hostKeyVerificationListeners = new Set();
 const passphraseListeners = new Set();
 const passphraseTimeoutListeners = new Set();
+const passphraseCancelledListeners = new Set();
+const passphraseAuthFailedListeners = new Set();
 const updateDownloadProgressListeners = new Set();
 const updateDownloadedListeners = new Set();
 const updateAvailableListeners = new Set();
 const updateNotAvailableListeners = new Set();
 const updateErrorListeners = new Set();
+const updateNeedsSaveListeners = new Set();
+const terminalPopupConfigState = {
+  pending: null,
+  // Keep the last delivered payload so StrictMode remount (unsubscribe →
+  // resubscribe) can replay config after the one-shot pending slot was drained.
+  lastPayload: null,
+  listeners: new Set(),
+};
 
-function cleanupTransferListeners(transferId) {
-  transferProgressListeners.delete(transferId);
-  transferCompleteListeners.delete(transferId);
-  transferErrorListeners.delete(transferId);
-  transferCancelledListeners.delete(transferId);
+function dispatchGlobalSftpTransferEvent(payload) {
+  for (const cb of globalSftpTransferListeners) {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Global SFTP transfer callback failed", err);
+    }
+  }
+}
+
+function dispatchPluginContributionsChanged(payload) {
+  for (const cb of pluginContributionsChangedListeners) {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Plugin contributions callback failed", err);
+    }
+  }
 }
 
 // ── MCP marker filter with per-session line buffering ──
@@ -36,7 +91,22 @@ function cleanupTransferListeners(transferId) {
 // chunk, then filter complete lines that contain the marker.
 
 const _mcpLineBufs = new Map(); // sessionId -> trailing fragment string
+const _mcpLineMetas = new Map(); // sessionId -> trailing fragment metadata
+const _mcpPendingMetas = new Map(); // sessionId -> metadata from filtered-empty chunks
 const _mcpFlushTimers = new Map(); // sessionId -> delayed-flush timer
+const _mcpDroppingWrappedLine = new Set(); // sessionIds with a split marker echo line in progress
+const MAX_MCP_BUFFERED_LINE_CHARS = 64 * 1024;
+
+function clearMcpSessionState(sessionId) {
+  if (!sessionId) return;
+  const pendingTimer = _mcpFlushTimers.get(sessionId);
+  if (pendingTimer) clearTimeout(pendingTimer);
+  _mcpFlushTimers.delete(sessionId);
+  _mcpLineBufs.delete(sessionId);
+  _mcpLineMetas.delete(sessionId);
+  _mcpPendingMetas.delete(sessionId);
+  _mcpDroppingWrappedLine.delete(sessionId);
+}
 
 // Returns true if `s` ends with a non-empty prefix of "__NCMCP_"
 // (i.e. the next chunk might complete it into a marker-containing line).
@@ -48,7 +118,7 @@ function _endsWithMarkerPrefix(s) {
   return false;
 }
 
-function filterMcpChunk(sessionId, chunk) {
+function filterMcpChunk(sessionId, chunk, meta) {
   // Cancel any pending delayed flush — new data arrived
   const pendingTimer = _mcpFlushTimers.get(sessionId);
   if (pendingTimer) {
@@ -58,17 +128,37 @@ function filterMcpChunk(sessionId, chunk) {
 
   // Prepend any buffered fragment from the previous chunk
   const held = _mcpLineBufs.get(sessionId) || "";
+  const heldMeta = _mcpLineMetas.get(sessionId);
+  const heldIngressAlreadyAcknowledged = heldMeta?.pluginPipelineIngressBytes === 0;
+  const pendingMeta = _mcpPendingMetas.get(sessionId);
+  const stateMeta = mergeTerminalDataMeta(mergeTerminalDataMeta(pendingMeta, heldMeta), meta);
+  const sameChunkMeta = mergeTerminalDataMeta(mergeTerminalDataMeta(pendingMeta, heldMeta), meta, {
+    preserveTerminalPerf: true,
+  });
   const data = held + chunk;
   _mcpLineBufs.delete(sessionId);
+  _mcpLineMetas.delete(sessionId);
+  _mcpPendingMetas.delete(sessionId);
 
   // Fast path: nothing suspicious in the combined data
-  if (!data.includes("__NCMCP_") && !_endsWithMarkerPrefix(data)) {
-    return data;
+  if (!_mcpDroppingWrappedLine.has(sessionId) && !data.includes("__NCMCP_") && !_endsWithMarkerPrefix(data)) {
+    const deliveryMeta = held ? stateMeta : sameChunkMeta;
+    return {
+      data,
+      meta: heldIngressAlreadyAcknowledged
+        ? {
+            ...(deliveryMeta || {}),
+            pluginPipelineIngressBytes: Number.isFinite(meta?.pluginPipelineIngressBytes)
+              ? Math.max(0, Number(meta.pluginPipelineIngressBytes))
+              : chunk.length,
+          }
+        : deliveryMeta,
+    };
   }
 
   // Slow path: scan line by line
   let result = "";
-  let droppedAny = false;
+  let droppedAny = _mcpDroppingWrappedLine.has(sessionId);
   let pos = 0;
   while (pos < data.length) {
     const nlIdx = data.indexOf("\n", pos);
@@ -80,91 +170,234 @@ function filterMcpChunk(sessionId, chunk) {
       // contain __NCMCP_ would otherwise leak through as garbage.
       const tail = data.slice(pos);
       if (droppedAny || tail.includes("__NCMCP_") || _endsWithMarkerPrefix(tail)) {
-        _mcpLineBufs.set(sessionId, tail);
+        let tailMeta = !held && tail === chunk ? sameChunkMeta : stateMeta;
+        if (heldIngressAlreadyAcknowledged && !hasPluginPipelineIngress(tailMeta)) {
+          tailMeta = { ...(tailMeta || {}), pluginPipelineIngressBytes: 0 };
+        }
+        if (tail.length <= MAX_MCP_BUFFERED_LINE_CHARS) {
+          _mcpLineBufs.set(sessionId, tail);
+          if (tailMeta) _mcpLineMetas.set(sessionId, tailMeta);
+        } else {
+          // A malformed/wrapped marker line can otherwise grow forever while
+          // high-rate output keeps postponing the delayed flush. Its visible
+          // content is already being suppressed, so discard the oversized
+          // prefix and retain only the drop-until-newline state.
+          _mcpLineBufs.delete(sessionId);
+          _mcpLineMetas.delete(sessionId);
+          _mcpDroppingWrappedLine.add(sessionId);
+        }
+        if (droppedAny) _mcpDroppingWrappedLine.add(sessionId);
       } else {
         result += tail; // safe to display immediately
       }
       break;
     }
     const line = data.slice(pos, nlIdx + 1); // includes the \n
-    if (!line.includes("__NCMCP_")) {
-      result += line;
+    if (droppedAny || line.includes("__NCMCP_")) {
+      droppedAny = false;
+      _mcpDroppingWrappedLine.delete(sessionId);
     } else {
-      droppedAny = true;
+      result += line;
     }
     pos = nlIdx + 1;
   }
 
-  return result;
+  const deliveryMeta = !held && result === chunk ? sameChunkMeta : stateMeta;
+  return {
+    data: result,
+    meta: heldIngressAlreadyAcknowledged
+      ? {
+          ...(deliveryMeta || {}),
+          pluginPipelineIngressBytes: Number.isFinite(meta?.pluginPipelineIngressBytes)
+            ? Math.max(0, Number(meta.pluginPipelineIngressBytes))
+            : chunk.length,
+        }
+      : deliveryMeta,
+  };
+}
+
+function consumeBufferedMcpIngress(sessionId) {
+  const heldMeta = _mcpLineMetas.get(sessionId);
+  if (!hasPluginPipelineIngress(heldMeta)) return;
+  // Retain an explicit zero so a later safe flush does not fall back to the
+  // visible chunk length and acknowledge the already-credited prefix twice.
+  _mcpLineMetas.set(sessionId, { ...heldMeta, pluginPipelineIngressBytes: 0 });
 }
 
 /**
  * Deliver data to session listeners.  Used both by the normal data path
  * and by the delayed-flush timer.
  */
-function _deliverToListeners(sessionId, data) {
-  const set = dataListeners.get(sessionId);
-  if (!set || !data) return;
-  set.forEach((cb) => {
-    try { cb(data); } catch (err) { console.error("Data callback failed", err); }
-  });
+const _deliverToListeners = createTerminalDataDispatcher({
+  dataListeners,
+  displayDataListeners,
+  terminalDataBacklog,
+  shouldDropSession: (sessionId) => closedTerminalDataSessions.has(sessionId),
+});
+
+function flushMcpBufferedOutput(sessionId) {
+    const timer = _mcpFlushTimers.get(sessionId);
+    if (timer) clearTimeout(timer);
+    const held = _mcpLineBufs.get(sessionId);
+    const heldMeta = _mcpLineMetas.get(sessionId);
+    _mcpLineBufs.delete(sessionId);
+    _mcpLineMetas.delete(sessionId);
+    _mcpFlushTimers.delete(sessionId);
+    if (_mcpDroppingWrappedLine.has(sessionId)) {
+      _mcpDroppingWrappedLine.delete(sessionId);
+      if (heldMeta) _mcpPendingMetas.set(sessionId, mergeTerminalDataMeta(_mcpPendingMetas.get(sessionId), heldMeta));
+      return;
+    }
+    if (held) {
+      let deliveryMeta = mergeTerminalDataMeta(_mcpPendingMetas.get(sessionId), heldMeta, {
+        preserveTerminalPerf: true,
+      });
+      if (heldMeta?.pluginPipelineIngressBytes === 0 && !hasPluginPipelineIngress(deliveryMeta)) {
+        deliveryMeta = { ...(deliveryMeta || {}), pluginPipelineIngressBytes: 0 };
+      }
+      _deliverToListeners(sessionId, held, deliveryMeta);
+      _mcpPendingMetas.delete(sessionId);
+    }
 }
 
-// ZMODEM file transfer events
+function scheduleMcpBufferedFlush(sessionId) {
+  if (!_mcpLineBufs.has(sessionId)) return;
+  _mcpFlushTimers.set(sessionId, setTimeout(() => flushMcpBufferedOutput(sessionId), 80));
+}
+
+function deliverTerminalData(sessionId, data, options = {}) {
+  if (!sessionId || (!data && !hasPluginPipelineIngressMarker(options.meta))) return;
+  if (closedTerminalDataSessions.has(sessionId)) return;
+  if (!data) {
+    _deliverToListeners(sessionId, "", options.meta);
+    return;
+  }
+  if (options.syntheticEcho) {
+    _deliverToListeners(sessionId, data, options.meta);
+    return;
+  }
+  const filtered = filterMcpChunk(sessionId, data, options.meta);
+  if (filtered?.data) {
+    _deliverToListeners(sessionId, filtered.data, filtered.meta);
+    if (hasPluginPipelineIngress(filtered.meta)) consumeBufferedMcpIngress(sessionId);
+  } else if (filtered?.meta) {
+    if (hasPluginPipelineIngress(filtered.meta)) {
+      // The legacy path must return flow credit even when MCP marker filtering
+      // removes every display byte. Waiting for unrelated visible output can
+      // otherwise leave a fully suppressed stream paused indefinitely.
+      _deliverToListeners(sessionId, "", filtered.meta);
+      consumeBufferedMcpIngress(sessionId);
+    } else {
+      _mcpPendingMetas.set(sessionId, mergeTerminalDataMeta(_mcpPendingMetas.get(sessionId), filtered.meta));
+    }
+  }
+  // If there is buffered content waiting for more data (e.g. a prompt
+  // right after a dropped marker line), schedule a delayed flush so it
+  // appears after a short pause instead of staying hidden forever.
+  scheduleMcpBufferedFlush(sessionId);
+}
+
+const terminalOutputDrainListeners = new Map();
+const terminalOutputPorts = createTerminalOutputPortRegistry({
+  ipcRenderer,
+  deliverToListeners: _deliverToListeners,
+  filterData(sessionId, data, message) {
+    if (message?.syntheticEcho) return data;
+    const filtered = filterMcpChunk(sessionId, data, message.meta);
+    // Metadata-only plugin output is delivered immediately by the output-port
+    // registry so renderer flow credit can be returned. Do not retain the same
+    // ingress metadata for the next visible chunk or it would be acknowledged
+    // twice. Non-ingress terminal-state metadata still follows the next output.
+    if (hasPluginPipelineIngress(filtered?.meta)) {
+      consumeBufferedMcpIngress(sessionId);
+    } else if (!filtered?.data && filtered?.meta) {
+      _mcpPendingMetas.set(sessionId, mergeTerminalDataMeta(_mcpPendingMetas.get(sessionId), filtered.meta));
+    }
+    scheduleMcpBufferedFlush(sessionId);
+    return filtered;
+  },
+  closedTerminalDataSessions,
+  onDrain(sessionId, requestId) {
+    flushMcpBufferedOutput(sessionId);
+    for (const listener of terminalOutputDrainListeners.get(sessionId) || []) {
+      try { listener({ sessionId, requestId }); } catch (err) { console.error("Terminal drain callback failed", err); }
+    }
+  },
+});
+terminalOutputPorts.register();
+
+const terminalUrgentInputPorts = createTerminalUrgentInputPortRegistry({
+  ipcRenderer,
+});
+terminalUrgentInputPorts.register();
+
+// ZMODEM file transfer events. Listener sets are owned by renderer subscribers
+// (disposed on unmount); delivery is gated by closedTerminalDataSessions so
+// events stop after exit/close and resume automatically when a session
+// restarts with the same id.
 ipcRenderer.on("netcatty:zmodem:detect", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
   if (!set) return;
   set.forEach((cb) => { try { cb({ type: "detect", ...payload }); } catch {} });
 });
+
+ipcRenderer.on("netcatty:window:terminalPopupConfig", (_event, payload) => {
+  terminalPopupConfigState.lastPayload = payload;
+  if (terminalPopupConfigState.listeners.size === 0) {
+    terminalPopupConfigState.pending = payload;
+    return;
+  }
+  terminalPopupConfigState.pending = null;
+  terminalPopupConfigState.listeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Terminal popup config callback failed", err);
+    }
+  });
+});
 ipcRenderer.on("netcatty:zmodem:progress", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
   if (!set) return;
   set.forEach((cb) => { try { cb({ type: "progress", ...payload }); } catch {} });
 });
 ipcRenderer.on("netcatty:zmodem:complete", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
   if (!set) return;
   set.forEach((cb) => { try { cb({ type: "complete", ...payload }); } catch {} });
 });
 ipcRenderer.on("netcatty:zmodem:error", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
   const set = zmodemListeners.get(payload.sessionId);
   if (!set) return;
   set.forEach((cb) => { try { cb({ type: "error", ...payload }); } catch {} });
 });
-
-ipcRenderer.on("netcatty:data", (_event, payload) => {
-  const set = dataListeners.get(payload.sessionId);
-  if (!set) return;
-  if (payload?.syntheticEcho) {
-    _deliverToListeners(payload.sessionId, payload.data);
-    return;
-  }
-  const data = filterMcpChunk(payload.sessionId, payload.data);
-  if (data) {
-    set.forEach((cb) => {
-      try {
-        cb(data);
-      } catch (err) {
-        console.error("Data callback failed", err);
-      }
-    });
-  }
-  // If there is buffered content waiting for more data (e.g. a prompt
-  // right after a dropped marker line), schedule a delayed flush so it
-  // appears after a short pause instead of staying hidden forever.
-  if (_mcpLineBufs.has(payload.sessionId)) {
-    const sid = payload.sessionId;
-    _mcpFlushTimers.set(sid, setTimeout(() => {
-      const held = _mcpLineBufs.get(sid);
-      _mcpLineBufs.delete(sid);
-      _mcpFlushTimers.delete(sid);
-      if (held) _deliverToListeners(sid, held);
-    }, 80));
-  }
+ipcRenderer.on("netcatty:zmodem:overwrite-request", (_event, payload) => {
+  if (closedTerminalDataSessions.has(payload.sessionId)) return;
+  const set = zmodemOverwriteListeners.get(payload.sessionId);
+  if (set) set.forEach((cb) => cb(payload));
 });
 
+ipcRenderer.on("netcatty:data", (_event, payload) => {
+  deliverTerminalData(payload?.sessionId, payload?.data, {
+    syntheticEcho: payload?.syntheticEcho,
+    meta: payload?.meta,
+  });
+});
+
+// ZMODEM listener sets deliberately survive exit: they are owned by renderer
+// subscribers and disposed on unmount. Delivery is gated by
+// closedTerminalDataSessions (see zmodem handlers above), so events stop after
+// exit/close and resume when a session restarts with the same id.
 ipcRenderer.on("netcatty:exit", (_event, payload) => {
-  const set = exitListeners.get(payload.sessionId);
+  const sessionId = payload?.sessionId;
+  if (!sessionId) return;
+  const wasClosed = closedTerminalDataSessions.has(sessionId);
+  closedTerminalDataSessions.add(sessionId);
+  const set = wasClosed ? null : exitListeners.get(sessionId);
   if (set) {
     set.forEach((cb) => {
       try {
@@ -174,15 +407,14 @@ ipcRenderer.on("netcatty:exit", (_event, payload) => {
       }
     });
   }
-  dataListeners.delete(payload.sessionId);
-  exitListeners.delete(payload.sessionId);
-  zmodemListeners.delete(payload.sessionId);
-  const pendingTimer = _mcpFlushTimers.get(payload.sessionId);
-  if (pendingTimer) {
-    clearTimeout(pendingTimer);
-    _mcpFlushTimers.delete(payload.sessionId);
-  }
-  _mcpLineBufs.delete(payload.sessionId); // clean up any held fragment
+  clearTerminalDataBacklog({ terminalDataBacklog }, sessionId);
+  terminalOutputPorts.closeSession(sessionId);
+  telnetAutoLoginCompleteListeners.delete(sessionId);
+  telnetAutoLoginCancelledListeners.delete(sessionId);
+  telnetEchoModeListeners.delete(sessionId);
+  moshSessionReadyListeners.delete(sessionId);
+  authFailedListeners.delete(sessionId);
+  clearMcpSessionState(sessionId);
 });
 
 // Chain progress events (for jump host connections)
@@ -194,6 +426,16 @@ ipcRenderer.on("netcatty:chain:progress", (_event, payload) => {
       cb(sessionId, hop, total, label, status, error);
     } catch (err) {
       console.error("Chain progress callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:connection-reuse:fallback", (_event, payload) => {
+  connectionReuseFallbackListeners.forEach((cb) => {
+    try {
+      cb(payload.sessionId, payload.sourceSessionId);
+    } catch (err) {
+      console.error("Connection reuse fallback callback failed", err);
     }
   });
 });
@@ -229,6 +471,36 @@ ipcRenderer.on("netcatty:window:fullscreen-changed", (_event, isFullscreen) => {
   });
 });
 
+ipcRenderer.on("netcatty:window:shown", () => {
+  windowShownListeners.forEach((cb) => {
+    try {
+      cb();
+    } catch (err) {
+      console.error("Window shown callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:window:focus-requested", () => {
+  windowFocusRequestedListeners.forEach((cb) => {
+    try {
+      cb();
+    } catch (err) {
+      console.error("Window focus-requested callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:window:will-hide", () => {
+  windowWillHideListeners.forEach((cb) => {
+    try {
+      cb();
+    } catch (err) {
+      console.error("Window will-hide callback failed", err);
+    }
+  });
+});
+
 
 
 // Authentication failed events
@@ -245,6 +517,54 @@ ipcRenderer.on("netcatty:auth:failed", (_event, payload) => {
   }
 });
 
+ipcRenderer.on("netcatty:telnet:auto-login-complete", (_event, payload) => {
+  const set = telnetAutoLoginCompleteListeners.get(payload.sessionId);
+  if (!set) return;
+  set.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Telnet auto-login callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:telnet:auto-login-cancelled", (_event, payload) => {
+  const set = telnetAutoLoginCancelledListeners.get(payload.sessionId);
+  if (!set) return;
+  set.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Telnet auto-login cancellation callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:mosh:ready", (_event, payload) => {
+  const set = moshSessionReadyListeners.get(payload.sessionId);
+  if (!set) return;
+  set.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Mosh session ready callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:telnet:echo-mode", (_event, payload) => {
+  const set = telnetEchoModeListeners.get(payload.sessionId);
+  if (!set) return;
+  set.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Telnet echo mode callback failed", err);
+    }
+  });
+});
+
 // Keyboard-interactive authentication events (2FA/MFA)
 ipcRenderer.on("netcatty:keyboard-interactive", (_event, payload) => {
   keyboardInteractiveListeners.forEach((cb) => {
@@ -252,6 +572,26 @@ ipcRenderer.on("netcatty:keyboard-interactive", (_event, payload) => {
       cb(payload);
     } catch (err) {
       console.error("Keyboard-interactive callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:keyboard-interactive-cancelled", (_event, payload) => {
+  keyboardInteractiveCancelledListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Keyboard-interactive cancellation callback failed", err);
+    }
+  });
+});
+
+ipcRenderer.on("netcatty:host-key:verify", (_event, payload) => {
+  hostKeyVerificationListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Host key verification callback failed", err);
     }
   });
 });
@@ -274,6 +614,28 @@ ipcRenderer.on("netcatty:passphrase-timeout", (_event, payload) => {
       cb(payload);
     } catch (err) {
       console.error("Passphrase timeout callback failed", err);
+    }
+  });
+});
+
+// Passphrase cancelled events (request ended because the owning operation stopped)
+ipcRenderer.on("netcatty:passphrase-cancelled", (_event, payload) => {
+  passphraseCancelledListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Passphrase cancelled callback failed", err);
+    }
+  });
+});
+
+// Passphrase auth failed events (saved passphrase was wrong)
+ipcRenderer.on("netcatty:passphrase-auth-failed", (_event, payload) => {
+  passphraseAuthFailedListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Passphrase auth-failed callback failed", err);
     }
   });
 });
@@ -329,152 +691,28 @@ ipcRenderer.on("netcatty:update:error", (_event, payload) => {
   });
 });
 
-// Transfer progress events
-ipcRenderer.on("netcatty:transfer:progress", (_event, payload) => {
-  const cb = transferProgressListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb(payload.transferred, payload.totalBytes, payload.speed);
-    } catch (err) {
-      console.error("Transfer progress callback failed", err);
-    }
-  }
-});
-
-ipcRenderer.on("netcatty:transfer:complete", (_event, payload) => {
-  const cb = transferCompleteListeners.get(payload.transferId);
-  if (cb) {
+// Update can't install yet because there are unsaved editors (#1215).
+ipcRenderer.on("netcatty:update:needs-save", () => {
+  updateNeedsSaveListeners.forEach((cb) => {
     try {
       cb();
     } catch (err) {
-      console.error("Transfer complete callback failed", err);
+      console.error("Update needs-save callback failed", err);
     }
-  }
-  cleanupTransferListeners(payload.transferId);
+  });
 });
 
-ipcRenderer.on("netcatty:transfer:error", (_event, payload) => {
-  const cb = transferErrorListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb(payload.error);
-    } catch (err) {
-      console.error("Transfer error callback failed", err);
-    }
-  }
-  cleanupTransferListeners(payload.transferId);
+ipcRenderer.on("netcatty:sftp:global-transfer", (_event, payload) => {
+  dispatchGlobalSftpTransferEvent(payload);
 });
 
-ipcRenderer.on("netcatty:transfer:cancelled", (_event, payload) => {
-  const cb = transferCancelledListeners.get(payload.transferId);
-  if (cb) {
-    try { cb(); } catch { }
-  }
-  cleanupTransferListeners(payload.transferId);
-});
-
-// Upload with progress listeners
-const uploadProgressListeners = new Map();
-const uploadCompleteListeners = new Map();
-const uploadErrorListeners = new Map();
-
-// Compress upload listeners
-const compressProgressListeners = new Map();
-const compressCompleteListeners = new Map();
-const compressErrorListeners = new Map();
-
-ipcRenderer.on("netcatty:upload:progress", (_event, payload) => {
-  const cb = uploadProgressListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb(payload.transferred, payload.totalBytes, payload.speed);
-    } catch (err) {
-      console.error("Upload progress callback failed", err);
-    }
-  }
-});
-
-ipcRenderer.on("netcatty:upload:complete", (_event, payload) => {
-  const cb = uploadCompleteListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb();
-    } catch (err) {
-      console.error("Upload complete callback failed", err);
-    }
-  }
-  // Cleanup listeners
-  uploadProgressListeners.delete(payload.transferId);
-  uploadCompleteListeners.delete(payload.transferId);
-  uploadErrorListeners.delete(payload.transferId);
-});
-
-ipcRenderer.on("netcatty:upload:error", (_event, payload) => {
-  const cb = uploadErrorListeners.get(payload.transferId);
-  if (cb) {
-    try {
-      cb(payload.error);
-    } catch (err) {
-      console.error("Upload error callback failed", err);
-    }
-  }
-  // Cleanup listeners
-  uploadProgressListeners.delete(payload.transferId);
-  uploadCompleteListeners.delete(payload.transferId);
-  uploadErrorListeners.delete(payload.transferId);
-});
-
-// Compress upload events
-ipcRenderer.on("netcatty:compress:progress", (_event, payload) => {
-  const cb = compressProgressListeners.get(payload.compressionId);
-  if (cb) {
-    try {
-      cb(payload.phase, payload.transferred, payload.total);
-    } catch (err) {
-      console.error("Compress progress callback failed", err);
-    }
-  }
-});
-
-ipcRenderer.on("netcatty:compress:complete", (_event, payload) => {
-  const cb = compressCompleteListeners.get(payload.compressionId);
-  if (cb) {
-    try {
-      cb();
-    } catch (err) {
-      console.error("Compress complete callback failed", err);
-    }
-  }
-  // Cleanup listeners
-  compressProgressListeners.delete(payload.compressionId);
-  compressCompleteListeners.delete(payload.compressionId);
-  compressErrorListeners.delete(payload.compressionId);
-});
-
-ipcRenderer.on("netcatty:compress:error", (_event, payload) => {
-  const cb = compressErrorListeners.get(payload.compressionId);
-  if (cb) {
-    try {
-      cb(payload.error);
-    } catch (err) {
-      console.error("Compress error callback failed", err);
-    }
-  }
-  // Cleanup listeners
-  compressProgressListeners.delete(payload.compressionId);
-  compressCompleteListeners.delete(payload.compressionId);
-  compressErrorListeners.delete(payload.compressionId);
-});
-
-ipcRenderer.on("netcatty:compress:cancelled", (_event, payload) => {
-  // Just cleanup listeners, the UI already knows it's cancelled
-  compressProgressListeners.delete(payload.compressionId);
-  compressCompleteListeners.delete(payload.compressionId);
-  compressErrorListeners.delete(payload.compressionId);
+ipcRenderer.on("netcatty:plugins:contributions-changed", (_event, payload) => {
+  dispatchPluginContributionsChanged(payload);
 });
 
 // Port forwarding status listeners
 const portForwardStatusListeners = new Map();
+const portForwardRuntimeListeners = new Set();
 
 ipcRenderer.on("netcatty:portforward:status", (_event, payload) => {
   const { tunnelId, status, error } = payload;
@@ -490,9 +728,20 @@ ipcRenderer.on("netcatty:portforward:status", (_event, payload) => {
   }
 });
 
+ipcRenderer.on("netcatty:portforward:runtime", (_event, payload) => {
+  portForwardRuntimeListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Port forward runtime callback failed", err);
+    }
+  });
+});
+
 // File watcher listeners (for auto-sync feature)
 const fileWatchSyncedListeners = new Set();
 const fileWatchErrorListeners = new Set();
+const fileWatchStoppedListeners = new Set();
 
 ipcRenderer.on("netcatty:filewatch:synced", (_event, payload) => {
   fileWatchSyncedListeners.forEach((cb) => {
@@ -514,6 +763,16 @@ ipcRenderer.on("netcatty:filewatch:error", (_event, payload) => {
   });
 });
 
+ipcRenderer.on("netcatty:filewatch:stopped", (_event, payload) => {
+  fileWatchStoppedListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("File watch stopped callback failed", err);
+    }
+  });
+});
+
 // Buffer the latest tray menu data so it can be replayed when the React
 // component subscribes after lazy-mount (avoiding the first-open race).
 let _lastTrayMenuData = null;
@@ -521,913 +780,59 @@ ipcRenderer.on("netcatty:trayPanel:setMenuData", (_event, data) => {
   _lastTrayMenuData = data;
 });
 
-const api = {
-  getWindowsPtyInfo: () => {
-    if (process.platform !== "win32") {
-      return null;
-    }
-
-    const releaseParts = os.release().split(".");
-    const buildNumber = Number.parseInt(releaseParts[2] || "", 10);
-    const hasBuildNumber = Number.isFinite(buildNumber);
-    const backend =
-      hasBuildNumber && buildNumber < 18309 ? "winpty" : "conpty";
-
-    return hasBuildNumber ? { backend, buildNumber } : { backend };
-  },
-  startSSHSession: async (options) => {
-    const result = await ipcRenderer.invoke("netcatty:start", options);
-    return result.sessionId;
-  },
-  startSSHTransport: async (options) => {
-    return ipcRenderer.invoke("netcatty:ssh:transport:start", options);
-  },
-  openSSHChannel: async (options) => {
-    return ipcRenderer.invoke("netcatty:ssh:channel:open", options);
-  },
-  startTelnetSession: async (options) => {
-    const result = await ipcRenderer.invoke("netcatty:telnet:start", options);
-    return result.sessionId;
-  },
-  startMoshSession: async (options) => {
-    const result = await ipcRenderer.invoke("netcatty:mosh:start", options);
-    return result.sessionId;
-  },
-  startLocalSession: async (options) => {
-    const result = await ipcRenderer.invoke("netcatty:local:start", options || {});
-    return result.sessionId;
-  },
-  startSerialSession: async (options) => {
-    const result = await ipcRenderer.invoke("netcatty:serial:start", options);
-    return result.sessionId;
-  },
-  listSerialPorts: async () => {
-    return ipcRenderer.invoke("netcatty:serial:list");
-  },
-  getDefaultShell: async () => {
-    return ipcRenderer.invoke("netcatty:local:defaultShell");
-  },
-  discoverShells: () => ipcRenderer.invoke("netcatty:shells:discover"),
-  validatePath: async (path, type) => {
-    return ipcRenderer.invoke("netcatty:local:validatePath", { path, type });
-  },
-  writeToSession: (sessionId, data) => {
-    ipcRenderer.send("netcatty:write", { sessionId, data });
-  },
-  execCommand: async (options) => {
-    return ipcRenderer.invoke("netcatty:ssh:exec", options);
-  },
-  getSessionPwd: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:ssh:pwd", { sessionId });
-  },
-  getSessionRemoteInfo: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:ssh:remoteInfo", { sessionId });
-  },
-  getSessionDistroInfo: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:ssh:distroInfo", { sessionId });
-  },
-  getServerStats: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:ssh:stats", { sessionId });
-  },
-  generateKeyPair: async (options) => {
-    return ipcRenderer.invoke("netcatty:key:generate", options);
-  },
-  checkSshAgent: async () => {
-    return ipcRenderer.invoke("netcatty:ssh:check-agent");
-  },
-  getDefaultKeys: async () => {
-    return ipcRenderer.invoke("netcatty:ssh:get-default-keys");
-  },
-  resizeSession: (sessionId, cols, rows) => {
-    ipcRenderer.send("netcatty:resize", { sessionId, cols, rows });
-  },
-  closeSession: (sessionId) => {
-    ipcRenderer.send("netcatty:close", { sessionId });
-  },
-  setSessionEncoding: (sessionId, encoding) =>
-    ipcRenderer.invoke("netcatty:ssh:setEncoding", { sessionId, encoding }),
-  onZmodemEvent: (sessionId, cb) => {
-    if (!zmodemListeners.has(sessionId)) zmodemListeners.set(sessionId, new Set());
-    zmodemListeners.get(sessionId).add(cb);
-    return () => zmodemListeners.get(sessionId)?.delete(cb);
-  },
-  cancelZmodem: (sessionId) => {
-    ipcRenderer.send("netcatty:zmodem:cancel", { sessionId });
-  },
-  onSessionData: (sessionId, cb) => {
-    if (!dataListeners.has(sessionId)) dataListeners.set(sessionId, new Set());
-    dataListeners.get(sessionId).add(cb);
-    return () => dataListeners.get(sessionId)?.delete(cb);
-  },
-  onSessionExit: (sessionId, cb) => {
-    if (!exitListeners.has(sessionId)) exitListeners.set(sessionId, new Set());
-    exitListeners.get(sessionId).add(cb);
-    return () => exitListeners.get(sessionId)?.delete(cb);
-  },
-  onAuthFailed: (sessionId, cb) => {
-    if (!authFailedListeners.has(sessionId)) authFailedListeners.set(sessionId, new Set());
-    authFailedListeners.get(sessionId).add(cb);
-    return () => authFailedListeners.get(sessionId)?.delete(cb);
-  },
-  // Keyboard-interactive authentication (2FA/MFA)
-  onKeyboardInteractive: (cb) => {
-    keyboardInteractiveListeners.add(cb);
-    return () => keyboardInteractiveListeners.delete(cb);
-  },
-  respondKeyboardInteractive: async (requestId, responses, cancelled = false) => {
-    return ipcRenderer.invoke("netcatty:keyboard-interactive:respond", {
-      requestId,
-      responses,
-      cancelled,
-    });
-  },
-  // Passphrase request for encrypted SSH keys
-  onPassphraseRequest: (cb) => {
-    passphraseListeners.add(cb);
-    return () => passphraseListeners.delete(cb);
-  },
-  respondPassphrase: async (requestId, passphrase, cancelled = false) => {
-    return ipcRenderer.invoke("netcatty:passphrase:respond", {
-      requestId,
-      passphrase,
-      cancelled,
-    });
-  },
-  respondPassphraseSkip: async (requestId) => {
-    return ipcRenderer.invoke("netcatty:passphrase:respond", {
-      requestId,
-      passphrase: '',
-      skipped: true,
-    });
-  },
-  onPassphraseTimeout: (cb) => {
-    passphraseTimeoutListeners.add(cb);
-    return () => passphraseTimeoutListeners.delete(cb);
-  },
-  openSftp: async (options) => {
-    const result = await ipcRenderer.invoke("netcatty:sftp:open", options);
-    return result.sftpId;
-  },
-  openSftpForSession: async (sessionId, options) => {
-    const result = await ipcRenderer.invoke("netcatty:sftp:open-for-session", {
-      sessionId,
-      ...(options || {}),
-    });
-    return result.sftpId;
-  },
-  dockerCheckSessionSupport: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:check", { sessionId });
-  },
-  dockerListContainersForSession: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:listContainers", { sessionId });
-  },
-  dockerListFilesForSession: async (sessionId, containerId, path) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:listFiles", { sessionId, containerId, path });
-  },
-  dockerReadTextFile: async (sessionId, containerId, path) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:readText", { sessionId, containerId, path });
-  },
-  dockerWriteTextFile: async (sessionId, containerId, path, content) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:writeText", { sessionId, containerId, path, content });
-  },
-  dockerDownloadFile: async (sessionId, containerId, remotePath, localPath) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:downloadFile", {
-      sessionId,
-      containerId,
-      remotePath,
-      localPath,
-    });
-  },
-  dockerDownloadFileToTemp: async (sessionId, containerId, remotePath, fileName) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:downloadFileToTemp", {
-      sessionId,
-      containerId,
-      remotePath,
-      fileName,
-    });
-  },
-  dockerCreateDirectory: async (sessionId, containerId, path) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:mkdir", { sessionId, containerId, path });
-  },
-  dockerCreateFile: async (sessionId, containerId, path) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:createFile", { sessionId, containerId, path });
-  },
-  dockerDeletePath: async (sessionId, containerId, path) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:delete", { sessionId, containerId, path });
-  },
-  dockerRenamePath: async (sessionId, containerId, oldPath, newPath) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:rename", {
-      sessionId,
-      containerId,
-      oldPath,
-      newPath,
-    });
-  },
-  dockerGetContainerPwd: async (sessionId, containerId) => {
-    return ipcRenderer.invoke("netcatty:ssh:docker:pwd", { sessionId, containerId });
-  },
-  listSftp: async (sftpId, path, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:list", { sftpId, path, encoding });
-  },
-  readSftp: async (sftpId, path, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:read", { sftpId, path, encoding });
-  },
-  readSftpBinary: async (sftpId, path, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:readBinary", { sftpId, path, encoding });
-  },
-  writeSftp: async (sftpId, path, content, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:write", { sftpId, path, content, encoding });
-  },
-  writeSftpBinary: async (sftpId, path, content, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:writeBinary", { sftpId, path, content, encoding });
-  },
-  closeSftp: async (sftpId) => {
-    return ipcRenderer.invoke("netcatty:sftp:close", { sftpId });
-  },
-  mkdirSftp: async (sftpId, path, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:mkdir", { sftpId, path, encoding });
-  },
-  deleteSftp: async (sftpId, path, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:delete", { sftpId, path, encoding });
-  },
-  renameSftp: async (sftpId, oldPath, newPath, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:rename", { sftpId, oldPath, newPath, encoding });
-  },
-  statSftp: async (sftpId, path, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:stat", { sftpId, path, encoding });
-  },
-  chmodSftp: async (sftpId, path, mode, encoding) => {
-    return ipcRenderer.invoke("netcatty:sftp:chmod", { sftpId, path, mode, encoding });
-  },
-  getSftpHomeDir: async (sftpId) => {
-    return ipcRenderer.invoke("netcatty:sftp:homeDir", { sftpId });
-  },
-  // Write binary with real-time progress callback
-  writeSftpBinaryWithProgress: async (sftpId, path, content, transferId, encoding, onProgress, onComplete, onError) => {
-    // Register callbacks
-    if (onProgress) uploadProgressListeners.set(transferId, onProgress);
-    if (onComplete) uploadCompleteListeners.set(transferId, onComplete);
-    if (onError) uploadErrorListeners.set(transferId, onError);
-    
-    return ipcRenderer.invoke("netcatty:sftp:writeBinaryWithProgress", { 
-      sftpId, 
-      path, 
-      content, 
-      transferId,
-      encoding,
-    });
-  },
-  // Cancel an in-progress SFTP upload
-  cancelSftpUpload: async (transferId) => {
-    // Cleanup listeners
-    uploadProgressListeners.delete(transferId);
-    uploadCompleteListeners.delete(transferId);
-    uploadErrorListeners.delete(transferId);
-    return ipcRenderer.invoke("netcatty:sftp:cancelUpload", { transferId });
-  },
-  // Local filesystem operations
-  listLocalDir: async (path) => {
-    return ipcRenderer.invoke("netcatty:local:list", { path });
-  },
-  readLocalFile: async (path) => {
-    return ipcRenderer.invoke("netcatty:local:read", { path });
-  },
-  writeLocalFile: async (path, content) => {
-    return ipcRenderer.invoke("netcatty:local:write", { path, content });
-  },
-  deleteLocalFile: async (path) => {
-    return ipcRenderer.invoke("netcatty:local:delete", { path });
-  },
-  renameLocalFile: async (oldPath, newPath) => {
-    return ipcRenderer.invoke("netcatty:local:rename", { oldPath, newPath });
-  },
-  mkdirLocal: async (path) => {
-    return ipcRenderer.invoke("netcatty:local:mkdir", { path });
-  },
-  statLocal: async (path) => {
-    return ipcRenderer.invoke("netcatty:local:stat", { path });
-  },
-  getHomeDir: async () => {
-    return ipcRenderer.invoke("netcatty:local:homedir");
-  },
-  getSystemInfo: async () => {
-    return ipcRenderer.invoke("netcatty:system:info");
-  },
-  // Read system known_hosts file
-  readKnownHosts: async () => {
-    return ipcRenderer.invoke("netcatty:known-hosts:read");
-  },
-  setTheme: async (theme) => {
-    return ipcRenderer.invoke("netcatty:setTheme", theme);
-  },
-  setBackgroundColor: async (color) => {
-    return ipcRenderer.invoke("netcatty:setBackgroundColor", color);
-  },
-  setLanguage: async (language) => {
-    return ipcRenderer.invoke("netcatty:setLanguage", language);
-  },
-  onLanguageChanged: (cb) => {
-    languageChangeListeners.add(cb);
-    return () => languageChangeListeners.delete(cb);
-  },
-  // Streaming transfer with real progress
-  startStreamTransfer: async (options, onProgress, onComplete, onError) => {
-    const { transferId } = options;
-    // Register callbacks
-    if (onProgress) transferProgressListeners.set(transferId, onProgress);
-    if (onComplete) transferCompleteListeners.set(transferId, onComplete);
-    if (onError) transferErrorListeners.set(transferId, onError);
-    
-    return ipcRenderer.invoke("netcatty:transfer:start", options);
-  },
-  cancelTransfer: async (transferId) => {
-    cleanupTransferListeners(transferId);
-    return ipcRenderer.invoke("netcatty:transfer:cancel", { transferId });
-  },
-  sameHostCopyDirectory: async (sftpId, sourcePath, targetPath, encoding, transferId) => {
-    return ipcRenderer.invoke("netcatty:transfer:same-host-copy-dir", { sftpId, sourcePath, targetPath, encoding, transferId });
-  },
-  // Compressed folder upload
-  startCompressedUpload: async (options, onProgress, onComplete, onError) => {
-    const { compressionId } = options;
-    // Register callbacks
-    if (onProgress) compressProgressListeners.set(compressionId, onProgress);
-    if (onComplete) compressCompleteListeners.set(compressionId, onComplete);
-    if (onError) compressErrorListeners.set(compressionId, onError);
-    
-    return ipcRenderer.invoke("netcatty:compress:start", options);
-  },
-  cancelCompressedUpload: async (compressionId) => {
-    // Cleanup listeners
-    compressProgressListeners.delete(compressionId);
-    compressCompleteListeners.delete(compressionId);
-    compressErrorListeners.delete(compressionId);
-    return ipcRenderer.invoke("netcatty:compress:cancel", { compressionId });
-  },
-  checkCompressedUploadSupport: async (sftpId) => {
-    return ipcRenderer.invoke("netcatty:compress:checkSupport", { sftpId });
-  },
-  // Window controls for custom title bar
-  windowMinimize: () => ipcRenderer.invoke("netcatty:window:minimize"),
-  windowMaximize: () => ipcRenderer.invoke("netcatty:window:maximize"),
-  windowClose: () => ipcRenderer.invoke("netcatty:window:close"),
-  windowIsMaximized: () => ipcRenderer.invoke("netcatty:window:isMaximized"),
-  windowIsFullscreen: () => ipcRenderer.invoke("netcatty:window:isFullscreen"),
-  onWindowFullScreenChanged: (cb) => {
-    fullscreenChangeListeners.add(cb);
-    return () => fullscreenChangeListeners.delete(cb);
-  },
-  
-  // Settings window
-  openSettingsWindow: () => ipcRenderer.invoke("netcatty:settings:open"),
-  closeSettingsWindow: () => ipcRenderer.invoke("netcatty:settings:close"),
-
-  // Cross-window settings sync
-  notifySettingsChanged: (payload) => ipcRenderer.send("netcatty:settings:changed", payload),
-  onSettingsChanged: (callback) => {
-    const handler = (_event, payload) => callback(payload);
-    ipcRenderer.on("netcatty:settings:changed", handler);
-    return () => ipcRenderer.removeListener("netcatty:settings:changed", handler);
-  },
-
-  // Cloud sync session (in-memory only, shared across windows)
-  cloudSyncSetSessionPassword: (password) =>
-    ipcRenderer.invoke("netcatty:cloudSync:session:setPassword", password),
-  cloudSyncGetSessionPassword: () =>
-    ipcRenderer.invoke("netcatty:cloudSync:session:getPassword"),
-  cloudSyncClearSessionPassword: () =>
-    ipcRenderer.invoke("netcatty:cloudSync:session:clearPassword"),
-
-  // Cloud sync network operations (proxied via main process)
-  cloudSyncWebdavInitialize: (config) =>
-    ipcRenderer.invoke("netcatty:cloudSync:webdav:initialize", { config }),
-  cloudSyncWebdavUpload: (config, syncedFile) =>
-    ipcRenderer.invoke("netcatty:cloudSync:webdav:upload", { config, syncedFile }),
-  cloudSyncWebdavDownload: (config) =>
-    ipcRenderer.invoke("netcatty:cloudSync:webdav:download", { config }),
-  cloudSyncWebdavDelete: (config) =>
-    ipcRenderer.invoke("netcatty:cloudSync:webdav:delete", { config }),
-
-  cloudSyncS3Initialize: (config) =>
-    ipcRenderer.invoke("netcatty:cloudSync:s3:initialize", { config }),
-  cloudSyncS3Upload: (config, syncedFile) =>
-    ipcRenderer.invoke("netcatty:cloudSync:s3:upload", { config, syncedFile }),
-  cloudSyncS3Download: (config) =>
-    ipcRenderer.invoke("netcatty:cloudSync:s3:download", { config }),
-  cloudSyncS3Delete: (config) =>
-    ipcRenderer.invoke("netcatty:cloudSync:s3:delete", { config }),
-  
-  // Open URL in default browser
-  openExternal: (url) => ipcRenderer.invoke("netcatty:openExternal", url),
-
-  // App info
-  getAppInfo: () => ipcRenderer.invoke("netcatty:app:getInfo"),
-  ptyGetChildProcesses: (sessionId) =>
-    ipcRenderer.invoke("netcatty:pty:childProcesses", sessionId),
-  confirmCloseBusy: (payload) =>
-    ipcRenderer.invoke("netcatty:dialog:confirmCloseBusy", payload),
-  getVaultBackupCapabilities: () =>
-    ipcRenderer.invoke("netcatty:vaultBackups:capabilities"),
-  createVaultBackup: (payload) =>
-    ipcRenderer.invoke("netcatty:vaultBackups:create", payload),
-  listVaultBackups: () =>
-    ipcRenderer.invoke("netcatty:vaultBackups:list"),
-  readVaultBackup: (payload) =>
-    ipcRenderer.invoke("netcatty:vaultBackups:read", payload),
-  trimVaultBackups: (payload) =>
-    ipcRenderer.invoke("netcatty:vaultBackups:trim", payload),
-  openVaultBackupDir: () =>
-    ipcRenderer.invoke("netcatty:vaultBackups:openDir"),
-  // Subscribe to cross-window "backups changed" events emitted by the
-  // main process whenever a create/trim actually mutated the on-disk
-  // set. Returns an unsubscribe function so React-style consumers can
-  // release the listener on unmount without leaking IPC handlers.
-  onVaultBackupsChanged: (handler) => {
-    if (typeof handler !== "function") return () => {};
-    const listener = () => {
-      try { handler(); } catch (error) {
-        console.warn("[preload] onVaultBackupsChanged handler threw:", error);
-      }
-    };
-    ipcRenderer.on("netcatty:vaultBackups:changed", listener);
-    return () => {
-      try { ipcRenderer.removeListener("netcatty:vaultBackups:changed", listener); }
-      catch { /* ignore */ }
-    };
-  },
-
-  // Tell main process the renderer has mounted/painted (used to avoid initial blank screen).
-  rendererReady: () => ipcRenderer.send("netcatty:renderer:ready"),
-  
-  // Port Forwarding API
-  startPortForward: async (options) => {
-    return ipcRenderer.invoke("netcatty:portforward:start", options);
-  },
-  stopPortForward: async (tunnelId) => {
-    return ipcRenderer.invoke("netcatty:portforward:stop", { tunnelId });
-  },
-  getPortForwardStatus: async (tunnelId) => {
-    return ipcRenderer.invoke("netcatty:portforward:status", { tunnelId });
-  },
-  listPortForwards: async () => {
-    return ipcRenderer.invoke("netcatty:portforward:list");
-  },
-  stopAllPortForwards: async () => {
-    return ipcRenderer.invoke("netcatty:portforward:stopAll");
-  },
-  stopPortForwardByRuleId: async (ruleId) => {
-    return ipcRenderer.invoke("netcatty:portforward:stopByRuleId", { ruleId });
-  },
-  onPortForwardStatus: (tunnelId, cb) => {
-    if (!portForwardStatusListeners.has(tunnelId)) {
-      portForwardStatusListeners.set(tunnelId, new Set());
-    }
-    portForwardStatusListeners.get(tunnelId).add(cb);
-    return () => {
-      portForwardStatusListeners.get(tunnelId)?.delete(cb);
-      if (portForwardStatusListeners.get(tunnelId)?.size === 0) {
-        portForwardStatusListeners.delete(tunnelId);
-      }
-    };
-  },
-  // Chain progress listener for jump host connections
-  onChainProgress: (cb) => {
-    const id = Date.now().toString() + Math.random().toString(16).slice(2);
-    chainProgressListeners.set(id, cb);
-    return () => {
-      chainProgressListeners.delete(id);
-    };
-  },
-  // SFTP connection progress listener (auth method logs)
-  onSftpConnectionProgress: (cb) => {
-    sftpConnectionProgressListeners.add(cb);
-    return () => {
-      sftpConnectionProgressListeners.delete(cb);
-    };
-  },
-
-  // OAuth callback server
-  startOAuthCallback: (expectedState) => ipcRenderer.invoke("oauth:startCallback", expectedState),
-  cancelOAuthCallback: () => ipcRenderer.invoke("oauth:cancelCallback"),
-
-  // GitHub Device Flow (proxied via main process to avoid CORS)
-  githubStartDeviceFlow: (options) => ipcRenderer.invoke("netcatty:github:deviceFlow:start", options),
-  githubPollDeviceFlowToken: (options) => ipcRenderer.invoke("netcatty:github:deviceFlow:poll", options),
-
-  // Google OAuth (proxied via main process to avoid CORS)
-  googleExchangeCodeForTokens: (options) =>
-    ipcRenderer.invoke("netcatty:google:oauth:exchange", options),
-  googleRefreshAccessToken: (options) =>
-    ipcRenderer.invoke("netcatty:google:oauth:refresh", options),
-  googleGetUserInfo: (options) =>
-    ipcRenderer.invoke("netcatty:google:oauth:userinfo", options),
-
-  // Google Drive API (proxied via main process to avoid CORS/COEP issues in renderer)
-  googleDriveFindSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:google:drive:findSyncFile", options),
-  googleDriveCreateSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:google:drive:createSyncFile", options),
-  googleDriveUpdateSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:google:drive:updateSyncFile", options),
-  googleDriveDownloadSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:google:drive:downloadSyncFile", options),
-  googleDriveDeleteSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:google:drive:deleteSyncFile", options),
-
-  // OneDrive OAuth + Graph (proxied via main process to avoid CORS)
-  onedriveExchangeCodeForTokens: (options) =>
-    ipcRenderer.invoke("netcatty:onedrive:oauth:exchange", options),
-  onedriveRefreshAccessToken: (options) =>
-    ipcRenderer.invoke("netcatty:onedrive:oauth:refresh", options),
-  onedriveGetUserInfo: (options) =>
-    ipcRenderer.invoke("netcatty:onedrive:oauth:userinfo", options),
-  onedriveFindSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:onedrive:drive:findSyncFile", options),
-  onedriveUploadSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:onedrive:drive:uploadSyncFile", options),
-  onedriveDownloadSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:onedrive:drive:downloadSyncFile", options),
-  onedriveDeleteSyncFile: (options) =>
-    ipcRenderer.invoke("netcatty:onedrive:drive:deleteSyncFile", options),
-
-  // File opener helpers (for "Open With" feature)
-  selectApplication: () =>
-    ipcRenderer.invoke("netcatty:selectApplication"),
-  openWithApplication: (filePath, appPath) =>
-    ipcRenderer.invoke("netcatty:openWithApplication", { filePath, appPath }),
-  downloadSftpToTemp: (sftpId, remotePath, fileName, encoding) =>
-    ipcRenderer.invoke("netcatty:sftp:downloadToTemp", { sftpId, remotePath, fileName, encoding }),
-  downloadSftpToTempWithProgress: (sftpId, remotePath, fileName, encoding, transferId, onProgress, onComplete, onError, onCancelled) => {
-    if (onProgress) transferProgressListeners.set(transferId, onProgress);
-    if (onComplete) transferCompleteListeners.set(transferId, onComplete);
-    if (onError) transferErrorListeners.set(transferId, onError);
-    if (onCancelled) transferCancelledListeners.set(transferId, onCancelled);
-    return ipcRenderer
-      .invoke("netcatty:sftp:downloadToTempWithProgress", { sftpId, remotePath, fileName, encoding, transferId })
-      .catch((err) => {
-        cleanupTransferListeners(transferId);
-        throw err;
-      });
-  },
-
-  // Save dialog for file downloads
-  showSaveDialog: (defaultPath, filters) =>
-    ipcRenderer.invoke("netcatty:showSaveDialog", { defaultPath, filters }),
-  selectDirectory: (title, defaultPath) =>
-    ipcRenderer.invoke("netcatty:selectDirectory", { title, defaultPath }),
-  selectFile: (title, defaultPath, filters) =>
-    ipcRenderer.invoke("netcatty:selectFile", { title, defaultPath, filters }),
-
-  // File watcher for auto-sync feature
-  startFileWatch: (localPath, remotePath, sftpId, encoding) =>
-    ipcRenderer.invoke("netcatty:filewatch:start", { localPath, remotePath, sftpId, encoding }),
-  stopFileWatch: (watchId, cleanupTempFile = false) =>
-    ipcRenderer.invoke("netcatty:filewatch:stop", { watchId, cleanupTempFile }),
-  listFileWatches: () =>
-    ipcRenderer.invoke("netcatty:filewatch:list"),
-  registerTempFile: (sftpId, localPath) =>
-    ipcRenderer.invoke("netcatty:filewatch:registerTempFile", { sftpId, localPath }),
-  onFileWatchSynced: (cb) => {
-    fileWatchSyncedListeners.add(cb);
-    return () => fileWatchSyncedListeners.delete(cb);
-  },
-  onFileWatchError: (cb) => {
-    fileWatchErrorListeners.add(cb);
-    return () => fileWatchErrorListeners.delete(cb);
-  },
-  
-  // Temp file cleanup
-  deleteTempFile: (filePath) =>
-    ipcRenderer.invoke("netcatty:deleteTempFile", { filePath }),
-  
-  // Temp directory management
-  getTempDirInfo: () =>
-    ipcRenderer.invoke("netcatty:tempdir:getInfo"),
-  clearTempDir: () =>
-    ipcRenderer.invoke("netcatty:tempdir:clear"),
-  getTempDirPath: () =>
-    ipcRenderer.invoke("netcatty:tempdir:getPath"),
-  openTempDir: () =>
-    ipcRenderer.invoke("netcatty:tempdir:open"),
-
-  // Session Logs
-  exportSessionLog: (payload) =>
-    ipcRenderer.invoke("netcatty:sessionLogs:export", payload),
-  selectSessionLogsDir: () =>
-    ipcRenderer.invoke("netcatty:sessionLogs:selectDir"),
-  autoSaveSessionLog: (payload) =>
-    ipcRenderer.invoke("netcatty:sessionLogs:autoSave", payload),
-  openSessionLogsDir: (directory) =>
-    ipcRenderer.invoke("netcatty:sessionLogs:openDir", { directory }),
-
-  // Crash Logs
-  getCrashLogs: () =>
-    ipcRenderer.invoke("netcatty:crashLogs:list"),
-  readCrashLog: (fileName) =>
-    ipcRenderer.invoke("netcatty:crashLogs:read", { fileName }),
-  clearCrashLogs: () =>
-    ipcRenderer.invoke("netcatty:crashLogs:clear"),
-  openCrashLogsDir: () =>
-    ipcRenderer.invoke("netcatty:crashLogs:openDir"),
-
-  // Global Toggle Hotkey (Quake Mode)
-  registerGlobalHotkey: (hotkey) =>
-    ipcRenderer.invoke("netcatty:globalHotkey:register", { hotkey }),
-  unregisterGlobalHotkey: () =>
-    ipcRenderer.invoke("netcatty:globalHotkey:unregister"),
-  getGlobalHotkeyStatus: () =>
-    ipcRenderer.invoke("netcatty:globalHotkey:status"),
-
-  // System Tray / Close to Tray
-  setCloseToTray: (enabled) =>
-    ipcRenderer.invoke("netcatty:tray:setCloseToTray", { enabled }),
-  isCloseToTray: () =>
-    ipcRenderer.invoke("netcatty:tray:isCloseToTray"),
-  updateTrayMenuData: (data) =>
-    ipcRenderer.invoke("netcatty:tray:updateMenuData", data),
-  // Listen for tray menu actions
-  onTrayFocusSession: (callback) => {
-    const handler = (_event, sessionId) => callback(sessionId);
-    ipcRenderer.on("netcatty:tray:focusSession", handler);
-    return () => ipcRenderer.removeListener("netcatty:tray:focusSession", handler);
-  },
-  onTrayTogglePortForward: (callback) => {
-    const handler = (_event, ruleId, start) => callback(ruleId, start);
-    ipcRenderer.on("netcatty:tray:togglePortForward", handler);
-    return () => ipcRenderer.removeListener("netcatty:tray:togglePortForward", handler);
-  },
-
-  // Tray panel actions forwarded to main window
-  onTrayPanelJumpToSession: (callback) => {
-    const handler = (_event, sessionId) => callback(sessionId);
-    ipcRenderer.on("netcatty:trayPanel:jumpToSession", handler);
-    return () => ipcRenderer.removeListener("netcatty:trayPanel:jumpToSession", handler);
-  },
-  onTrayPanelConnectToHost: (callback) => {
-    const handler = (_event, hostId) => callback(hostId);
-    ipcRenderer.on("netcatty:trayPanel:connectToHost", handler);
-    return () => ipcRenderer.removeListener("netcatty:trayPanel:connectToHost", handler);
-  },
-
-  // Tray panel window
-  hideTrayPanel: () => ipcRenderer.invoke("netcatty:trayPanel:hide"),
-  openMainWindow: () => ipcRenderer.invoke("netcatty:trayPanel:openMainWindow"),
-  quitApp: () => ipcRenderer.invoke("netcatty:trayPanel:quitApp"),
-  jumpToSessionFromTrayPanel: (sessionId) =>
-    ipcRenderer.invoke("netcatty:trayPanel:jumpToSession", sessionId),
-  connectToHostFromTrayPanel: (hostId) =>
-    ipcRenderer.invoke("netcatty:trayPanel:connectToHost", hostId),
-  onTrayPanelCloseRequest: (callback) => {
-    const handler = () => callback();
-    ipcRenderer.on("netcatty:trayPanel:closeRequest", handler);
-    return () => ipcRenderer.removeListener("netcatty:trayPanel:closeRequest", handler);
-  },
-
-  onTrayPanelRefresh: (callback) => {
-    const handler = () => callback();
-    ipcRenderer.on("netcatty:trayPanel:refresh", handler);
-    return () => ipcRenderer.removeListener("netcatty:trayPanel:refresh", handler);
-  },
-
-  onTrayPanelMenuData: (callback) => {
-    // Replay buffered data so late subscribers (e.g. after React lazy-mount) don't miss
-    // the initial payload that was sent before the useEffect listener was registered.
-    if (_lastTrayMenuData) {
-      queueMicrotask(() => callback(_lastTrayMenuData));
-    }
-    const handler = (_event, data) => {
-      _lastTrayMenuData = data;
-      callback(data);
-    };
-    ipcRenderer.on("netcatty:trayPanel:setMenuData", handler);
-    return () => ipcRenderer.removeListener("netcatty:trayPanel:setMenuData", handler);
-  },
-
-  // Get file path from File object (for drag-and-drop)
-  getPathForFile: (file) => {
-    try {
-      return webUtils.getPathForFile(file);
-    } catch {
-      return undefined;
-    }
-  },
-
-  // Clipboard fallback helpers
-  readClipboardText: async () => {
-    return ipcRenderer.invoke("netcatty:clipboard:readText");
-  },
-
-  // Credential encryption (field-level safeStorage)
-  credentialsAvailable: () => ipcRenderer.invoke("netcatty:credentials:available"),
-  credentialsEncrypt: (plaintext) => ipcRenderer.invoke("netcatty:credentials:encrypt", plaintext),
-  credentialsDecrypt: (value) => ipcRenderer.invoke("netcatty:credentials:decrypt", value),
-
-  // Auto-update
-  checkForUpdate: () => ipcRenderer.invoke("netcatty:update:check"),
-  downloadUpdate: () => ipcRenderer.invoke("netcatty:update:download"),
-  installUpdate: () => ipcRenderer.invoke("netcatty:update:install"),
-  getUpdateStatus: () => ipcRenderer.invoke("netcatty:update:getStatus"),
-  setAutoUpdate: (enabled) => ipcRenderer.invoke("netcatty:update:setAutoUpdate", { enabled }),
-  getAutoUpdate: () => ipcRenderer.invoke("netcatty:update:getAutoUpdate"),
-  onUpdateAvailable: (cb) => {
-    updateAvailableListeners.add(cb);
-    return () => updateAvailableListeners.delete(cb);
-  },
-  onUpdateNotAvailable: (cb) => {
-    updateNotAvailableListeners.add(cb);
-    return () => updateNotAvailableListeners.delete(cb);
-  },
-  onUpdateDownloadProgress: (cb) => {
-    updateDownloadProgressListeners.add(cb);
-    return () => updateDownloadProgressListeners.delete(cb);
-  },
-  onUpdateDownloaded: (cb) => {
-    updateDownloadedListeners.add(cb);
-    return () => updateDownloadedListeners.delete(cb);
-  },
-  onUpdateError: (cb) => {
-    updateErrorListeners.add(cb);
-    return () => updateErrorListeners.delete(cb);
-  },
-
-  // ── AI Bridge ──
-  aiSyncProviders: async (providers) => {
-    return ipcRenderer.invoke("netcatty:ai:sync-providers", { providers });
-  },
-  aiSyncWebSearch: async (apiHost, apiKey) => {
-    return ipcRenderer.invoke("netcatty:ai:sync-web-search", { apiHost, apiKey });
-  },
-  aiUserSkillsGetStatus: async () => {
-    return ipcRenderer.invoke("netcatty:ai:user-skills:status");
-  },
-  aiUserSkillsOpenFolder: async () => {
-    return ipcRenderer.invoke("netcatty:ai:user-skills:open");
-  },
-  aiUserSkillsBuildContext: async (prompt, selectedSkillSlugs) => {
-    return ipcRenderer.invoke("netcatty:ai:user-skills:build-context", { prompt, selectedSkillSlugs });
-  },
-  aiChatStream: async (requestId, url, headers, body, providerId) => {
-    return ipcRenderer.invoke("netcatty:ai:chat:stream", { requestId, url, headers, body, providerId });
-  },
-  aiChatCancel: async (requestId) => {
-    return ipcRenderer.invoke("netcatty:ai:chat:cancel", { requestId });
-  },
-  aiFetch: async (url, method, headers, body, providerId, skipHostCheck, followRedirects, skipTLSVerify) => {
-    return ipcRenderer.invoke("netcatty:ai:fetch", { url, method, headers, body, providerId, skipHostCheck, followRedirects, skipTLSVerify });
-  },
-  aiAllowlistAddHost: async (baseURL) => {
-    return ipcRenderer.invoke("netcatty:ai:allowlist:add-host", { baseURL });
-  },
-  aiExec: async (sessionId, command, chatSessionId) => {
-    return ipcRenderer.invoke("netcatty:ai:exec", { sessionId, command, chatSessionId });
-  },
-  aiCattyCancelExec: async (chatSessionId) => {
-    return ipcRenderer.invoke("netcatty:ai:catty:cancel", { chatSessionId });
-  },
-  aiDiscoverAgents: async () => {
-    return ipcRenderer.invoke("netcatty:ai:agents:discover");
-  },
-  aiResolveCli: async (params) => {
-    return ipcRenderer.invoke("netcatty:ai:resolve-cli", params);
-  },
-  aiCodexGetIntegration: async (options) => {
-    return ipcRenderer.invoke("netcatty:ai:codex:get-integration", options);
-  },
-  aiCodexStartLogin: async () => {
-    return ipcRenderer.invoke("netcatty:ai:codex:start-login");
-  },
-  aiCodexGetLoginSession: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:ai:codex:get-login-session", { sessionId });
-  },
-  aiCodexCancelLogin: async (sessionId) => {
-    return ipcRenderer.invoke("netcatty:ai:codex:cancel-login", { sessionId });
-  },
-  aiCodexLogout: async () => {
-    return ipcRenderer.invoke("netcatty:ai:codex:logout");
-  },
-  aiSpawnAgent: async (agentId, command, args, env, options) => {
-    return ipcRenderer.invoke("netcatty:ai:agent:spawn", { agentId, command, args, env, closeStdin: options?.closeStdin });
-  },
-  aiWriteToAgent: async (agentId, data) => {
-    return ipcRenderer.invoke("netcatty:ai:agent:write", { agentId, data });
-  },
-  aiCloseAgentStdin: async (agentId) => {
-    return ipcRenderer.invoke("netcatty:ai:agent:close-stdin", { agentId });
-  },
-  aiKillAgent: async (agentId) => {
-    return ipcRenderer.invoke("netcatty:ai:agent:kill", { agentId });
-  },
-  // MCP Server session metadata
-  aiMcpUpdateSessions: async (sessions, chatSessionId) => {
-    return ipcRenderer.invoke("netcatty:ai:mcp:update-sessions", { sessions, chatSessionId });
-  },
-  aiMcpSetCommandBlocklist: async (blocklist) => {
-    return ipcRenderer.invoke("netcatty:ai:mcp:set-command-blocklist", { blocklist });
-  },
-  aiMcpSetCommandTimeout: async (timeout) => {
-    return ipcRenderer.invoke("netcatty:ai:mcp:set-command-timeout", { timeout });
-  },
-  aiMcpSetMaxIterations: async (maxIterations) => {
-    return ipcRenderer.invoke("netcatty:ai:mcp:set-max-iterations", { maxIterations });
-  },
-  aiMcpSetPermissionMode: async (mode) => {
-    return ipcRenderer.invoke("netcatty:ai:mcp:set-permission-mode", { mode });
-  },
-  aiMcpSetToolIntegrationMode: async (mode) => {
-    return ipcRenderer.invoke("netcatty:ai:mcp:set-tool-integration-mode", { mode });
-  },
-  // MCP approval gate: renderer receives approval requests from main process
-  onMcpApprovalRequest: (cb) => {
-    const handler = (_event, payload) => cb(payload);
-    ipcRenderer.on("netcatty:ai:mcp:approval-request", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:mcp:approval-request", handler);
-  },
-  respondMcpApproval: async (approvalId, approved) => {
-    return ipcRenderer.invoke("netcatty:ai:mcp:approval-response", { approvalId, approved });
-  },
-  // MCP approval cleared: main process timed out or cancelled an approval
-  onMcpApprovalCleared: (cb) => {
-    const handler = (_event, payload) => cb(payload);
-    ipcRenderer.on("netcatty:ai:mcp:approval-cleared", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:mcp:approval-cleared", handler);
-  },
-  // ACP streaming
-  aiAcpStream: async (requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext) => {
-    return ipcRenderer.invoke("netcatty:ai:acp:stream", { requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext });
-  },
-  aiAcpListModels: async (acpCommand, acpArgs, cwd, providerId, chatSessionId) => {
-    return ipcRenderer.invoke("netcatty:ai:acp:list-models", { acpCommand, acpArgs, cwd, providerId, chatSessionId });
-  },
-  aiAcpCancel: async (requestId, chatSessionId) => {
-    return ipcRenderer.invoke("netcatty:ai:acp:cancel", { requestId, chatSessionId });
-  },
-  aiAcpCleanup: async (chatSessionId) => {
-    return ipcRenderer.invoke("netcatty:ai:acp:cleanup", { chatSessionId });
-  },
-  onAiAcpEvent: (requestId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.requestId === requestId) cb(payload.event);
-    };
-    ipcRenderer.on("netcatty:ai:acp:event", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:acp:event", handler);
-  },
-  onAiAcpDone: (requestId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.requestId === requestId) cb();
-    };
-    ipcRenderer.on("netcatty:ai:acp:done", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:acp:done", handler);
-  },
-  onAiAcpError: (requestId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.requestId === requestId) cb(payload.error);
-    };
-    ipcRenderer.on("netcatty:ai:acp:error", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:acp:error", handler);
-  },
-  onAiStreamData: (requestId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.requestId === requestId) cb(payload.data);
-    };
-    ipcRenderer.on("netcatty:ai:stream:data", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:stream:data", handler);
-  },
-  onAiStreamEnd: (requestId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.requestId === requestId) cb();
-    };
-    ipcRenderer.on("netcatty:ai:stream:end", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:stream:end", handler);
-  },
-  onAiStreamError: (requestId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.requestId === requestId) cb(payload.error);
-    };
-    ipcRenderer.on("netcatty:ai:stream:error", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:stream:error", handler);
-  },
-  onAiAgentStdout: (agentId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.agentId === agentId) cb(payload.data);
-    };
-    ipcRenderer.on("netcatty:ai:agent:stdout", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:agent:stdout", handler);
-  },
-  onAiAgentStderr: (agentId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.agentId === agentId) cb(payload.data);
-    };
-    ipcRenderer.on("netcatty:ai:agent:stderr", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:agent:stderr", handler);
-  },
-  onAiAgentExit: (agentId, cb) => {
-    const handler = (_event, payload) => {
-      if (payload.agentId === agentId) cb(payload.code);
-    };
-    ipcRenderer.on("netcatty:ai:agent:exit", handler);
-    return () => ipcRenderer.removeListener("netcatty:ai:agent:exit", handler);
-  },
-};
+const api = createPreloadApi({
+  ipcRenderer,
+  os,
+  webUtils,
+  randomUUID,
+  dataListeners,
+  displayDataListeners,
+  exitListeners,
+  closedTerminalDataSessions,
+  globalSftpTransferListeners,
+  pluginContributionsChangedListeners,
+  chainProgressListeners,
+  connectionReuseFallbackListeners,
+  zmodemListeners,
+  zmodemOverwriteListeners,
+  sftpConnectionProgressListeners,
+  authFailedListeners,
+  telnetAutoLoginCompleteListeners,
+  telnetAutoLoginCancelledListeners,
+  telnetEchoModeListeners,
+  moshSessionReadyListeners,
+  terminalDataBacklog,
+  terminalOutputPorts,
+  clearTerminalOutputSessionState: clearMcpSessionState,
+  terminalOutputDrainListeners,
+  terminalUrgentInputPorts,
+  languageChangeListeners,
+  fullscreenChangeListeners,
+  windowShownListeners,
+  windowFocusRequestedListeners,
+  windowWillHideListeners,
+  keyboardInteractiveListeners,
+  keyboardInteractiveCancelledListeners,
+  hostKeyVerificationListeners,
+  passphraseListeners,
+  passphraseTimeoutListeners,
+  passphraseCancelledListeners,
+  passphraseAuthFailedListeners,
+  updateDownloadProgressListeners,
+  updateDownloadedListeners,
+  updateAvailableListeners,
+  updateNotAvailableListeners,
+  updateErrorListeners,
+  updateNeedsSaveListeners,
+  terminalPopupConfigState,
+  portForwardStatusListeners,
+  portForwardRuntimeListeners,
+  fileWatchSyncedListeners,
+  fileWatchErrorListeners,
+  fileWatchStoppedListeners,
+  get _lastTrayMenuData() { return _lastTrayMenuData; },
+  set _lastTrayMenuData(value) { _lastTrayMenuData = value; },
+});
 
 // Fig autocomplete spec loading via main process
 const figSpecApi = {

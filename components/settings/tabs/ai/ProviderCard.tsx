@@ -3,6 +3,7 @@ import { Pencil, Trash2 } from "lucide-react";
 import type { ProviderConfig } from "../../../../infrastructure/ai/types";
 import { useI18n } from "../../../../application/i18n/I18nProvider";
 import { Toggle } from "../../settings-ui";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import { cn } from "../../../../lib/utils";
 import { ProviderIconBadge } from "./ProviderIconBadge";
 import { ProviderConfigForm } from "./ProviderConfigForm";
@@ -24,12 +25,12 @@ export const ProviderCard: React.FC<{
     <div
       className={cn(
         "rounded-lg border p-4 transition-colors",
-        isActive ? "border-primary/50 bg-primary/5" : "border-border/60 bg-muted/20",
+        isActive ? "border-primary/50 bg-primary/5" : "border-border bg-card",
       )}
     >
       <div className="flex items-center gap-3">
         {/* Provider icon */}
-        <ProviderIconBadge providerId={provider.providerId} />
+        <ProviderIconBadge provider={provider} />
 
         {/* Info */}
         <div className="flex-1 min-w-0">
@@ -61,20 +62,28 @@ export const ProviderCard: React.FC<{
 
         {/* Actions */}
         <div className="flex items-center gap-1 shrink-0">
-          <button
-            onClick={onEdit}
-            className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-            title={t('ai.providers.configure')}
-          >
-            <Pencil size={14} />
-          </button>
-          <button
-            onClick={onRemove}
-            className="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
-            title={t('ai.providers.remove')}
-          >
-            <Trash2 size={14} />
-          </button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={onEdit}
+                className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+              >
+                <Pencil size={14} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{t('ai.providers.configure')}</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={onRemove}
+                className="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+              >
+                <Trash2 size={14} />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{t('ai.providers.remove')}</TooltipContent>
+          </Tooltip>
           <Toggle checked={provider.enabled} onChange={onToggleEnabled} />
         </div>
       </div>

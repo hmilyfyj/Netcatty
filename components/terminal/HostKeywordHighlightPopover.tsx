@@ -4,13 +4,13 @@
  */
 import { Highlighter, Plus, Trash2, RotateCcw } from 'lucide-react';
 import React, { useState, useCallback, useMemo } from 'react';
-import { v4 as uuidv4 } from 'uuid';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { Host, KeywordHighlightRule } from '../../types';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover';
 import { ScrollArea } from '../ui/scroll-area';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 
 export interface HostKeywordHighlightPopoverProps {
   host?: Host;
@@ -21,6 +21,14 @@ export interface HostKeywordHighlightPopoverProps {
 }
 
 const DEFAULT_NEW_RULE_COLOR = '#F87171';
+
+export function addHostKeywordHighlightRule(host: Host, rule: KeywordHighlightRule): Host {
+  return {
+    ...host,
+    keywordHighlightRules: [...(host.keywordHighlightRules ?? []), rule],
+    keywordHighlightEnabled: true,
+  };
+}
 
 export const HostKeywordHighlightPopover: React.FC<HostKeywordHighlightPopoverProps> = ({
   host,
@@ -68,26 +76,23 @@ export const HostKeywordHighlightPopover: React.FC<HostKeywordHighlightPopoverPr
     }
 
     const newRule: KeywordHighlightRule = {
-      id: uuidv4(),
+      id: crypto.randomUUID(),
       label: newRuleLabel.trim(),
       patterns: [newRulePattern.trim()],
       color: newRuleColor,
       enabled: true,
     };
 
-    updateRules([...rules, newRule]);
+    if (host && onUpdateHost) {
+      onUpdateHost(addHostKeywordHighlightRule(host, newRule));
+    }
 
     // Reset form
     setNewRuleLabel('');
     setNewRulePattern('');
     setNewRuleColor(DEFAULT_NEW_RULE_COLOR);
     setPatternError(null);
-
-    // Auto-enable if adding the first rule and not enabled
-    if (rules.length === 0 && !enabled && host && onUpdateHost) {
-      onUpdateHost({ ...host, keywordHighlightRules: [newRule], keywordHighlightEnabled: true });
-    }
-  }, [newRuleLabel, newRulePattern, newRuleColor, rules, updateRules, enabled, host, onUpdateHost, t]);
+  }, [newRuleLabel, newRulePattern, newRuleColor, host, onUpdateHost, t]);
 
   const handleDeleteRule = useCallback((ruleId: string) => {
     updateRules(rules.filter((r) => r.id !== ruleId));
@@ -120,21 +125,33 @@ export const HostKeywordHighlightPopover: React.FC<HostKeywordHighlightPopoverPr
 
   return (
     <Popover open={isOpen} onOpenChange={setIsOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          variant="secondary"
-          size="icon"
-          className={buttonClassName}
-          title={t('terminal.toolbar.hostHighlight.title')}
-          aria-label={t('terminal.toolbar.hostHighlight.title')}
-          disabled={isDisabled}
-        >
-          <Highlighter size={12} />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent className="w-80 p-0" align="start" side="top">
-        <div className="px-3 py-2 border-b bg-muted/30 flex items-center justify-between">
-          <span className="text-xs font-semibold uppercase text-muted-foreground">
+      {/* Force-close tooltip while the panel is open so the blue label does not
+          sit on top of the trigger/panel (especially in the compact top-right
+          cluster when the host info bar is hidden). */}
+      <Tooltip open={isOpen ? false : undefined}>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <Button
+              variant="secondary"
+              size="icon"
+              className={buttonClassName}
+              aria-label={t('terminal.toolbar.hostHighlight.title')}
+              disabled={isDisabled}
+            >
+              <Highlighter size={12} />
+            </Button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        {/* Toolbar sits at the top of the terminal pane; open below the trigger
+            so the label is not clipped by the window/title edge (especially in
+            compact top-right action cluster when the host info bar is hidden). */}
+        <TooltipContent side="bottom" sideOffset={8} className="whitespace-nowrap max-w-none">
+          {t('terminal.toolbar.hostHighlight.title')}
+        </TooltipContent>
+      </Tooltip>
+      <PopoverContent className="w-80 p-0" align="end" side="bottom" sideOffset={8} collisionPadding={12}>
+        <div className="px-3 py-2 border-b bg-muted/30 flex items-center justify-between gap-2 min-w-0">
+          <span className="text-xs font-semibold uppercase text-muted-foreground truncate min-w-0">
             {t('terminal.toolbar.hostHighlight.title')}
           </span>
           <label className="flex items-center gap-2 cursor-pointer">
@@ -175,18 +192,24 @@ export const HostKeywordHighlightPopover: React.FC<HostKeywordHighlightPopoverPr
                   key={rule.id}
                   className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-accent/50 group"
                 >
-                  <button
-                    type="button"
-                    onClick={() => handleToggleRule(rule.id)}
-                    className={`
-                      flex-shrink-0 w-3 h-3 rounded-sm border transition-colors
-                      ${rule.enabled 
-                        ? 'bg-primary border-primary' 
-                        : 'bg-transparent border-muted-foreground/50'
-                      }
-                    `}
-                    title={rule.enabled ? t('common.enabled') : t('common.disabled')}
-                  />
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => handleToggleRule(rule.id)}
+                        className={`
+                          flex-shrink-0 w-3 h-3 rounded-sm border transition-colors
+                          ${rule.enabled
+                            ? 'bg-primary border-primary'
+                            : 'bg-transparent border-muted-foreground/50'
+                          }
+                        `}
+                      />
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">
+                      {rule.enabled ? t('common.enabled') : t('common.disabled')}
+                    </TooltipContent>
+                  </Tooltip>
                   <div className="flex-1 min-w-0">
                     <div 
                       className="text-xs font-medium truncate" 

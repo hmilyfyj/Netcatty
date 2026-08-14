@@ -6,6 +6,34 @@
  */
 
 import type { ShrinkFinding } from './syncGuards';
+import type {
+  ConvergentFieldConflict,
+  ConvergentSyncEnvelopeV2,
+  ConvergentSyncStateV2,
+} from './convergentSync';
+import {
+  BUILTIN_CLOUD_PROVIDERS,
+  isBuiltinCloudProvider,
+  providerConnectionStorageKey,
+  type BuiltinCloudProvider,
+  type CloudProviderId,
+} from './cloudProviderIds';
+
+export type {
+  ConvergentFieldConflict,
+  ConvergentSyncEnvelopeV2,
+  ConvergentSyncStateV2,
+} from './convergentSync';
+
+export {
+  BUILTIN_CLOUD_PROVIDERS,
+  isBuiltinCloudProvider,
+  providerConnectionStorageKey,
+  type BuiltinCloudProvider,
+};
+
+/** Built-in short IDs or namespaced plugin contribution IDs. */
+export type CloudProvider = CloudProviderId;
 
 // ============================================================================
 // Security State Machine
@@ -43,11 +71,6 @@ export type ConflictResolution =
 // Cloud Provider Types
 // ============================================================================
 
-/**
- * Supported cloud storage providers
- */
-export type CloudProvider = 'github' | 'google' | 'onedrive' | 'webdav' | 's3';
-
 export type WebDAVAuthType = 'basic' | 'digest' | 'token';
 
 export interface WebDAVConfig {
@@ -68,6 +91,7 @@ export interface S3Config {
   sessionToken?: string;
   prefix?: string;
   forcePathStyle?: boolean;
+  allowInsecure?: boolean;
 }
 
 /**
@@ -92,6 +116,38 @@ export interface OAuthTokens {
 }
 
 /**
+ * Marker prefixed onto OneDrive refresh errors when Microsoft reports the
+ * refresh token can no longer be used (expired / revoked / consent withdrawn).
+ * Only an error's `message` survives the Electron IPC boundary, so the marker is
+ * the stable signal that the OneDrive session must be re-authorized. It is added
+ * in the bridge (electron/bridges/onedriveAuthBridge.cjs) and detected/cleaned
+ * here so the same logic is shared by infrastructure and UI layers.
+ */
+export const ONEDRIVE_REAUTH_REQUIRED_MARKER = 'ONEDRIVE_REAUTH_REQUIRED';
+
+/**
+ * True when an error indicates the OneDrive refresh token is dead and the user
+ * must reconnect. Robust to the error being re-wrapped (e.g. `new
+ * Error(String(err))`) as it bubbles through the provider-agnostic pipeline.
+ */
+export const isOneDriveReauthRequiredMessage = (message: string): boolean =>
+  message.includes(ONEDRIVE_REAUTH_REQUIRED_MARKER);
+
+/**
+ * Produce a clean, user-facing message from a (possibly multiply-wrapped) error
+ * string by dropping everything up to and including the internal reauth marker,
+ * e.g. "Error: OneDriveReauthRequiredError: ONEDRIVE_REAUTH_REQUIRED: OneDrive
+ * session expired..." -> "OneDrive session expired...". Returns the original
+ * string unchanged when the marker is absent.
+ */
+export const cleanOneDriveErrorMessage = (message: string): string => {
+  const token = `${ONEDRIVE_REAUTH_REQUIRED_MARKER}:`;
+  const markerIndex = message.lastIndexOf(token);
+  if (markerIndex === -1) return message;
+  return message.slice(markerIndex + token.length).trim();
+};
+
+/**
  * Provider account information
  */
 export interface ProviderAccount {
@@ -104,21 +160,74 @@ export interface ProviderAccount {
 /**
  * Cloud provider connection state
  */
+/**
+ * Opaque host-owned sync credential reference (SecretRef / CredentialRef shape).
+ * Never stores plaintext secrets — only the reference the plugin connect path needs.
+ * Secret leases are one-shot and must not be persisted for reconnect.
+ */
+export interface PluginSyncCredentialRef {
+  kind: 'secret' | 'credential';
+  id: string;
+  key?: string;
+}
+
+/** Reasonable upper bounds for durable opaque ref strings persisted at rest. */
+const MAX_PLUGIN_SYNC_CREDENTIAL_ID_CHARS = 512;
+const MAX_PLUGIN_SYNC_CREDENTIAL_KEY_CHARS = 256;
+
+/**
+ * Normalize a value into a durable PluginSyncCredentialRef for reconnect
+ * persistence. Rejects arrays, leases, and oversized / malformed shapes.
+ */
+export function normalizeDurablePluginSyncCredentialRef(
+  value: unknown,
+): PluginSyncCredentialRef | undefined {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const kind = record.kind;
+  const id = record.id;
+  if (kind !== 'secret' && kind !== 'credential') return undefined;
+  if (typeof id !== 'string' || id.length < 1 || id.length > MAX_PLUGIN_SYNC_CREDENTIAL_ID_CHARS) {
+    return undefined;
+  }
+  if (!Object.prototype.hasOwnProperty.call(record, 'key') || record.key === undefined) {
+    return { kind, id };
+  }
+  const key = record.key;
+  if (typeof key !== 'string' || key.length < 1 || key.length > MAX_PLUGIN_SYNC_CREDENTIAL_KEY_CHARS) {
+    return undefined;
+  }
+  return { kind, id, key };
+}
+
 export interface ProviderConnection {
   provider: CloudProvider;
   status: ProviderConnectionStatus;
   account?: ProviderAccount;
   tokens?: OAuthTokens;
   config?: WebDAVConfig | S3Config;
+  /** Plugin sync providers: persisted SyncConnectPayload.credential for reconnect. */
+  credential?: PluginSyncCredentialRef;
   lastSync?: number;        // Unix timestamp
   lastSyncVersion?: number;
   resourceId?: string;      // gistId / fileId / itemId
   error?: string;
 }
 
-const hasProviderConnectionData = (
-  connection: Pick<ProviderConnection, 'tokens' | 'config'>,
-): boolean => Boolean(connection.tokens || connection.config);
+/**
+ * Whether a connection still has usable credentials/config to retry.
+ * Plugin configs may be valid falsy JSON scalars (`false`, `0`, `""`) or even
+ * JSON `null` when a schema uses `type: "null"`. Presence is property
+ * existence for `config`; do not use truthiness (`||` / `Boolean`).
+ */
+export const hasProviderConnectionData = (
+  connection: Pick<ProviderConnection, 'tokens' | 'config' | 'credential'>,
+): boolean =>
+  connection.tokens != null
+  || Object.prototype.hasOwnProperty.call(connection, 'config')
+  || connection.credential != null;
 
 export const isProviderReadyForSync = (
   connection: Pick<ProviderConnection, 'status' | 'tokens' | 'config'>,
@@ -145,6 +254,8 @@ export interface SyncFileMeta {
   algorithm: 'AES-256-GCM'; // Encryption algorithm identifier
   kdf: 'PBKDF2' | 'Argon2id'; // Key derivation function
   kdfIterations?: number;   // PBKDF2 iterations (if applicable)
+  /** Present only for convergent-sync payloads. Unknown future versions fail closed. */
+  syncSchemaVersion?: 2;
 }
 
 /**
@@ -164,9 +275,12 @@ export interface SyncPayload {
   hosts: import('./models').Host[];
   keys: import('./models').SSHKey[];
   identities?: import('./models').Identity[];
+  proxyProfiles?: import('./models').ProxyProfile[];
   snippets: import('./models').Snippet[];
   customGroups: string[];
   snippetPackages?: string[];
+  notes?: import('./models').VaultNote[];
+  noteGroups?: string[];
 
   // Group configs (connection defaults per host group)
   groupConfigs?: import('./models').GroupConfig[];
@@ -190,9 +304,14 @@ export interface SyncPayload {
     customCSS?: string;
     // Terminal
     terminalTheme?: string;
+    followAppTerminalTheme?: boolean;
+    terminalThemeDark?: string;
+    terminalThemeLight?: string;
     terminalFontFamily?: string;
     terminalFontSize?: number;
     terminalSettings?: Record<string, unknown>;
+    terminalSidePanelAutoOpen?: boolean;
+    terminalSidePanelAutoOpenTab?: import('./terminalSidePanelAutoOpen').TerminalSidePanelAutoOpenTab;
     customTerminalThemes?: Array<{ id: string; name: string; colors: Record<string, string> }>;
     // Keyboard
     customKeyBindings?: Record<string, { mac?: string; pc?: string }>;
@@ -203,20 +322,194 @@ export interface SyncPayload {
     sftpAutoSync?: boolean;
     sftpShowHiddenFiles?: boolean;
     sftpUseCompressedUpload?: boolean;
+    sftpSkipUnchanged?: boolean;
     sftpAutoOpenSidebar?: boolean;
+    sftpFollowTerminalCwd?: boolean;
+    sftpDefaultViewMode?: 'list' | 'tree';
     sftpGlobalBookmarks?: import('./models').SftpBookmark[];
-    // Immersive mode
-    immersiveMode?: boolean;
     // Vault: show recently connected hosts
     showRecentHosts?: boolean;
+    // Vault: host click activates immediately, or select-then-click-again
+    hostClickBehavior?: 'connect' | 'select';
     // Vault: root list shows only ungrouped hosts
     showOnlyUngroupedHostsInRoot?: boolean;
     // Top tabs: show standalone SFTP view tab
     showSftpTab?: boolean;
+    // Shortcuts: Cmd/Ctrl+[1...9] and Ctrl+Tab skip pinned Vault/SFTP tabs
+    shellOnlyTabNumberShortcuts?: boolean;
+    // Shortcuts: show 1...9 badges on tabs matching number switch shortcuts
+    showTabNumberBadges?: boolean;
+    // Shortcuts: disable terminal font zoom shortcuts
+    disableTerminalFontZoom?: boolean;
+    // Terminal/editor tabs: show left host list sidebar
+    showHostTreeSidebar?: boolean;
+    // Workspace focus indicator style
+    workspaceFocusStyle?: 'dim' | 'border';
+    // AI configuration
+    ai?: {
+      providers?: Array<Record<string, unknown>>;
+      activeProviderId?: string;
+      activeModelId?: string;
+      globalPermissionMode?: 'observer' | 'confirm' | 'auto';
+      toolIntegrationMode?: 'mcp' | 'skills';
+      hostPermissions?: Array<Record<string, unknown>>;
+      // externalAgents intentionally omitted: command/args/env are device-local
+      // (binary paths, OS-specific values) and don't survive cross-device sync.
+      defaultAgentId?: string;
+      commandBlocklist?: string[];
+      commandTimeout?: number;
+      maxIterations?: number;
+      agentModelMap?: Record<string, string>;
+      agentProviderMap?: Record<string, string>;
+      webSearchConfig?: Record<string, unknown> | null;
+      quickMessages?: Array<Record<string, unknown>>;
+      showTerminalSelectionAction?: boolean;
+    };
   };
+
+  /**
+   * Encrypted-sidecar envelope for plugin user data that must survive missing
+   * plugins (sync:true settings, account/CRDT baselines). Secrets never appear here.
+   */
+  pluginSidecars?: import('./pluginSyncSidecar').PluginSyncSidecarBundle;
 
   // Sync metadata
   syncedAt: number;         // When this payload was created
+
+  // Reliability metadata used to make sync decisions auditable across devices.
+  syncMeta?: SyncReliabilityMeta;
+
+  /** Encrypted convergent-sync metadata. The adjacent fields remain a complete v1 snapshot. */
+  convergentSync?: ConvergentSyncEnvelopeV2;
+}
+
+export const SYNC_PAYLOAD_ENTITY_KEYS = [
+  'hosts',
+  'keys',
+  'identities',
+  'proxyProfiles',
+  'snippets',
+  'customGroups',
+  'snippetPackages',
+  'notes',
+  'noteGroups',
+  'portForwardingRules',
+  'knownHosts',
+  'groupConfigs',
+] as const;
+
+export const CLOUD_SYNC_PAYLOAD_ENTITY_KEYS = [
+  'hosts',
+  'keys',
+  'identities',
+  'proxyProfiles',
+  'snippets',
+  'customGroups',
+  'snippetPackages',
+  'notes',
+  'noteGroups',
+  'portForwardingRules',
+  'groupConfigs',
+] as const;
+
+export type SyncPayloadEntityKey = typeof SYNC_PAYLOAD_ENTITY_KEYS[number];
+export type CloudSyncPayloadEntityKey = typeof CLOUD_SYNC_PAYLOAD_ENTITY_KEYS[number];
+export type SyncChangeEntityKey = CloudSyncPayloadEntityKey | 'settings';
+
+export interface SyncEntityChangeCounts {
+  added: { local: number; remote: number };
+  modified: { local: number; remote: number };
+  deleted: { local: number; remote: number };
+}
+
+export interface SyncConflictDetail {
+  entityType: SyncChangeEntityKey;
+  id?: string;
+  kind:
+    | 'both-added'
+    | 'both-modified'
+    | 'local-deleted-remote-modified'
+    | 'remote-deleted-local-modified';
+}
+
+export interface SyncChangeSummary {
+  hasLocalChanges: boolean;
+  hasRemoteChanges: boolean;
+  hasConflicts: boolean;
+  byEntity: Partial<Record<SyncChangeEntityKey, SyncEntityChangeCounts>>;
+  conflicts: SyncConflictDetail[];
+}
+
+export interface SyncDeletionRecord {
+  entityType: CloudSyncPayloadEntityKey;
+  id: string;
+  deletedAt: number;
+  deviceId?: string;
+}
+
+export interface SyncReliabilityMeta {
+  schemaVersion: 1;
+  generatedAt: number;
+  deviceId?: string;
+  baseSyncedAt?: number;
+  localChanged: boolean;
+  deletions: SyncDeletionRecord[];
+  changeSummary: SyncChangeSummary;
+}
+
+export interface SyncSnapshotEntry {
+  id: string;
+  timestamp: number;
+  provider?: CloudProvider;
+  payload: SyncPayload;
+}
+
+export interface ConvergentProviderMigrationStatus {
+  provider: CloudProvider;
+  status: 'ready' | 'empty' | 'unavailable' | 'blocked';
+  schemaVersion: 1 | 2 | 'future' | 'invalid';
+  entityCount: number;
+  hasTrustedBaseline: boolean;
+  message?: string;
+}
+
+export interface ConvergentMigrationPreview {
+  schemaVersion: 2;
+  canInitialize: boolean;
+  entityCounts: Partial<Record<CloudSyncPayloadEntityKey, number>>;
+  settingsLeafCount: number;
+  conflictCount: number;
+  conflicts: ConvergentFieldConflict[];
+  shrinkFindings: Array<{ provider: CloudProvider; finding: Extract<ShrinkFinding, { suspicious: true }> }>;
+  providers: ConvergentProviderMigrationStatus[];
+  oldClientCompatibility: 'materialized-v1-snapshot';
+  blockedReasons: string[];
+}
+
+export interface ConvergentReplicaRecordV2 {
+  schemaVersion: 2;
+  state: ConvergentSyncStateV2;
+  updatedAt: number;
+}
+
+export interface ConvergentProviderBaselineV2 {
+  schemaVersion: 2;
+  provider: CloudProvider;
+  remoteVersion: number;
+  remoteUpdatedAt: number;
+  remoteDeviceId: string;
+  materializedPayload: SyncPayload;
+  state: ConvergentSyncStateV2;
+}
+
+export function hasSyncPayloadEntityData(
+  payload: SyncPayload,
+  keys: readonly SyncPayloadEntityKey[] = SYNC_PAYLOAD_ENTITY_KEYS,
+): boolean {
+  return keys.some((key) => {
+    const value = payload[key];
+    return Array.isArray(value) && value.length > 0;
+  });
 }
 
 // ============================================================================
@@ -285,12 +578,26 @@ export interface SyncResult {
   version?: number;
   error?: string;
   conflictDetected?: boolean;
-  /** Present when action === 'merge'; caller should apply this to update local state */
+  /** Present when sync produced or selected a payload that caller should apply locally */
   mergedPayload?: import('./sync').SyncPayload;
+  /** True when convergent sync already applied mergedPayload and committed its replica atomically. */
+  mergedPayloadApplied?: boolean;
+  /** Present with a downloaded payload so callers can commit the remote anchor after local apply succeeds. */
+  remoteFile?: SyncedFile;
   /** True when a shrink-detection guard blocked the upload */
   shrinkBlocked?: boolean;
   /** The finding that triggered the shrink block or force-push */
   finding?: ShrinkFinding;
+  /** Field-level conflicts retained by convergent sync v2. */
+  convergentConflicts?: ConvergentFieldConflict[];
+  /** Number of retained v2 conflicts; duplicated for lightweight status views. */
+  convergentConflictCount?: number;
+}
+
+export interface RemoteSyncPayload {
+  provider: CloudProvider;
+  payload: SyncPayload;
+  remoteFile: SyncedFile;
 }
 
 /**
@@ -304,6 +611,7 @@ export interface ConflictInfo {
   remoteVersion: number;
   remoteUpdatedAt: number;
   remoteDeviceName?: string;
+  changeSummary?: SyncChangeSummary;
 }
 
 /**
@@ -384,14 +692,26 @@ export const SYNC_STORAGE_KEYS = {
   DEVICE_ID: 'netcatty_device_id_v1',
   DEVICE_NAME: 'netcatty_device_name_v1',
   SYNC_CONFIG: 'netcatty_sync_config_v2',
+  /** Auto-sync prefs (autoSync / interval / syncStrategy); kept separate from version stamps. */
+  SYNC_PREFERENCES: 'netcatty_sync_preferences_v1',
   PROVIDER_GITHUB: 'netcatty_provider_github_v1',
   PROVIDER_GOOGLE: 'netcatty_provider_google_v1',
   PROVIDER_ONEDRIVE: 'netcatty_provider_onedrive_v1',
   PROVIDER_WEBDAV: 'netcatty_provider_webdav_v1',
   PROVIDER_S3: 'netcatty_provider_s3_v1',
   PROVIDER_SMB: 'netcatty_provider_smb_v1',
+  /** Registry of connected namespaced plugin sync provider IDs. */
+  PLUGIN_CLOUD_PROVIDERS: 'netcatty_plugin_cloud_providers_v1',
+  /** Contribution-available plugin sync provider IDs (live catalog membership). */
+  AVAILABLE_PLUGIN_SYNC_PROVIDERS: 'netcatty_available_plugin_sync_providers_v1',
+  /** Last successful sidecar collect (upload fallback when host is offline). */
+  PLUGIN_SIDECARS_LAST_KNOWN: 'netcatty_plugin_sidecars_last_known_v1',
+  /** Remote sidecar apply queued while the plugin host was unavailable. */
+  PLUGIN_SIDECARS_PENDING_REMOTE: 'netcatty_plugin_sidecars_pending_remote_v1',
   LOCAL_SYNC_META: 'netcatty_local_sync_meta_v1',
   SYNC_BASE_PAYLOAD: 'netcatty_sync_base_payload_v1',
+  CONVERGENT_REPLICA: 'netcatty_convergent_sync_replica_v2',
+  CONVERGENT_PROVIDER_BASELINE: 'netcatty_convergent_sync_provider_baseline_v2',
 } as const;
 
 // ============================================================================
@@ -465,23 +785,31 @@ export const getDefaultDeviceName = (): string => {
 };
 
 /**
+ * Format a sync timestamp as `yyyymmdd hhmm` (e.g. `20250628 1430`).
+ */
+export const formatSyncDateTime = (timestamp: number): string => {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  return `${year}${month}${day} ${hours}${minutes}`;
+};
+
+/**
  * Format last sync time for display
  */
 export const formatLastSync = (timestamp?: number): string => {
   if (!timestamp) return 'Never synced';
-  
+
   const now = Date.now();
   const diff = now - timestamp;
-  
+
   if (diff < 60000) return 'Just now';
   if (diff < 3600000) return `${Math.floor(diff / 60000)} min ago`;
-  if (diff < 86400000) {
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-  
-  const date = new Date(timestamp);
-  return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+
+  return formatSyncDateTime(timestamp);
 };
 
 /**

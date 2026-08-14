@@ -1,82 +1,82 @@
 import {
-  AlertTriangle,
   Check,
-  ChevronDown,
   Eye,
   EyeOff,
-  FolderLock,
+  FileText,
   FolderPlus,
-  Forward,
-  Globe,
-  Key,
-  KeyRound,
-  Link2,
-  MapPin,
-  Palette,
   Plus,
   Settings2,
-  Shield,
-  ShieldAlert,
   Tag,
-  TerminalSquare,
-  User,
-  FileKey,
-  FolderOpen,
-  Trash2,
-  Variable,
-  Wifi,
-  Router,
   X,
 } from "lucide-react";
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
-import { useApplicationBackend } from "../application/state/useApplicationBackend";
-import { resolveGroupDefaults, resolveGroupTerminalThemeId } from "../domain/groupConfig";
+import { useApplicationBackend, type SshAgentStatus } from "../application/state/useApplicationBackend";
+import { applyGroupDefaults, resolveGroupDefaults, resolveGroupTerminalThemeId } from "../domain/groupConfig";
 import {
   getEffectiveHostDistro,
-  LINUX_DISTRO_OPTIONS,
-  NETWORK_DEVICE_OPTIONS,
+  normalizePrimaryTelnetState,
 } from "../domain/host";
+import {
+  formatProxyConfigEndpoint,
+  formatProxyConfigType,
+  updateProxyConfigField,
+} from "../domain/proxyProfiles";
+import { hasRequiredHostAuthCredential, resolveHostAuth, resolveHostAuthMethodForPersistence } from "../domain/sshAuth";
 import { customThemeStore } from "../application/state/customThemeStore";
 import {
-  clearHostFontSizeOverride,
-  clearHostThemeOverride,
   hasHostFontSizeOverride,
   hasHostThemeOverride,
   resolveHostTerminalFontSize,
   resolveHostTerminalThemeId,
 } from "../domain/terminalAppearance";
-import { MIN_FONT_SIZE, MAX_FONT_SIZE } from "../infrastructure/config/fonts";
-import { cn } from "../lib/utils";
-import { EnvVar, GroupConfig, Host, Identity, ManagedSource, ProxyConfig, SSHKey } from "../types";
+import { EnvVar, GroupConfig, Host, Identity, ManagedSource, ProxyConfig, ProxyProfile, Snippet, SSHKey } from "../types";
 import { DISTRO_COLORS, DISTRO_LOGOS } from "./DistroAvatar";
-import { DistroAvatar } from "./DistroAvatar";
 import ThemeSelectPanel from "./ThemeSelectPanel";
 import {
   AsidePanel,
   AsidePanelContent,
   AsidePanelFooter,
   type AsidePanelLayout,
+  type AsidePanelResizeProps,
 } from "./ui/aside-panel";
-import { Badge } from "./ui/badge";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
+import { HostDetailsAdvancedSections } from "./HostDetailsAdvancedSections";
+import { detachEffectiveHostIdentity, HostDetailsConnectionSections } from "./HostDetailsConnectionSections";
+import {
+  LINUX_DISTRO_OPTION_IDS,
+  parseOptionalPortInput,
+  resolveDetailsTelnetPassword,
+  resolveDetailsTelnetPort,
+  resolveDetailsTelnetUsername,
+  resolvePrimaryProtocolSavePort,
+  resolvePrimaryProtocolSwitchPort,
+  prepareTelnetCredentialsForSave,
+  prepareProxyConfigForSave,
+} from "./HostDetailsPanel.helpers";
+export { parseOptionalPortInput } from "./HostDetailsPanel.helpers";
+import { TerminalEncodingSelect } from "./TerminalEncodingSelect";
 import { Button } from "./ui/button";
-import { Switch } from "./ui/switch";
-import { Card } from "./ui/card";
 import { Combobox, ComboboxOption, MultiCombobox } from "./ui/combobox";
 import { Input } from "./ui/input";
-import { Textarea } from "./ui/textarea";
-import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
-import { ScrollArea } from "./ui/scroll-area";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import { Switch } from "./ui/switch";
+import { toast } from "./ui/toast";
 
-// Import host-details sub-panels
 import {
   ChainPanel,
   CreateGroupPanel,
+  HostDetailsSection,
   EnvVarsPanel,
   ProxyPanel,
 } from "./host-details";
+import { HostNotesEditor } from "./host/HostNotesEditor";
+import { HostDetailsScriptsSection } from "./host/HostDetailsScriptsSection";
+import { ensureHostConnectScriptIds, getEditableHostConnectScriptIds, syncSnippetsForHostConnectQueueSave } from "@/domain/hostConnectScripts.ts";
+import {
+  isPluginHostProtocol,
+  sanitizePluginConnection,
+  stripBuiltInConnectionFieldsForPluginHost,
+} from "../domain/pluginConnection";
+import { PluginConnectionSection } from "./PluginConnectionSection";
 
 type CredentialType = "sshid" | "key" | "certificate" | "localKeyFile" | null;
 type SubPanel =
@@ -88,15 +88,11 @@ type SubPanel =
   | "theme-select"
   | "telnet-theme-select";
 
-const LINUX_DISTRO_OPTION_IDS = [
-  ...LINUX_DISTRO_OPTIONS,
-  ...NETWORK_DEVICE_OPTIONS,
-];
-
 interface HostDetailsPanelProps {
   initialData?: Host | null;
   availableKeys: SSHKey[];
   identities: Identity[];
+  proxyProfiles?: ProxyProfile[];
   groups: string[];
   managedSources?: ManagedSource[];
   allTags?: string[]; // All available tags for autocomplete
@@ -111,12 +107,20 @@ interface HostDetailsPanelProps {
   groupDefaults?: Partial<import('../domain/models').GroupConfig>;
   groupConfigs?: GroupConfig[];
   layout?: AsidePanelLayout;
+  onImportKey?: (draft: Partial<SSHKey>) => SSHKey;
+  snippets?: Snippet[];
+  onSnippetsChange?: (snippets: Snippet[]) => void;
+  onHostsChange?: (hosts: Host[] | ((prev: Host[]) => Host[])) => void;
+  className?: string;
 }
 
-const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
+type HostDetailsPanelPropsWithResize = HostDetailsPanelProps & AsidePanelResizeProps;
+
+const HostDetailsPanel: React.FC<HostDetailsPanelPropsWithResize> = ({
   initialData,
   availableKeys,
   identities,
+  proxyProfiles = [],
   groups,
   managedSources = [],
   allTags = [],
@@ -131,12 +135,28 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   groupDefaults,
   groupConfigs = [],
   layout = "overlay",
+  onImportKey,
+  snippets = [],
+  onSnippetsChange,
+  onHostsChange,
+  className,
+  resizable,
+  persistWidthStorageKey,
+  resizeAriaLabel,
 }) => {
   const { t } = useI18n();
+  const asideResizeProps = {
+    resizable,
+    persistWidthStorageKey,
+    resizeAriaLabel,
+  };
   const { checkSshAgent } = useApplicationBackend();
+  const baselineSnippetsRef = useRef(snippets);
+  const baselineHydratedRef = useRef(snippets.length > 0);
+  const openingQueueIdsRef = useRef<string[]>([]);
   const [form, setForm] = useState<Host>(
     () =>
-      initialData ||
+      (initialData ? normalizePrimaryTelnetState(initialData) : null) ||
       ({
         id: crypto.randomUUID(),
         label: "",
@@ -146,7 +166,8 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         protocol: "ssh",
         tags: [],
         os: "linux",
-        authMethod: "password",
+        authMethod: undefined,
+        authPolicyVersion: 1,
         charset: groupDefaults?.charset ? undefined : "UTF-8",
         distroMode: "auto",
         createdAt: Date.now(),
@@ -154,65 +175,151 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       } as Host),
   );
 
-  // Sub-panel state
   const [activeSubPanel, setActiveSubPanel] = useState<SubPanel>("none");
 
-  // Credential selection state
   const [credentialPopoverOpen, setCredentialPopoverOpen] = useState(false);
   const [selectedCredentialType, setSelectedCredentialType] =
     useState<CredentialType>(null);
 
-  // Identity suggestion dropdown state (popover anchored to username input)
   const [identitySuggestionsOpen, setIdentitySuggestionsOpen] = useState(false);
 
-  // Password visibility state
   const [showPassword, setShowPassword] = useState(false);
+  const [showTelnetPassword, setShowTelnetPassword] = useState(false);
+  const [showAlgorithmOverrides, setShowAlgorithmOverrides] = useState(false);
+  const [showNotesEditor, setShowNotesEditor] = useState(() => Boolean(initialData?.notes?.trim()));
+  const [pluginConnectionValid, setPluginConnectionValid] = useState(true);
 
-  // Local key file path input state
   const [newKeyFilePath, setNewKeyFilePath] = useState("");
+  const [pendingReferenceKeyPath, setPendingReferenceKeyPath] = useState<string | null>(null);
 
-  // New group creation state
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupParent, setNewGroupParent] = useState("");
 
-  // SSH Agent status for Windows (only checked when agentForwarding is enabled)
-  const [sshAgentStatus, setSshAgentStatus] = useState<{
-    running: boolean;
-    startupType: string | null;
-    error: string | null;
-  } | null>(null);
+  const [sshAgentStatus, setSshAgentStatus] = useState<SshAgentStatus | null>(null);
+  const [sshForwardingAgentStatus, setSshForwardingAgentStatus] = useState<SshAgentStatus | null>(null);
 
-  // Check SSH Agent status when agentForwarding is toggled on (Windows only)
   useEffect(() => {
-    if (form.agentForwarding) {
-      checkSshAgent().then(setSshAgentStatus);
+    let cancelled = false;
+    if (form.agentForwarding || form.useSshAgent === true) {
+      void checkSshAgent({
+        identityAgent: form.useSshAgent === true ? form.identityAgent : undefined,
+        hostname: form.hostname,
+        port: form.port,
+        username: form.username,
+      }).then((status) => {
+        if (!cancelled) setSshAgentStatus(status);
+      });
     } else {
       setSshAgentStatus(null);
     }
-  }, [form.agentForwarding, checkSshAgent]);
-
-  // Group input state for inline creation suggestion
-  const [groupInputValue, setGroupInputValue] = useState(form.group || "");
+    return () => {
+      cancelled = true;
+    };
+  }, [form.agentForwarding, form.useSshAgent, form.identityAgent, form.hostname, form.port, form.username, checkSshAgent]);
 
   useEffect(() => {
-    if (initialData) {
-      // Ensure telnetEnabled is set when protocol is telnet
-      const updatedData = { ...initialData };
-      if (initialData.protocol === "telnet" && !initialData.telnetEnabled) {
-        updatedData.telnetEnabled = true;
-        updatedData.telnetPort =
-          initialData.telnetPort || initialData.port || 23;
-      }
-      setForm(updatedData);
-      setGroupInputValue(initialData.group || "");
-      // Reset password visibility when host changes for privacy
-      setShowPassword(false);
+    let cancelled = false;
+    if (form.agentForwarding) {
+      void checkSshAgent({
+        identityAgent: form.identityAgent,
+        agentForwarding: true,
+        hostname: form.hostname,
+        port: form.port,
+        username: form.username,
+      }).then((status) => {
+        if (!cancelled) setSshForwardingAgentStatus(status);
+      });
+    } else {
+      setSshForwardingAgentStatus(null);
     }
-  }, [initialData]);
+    return () => {
+      cancelled = true;
+    };
+  }, [form.agentForwarding, form.identityAgent, form.hostname, form.port, form.username, checkSshAgent]);
+
+  const [groupInputValue, setGroupInputValue] = useState(form.group || "");
+
+  const initialHostId = initialData?.id;
+
+  useEffect(() => {
+    baselineSnippetsRef.current = snippets;
+    baselineHydratedRef.current = snippets.length > 0;
+    if (!initialData) {
+      openingQueueIdsRef.current = [];
+    } else {
+      const normalized = normalizePrimaryTelnetState(initialData);
+      const ensured = snippets.length > 0
+        ? ensureHostConnectScriptIds(normalized, snippets)
+        : normalized;
+      openingQueueIdsRef.current = getEditableHostConnectScriptIds(ensured, snippets);
+    }
+    // Snapshot only when opening/reopening a host editor, not on live snippet edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialHostId]);
+
+  useEffect(() => {
+    // If the editor opened before snippets hydrated, capture the first non-empty
+    // catalog as baseline so concurrent-edit guards still have a reference.
+    if (baselineHydratedRef.current) return;
+    if (snippets.length === 0) return;
+    baselineSnippetsRef.current = snippets;
+    baselineHydratedRef.current = true;
+    if (initialData) {
+      const normalized = normalizePrimaryTelnetState(initialData);
+      const ensured = ensureHostConnectScriptIds(normalized, snippets);
+      openingQueueIdsRef.current = getEditableHostConnectScriptIds(ensured, snippets);
+    }
+  }, [initialData, snippets]);
+
+  useEffect(() => {
+    if (!initialData) return;
+    const normalized = normalizePrimaryTelnetState(initialData);
+    setForm(
+      snippets.length > 0
+        ? ensureHostConnectScriptIds(normalized, snippets)
+        : normalized,
+    );
+    setGroupInputValue(initialData.group || "");
+    setPendingReferenceKeyPath(null);
+    setShowPassword(false);
+    setShowTelnetPassword(false);
+    setShowNotesEditor(Boolean(normalized.notes?.trim()));
+    // Reset only when opening a different host — not when snippets list updates.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialHostId]);
+
+  useEffect(() => {
+    if (!initialData || snippets.length === 0) return;
+    setForm((prev) => {
+      if (prev.id !== initialData.id) return prev;
+      const synced = ensureHostConnectScriptIds(prev, snippets);
+      if (
+        synced.connectScriptIds === prev.connectScriptIds
+        && synced.loginScriptId === prev.loginScriptId
+      ) {
+        return prev;
+      }
+      return synced;
+    });
+  }, [initialData, snippets]);
 
   const update = <K extends keyof Host>(key: K, value: Host[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
   };
+
+  const addLocalKeyFilePath = useCallback((path: string) => {
+    const trimmed = path.trim();
+    if (!trimmed) return;
+    setForm((prev) => ({
+      ...prev,
+      identityFilePaths: onImportKey ? [trimmed] : [...(prev.identityFilePaths || []), trimmed],
+      identityFileId: undefined,
+      authMethod: "key",
+    }));
+    setPendingReferenceKeyPath(onImportKey ? trimmed : null);
+    setNewKeyFilePath("");
+    setSelectedCredentialType(null);
+  }, [onImportKey]);
 
   const effectiveGroupDefaults = useMemo(() => {
     const currentGroupPath = form.group || defaultGroup;
@@ -221,6 +328,23 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     }
     return groupDefaults;
   }, [defaultGroup, form.group, groupConfigs, groupDefaults]);
+
+  const effectiveAuthHost = useMemo(
+    () => effectiveGroupDefaults ? applyGroupDefaults(form, effectiveGroupDefaults) : form,
+    [effectiveGroupDefaults, form],
+  );
+
+  const selectedIdentity = useMemo(() => {
+    if (!effectiveAuthHost.identityId) return undefined;
+    return identities.find((i) => i.id === effectiveAuthHost.identityId);
+  }, [effectiveAuthHost.identityId, identities]);
+
+  const effectiveAuth = useMemo(() => resolveHostAuth({
+    host: effectiveAuthHost,
+    keys: availableKeys,
+    identities,
+  }), [availableKeys, effectiveAuthHost, identities]);
+  const effectiveAuthMethod = effectiveAuth.authMethod;
 
   const effectiveThemeId = useMemo(
     () => resolveHostTerminalThemeId(form, resolveGroupTerminalThemeId(effectiveGroupDefaults, terminalThemeId)),
@@ -240,6 +364,9 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   );
   const effectiveTelnetThemeId =
     form.protocols?.find((p) => p.protocol === "telnet")?.theme || effectiveThemeId;
+  const effectiveTelnetPort = resolveDetailsTelnetPort(form, effectiveGroupDefaults);
+  const effectiveTelnetUsername = resolveDetailsTelnetUsername(form, effectiveGroupDefaults);
+  const effectiveTelnetPassword = resolveDetailsTelnetPassword(form, effectiveGroupDefaults);
   const distroOptions = useMemo(
     () =>
       LINUX_DISTRO_OPTION_IDS.map((value) => ({
@@ -260,6 +387,24 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   );
 
   const effectiveFormDistro = getEffectiveHostDistro(form);
+  const selectedProxyProfile = useMemo(
+    () => proxyProfiles.find((profile) => profile.id === form.proxyProfileId),
+    [form.proxyProfileId, proxyProfiles],
+  );
+  const hasMissingProxyProfile = Boolean(form.proxyProfileId && !selectedProxyProfile);
+  const proxySummaryType = hasMissingProxyProfile
+    ? t("hostDetails.proxyPanel.missing")
+    : formatProxyConfigType(selectedProxyProfile?.config || form.proxyConfig) || "HTTP";
+  const proxySummaryLabel = hasMissingProxyProfile
+    ? t("hostDetails.proxyPanel.missingSaved")
+    : selectedProxyProfile
+      ? selectedProxyProfile.label
+      : formatProxyConfigEndpoint(form.proxyConfig);
+  const proxySummaryTooltip = hasMissingProxyProfile
+    ? t("hostDetails.proxyPanel.missingSaved")
+    : selectedProxyProfile
+      ? `${selectedProxyProfile.label} - ${formatProxyConfigEndpoint(selectedProxyProfile.config)}`
+      : `${formatProxyConfigType(form.proxyConfig)} ${formatProxyConfigEndpoint(form.proxyConfig)}`;
 
   const handleDistroModeChange = useCallback((mode: "auto" | "manual") => {
     setForm((prev) => ({
@@ -273,25 +418,30 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   }, []);
 
   const updateProxyConfig = useCallback(
-    (field: keyof ProxyConfig, value: string | number) => {
-      setForm((prev) => ({
-        ...prev,
-        proxyConfig: {
-          type: prev.proxyConfig?.type || "http",
-          host: prev.proxyConfig?.host || "",
-          port: prev.proxyConfig?.port || 8080,
-          ...prev.proxyConfig,
-          [field]: value,
-        },
-      }));
+    (field: keyof ProxyConfig, value: ProxyConfig[keyof ProxyConfig]) => {
+      setForm((prev) => {
+        const { proxyProfileId: _proxyProfileId, ...rest } = prev;
+        return {
+          ...rest,
+          proxyConfig: updateProxyConfigField(prev.proxyConfig, field, value),
+        } as Host;
+      });
     },
     [],
   );
 
   const clearProxyConfig = useCallback(() => {
     setForm((prev) => {
-      const { proxyConfig: _proxyConfig, ...rest } = prev;
+      const { proxyConfig: _proxyConfig, proxyProfileId: _proxyProfileId, ...rest } = prev;
       return rest as Host;
+    });
+  }, []);
+
+  const selectProxyProfile = useCallback((profileId: string | undefined) => {
+    setForm((prev) => {
+      const { proxyConfig: _proxyConfig, proxyProfileId: _proxyProfileId, ...rest } = prev;
+      if (!profileId) return rest as Host;
+      return { ...rest, proxyProfileId: profileId } as Host;
     });
   }, []);
 
@@ -318,7 +468,6 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     });
   }, []);
 
-  // Environment variables state
   const [newEnvName, setNewEnvName] = useState("");
   const [newEnvValue, setNewEnvValue] = useState("");
 
@@ -339,54 +488,119 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       return { ...prev, environmentVariables: filtered.length > 0 ? filtered : undefined };
     });
   };
+  const pluginProtocolActive = isPluginHostProtocol(form.protocol);
+  const hasHostname = form.hostname.trim().length > 0;
+  const canSaveHost = pluginProtocolActive
+    ? pluginConnectionValid && Boolean(sanitizePluginConnection(form.pluginConnection, form.protocol))
+    : hasHostname;
 
   const handleSubmit = () => {
-    if (!form.hostname) return;
-    // If label is empty, use hostname as label
-    let finalLabel = form.label?.trim() || form.hostname;
+    const hostname = form.hostname.trim()
+      || (pluginProtocolActive ? form.label.trim() || form.pluginConnection?.providerId || "plugin" : "");
+    if (!hostname || !canSaveHost) return;
+    if (!pluginProtocolActive && !hasRequiredHostAuthCredential({ host: effectiveAuthHost, keys: availableKeys, identities })) {
+      toast.error(t("hostDetails.auth.credentialRequired"));
+      return;
+    }
+    const proxySave = pluginProtocolActive
+      ? { normalizedProxyConfig: undefined, error: undefined }
+      : prepareProxyConfigForSave({
+      proxyConfig: form.proxyConfig,
+      proxyProfileId: form.proxyProfileId,
+      proxyProfiles,
+      identities,
+    });
+    if (proxySave.error) {
+      const messageKey = proxySave.error === "port"
+        ? "proxyProfiles.error.port"
+        : proxySave.error === "required"
+          ? "hostDetails.proxyPanel.error.required"
+          : proxySave.error === "missingSaved"
+            ? "hostDetails.proxyPanel.missingSaved"
+            : proxySave.error === "missingIdentity"
+              ? "hostDetails.proxyPanel.missingIdentity"
+              : proxySave.error === "incompleteIdentity"
+                ? "hostDetails.proxyPanel.incompleteIdentity"
+                : "hostDetails.proxyPanel.unreadableIdentity";
+      toast.error(t(messageKey));
+      setActiveSubPanel("proxy");
+      return;
+    }
+    const normalizedProxyConfig = proxySave.normalizedProxyConfig;
+    let finalLabel = form.label?.trim() || hostname;
     const finalGroup = groupInputValue.trim() || form.group || "";
 
-    // Find the most specific (deepest) managed source that matches the group path
-    // This handles nested managed groups correctly by preferring exact matches
-    // and longer paths over shorter prefix matches
     const targetManagedSource = managedSources
       .filter(s => finalGroup === s.groupName || finalGroup.startsWith(s.groupName + "/"))
       .sort((a, b) => b.groupName.length - a.groupName.length)[0];
 
-    // Only SSH hosts can be managed (SSH config only supports SSH protocol)
     const canBeManaged = !form.protocol || form.protocol === "ssh";
 
-    // Strip spaces from label only if host can be managed and is in a managed group
-    // (SSH config requires no spaces in Host alias)
     if (targetManagedSource && canBeManaged) {
       finalLabel = finalLabel.replace(/\s/g, '');
     }
 
-    // Determine managedSourceId:
-    // - Only SSH hosts can be managed (SSH config only supports SSH protocol)
-    // - If we found a matching managed source, use its id
-    // - If managedSources was not provided (empty array) and host already has managedSourceId, preserve it
-    // - Otherwise, clear it (host is not in a managed group)
     let finalManagedSourceId: string | undefined;
     if (targetManagedSource && canBeManaged) {
       finalManagedSourceId = targetManagedSource.id;
     } else if (managedSources.length === 0 && form.managedSourceId && canBeManaged) {
-      // managedSources not provided, preserve existing value
       finalManagedSourceId = form.managedSourceId;
     } else {
       finalManagedSourceId = undefined;
     }
 
-    const cleaned: Host = {
-      ...form,
+    const { proxyConfig: _draftProxyConfig, ...formWithoutProxyDraft } = form;
+    const finalPort = resolvePrimaryProtocolSavePort(
+      form.protocol,
+      form.port,
+      Boolean(groupDefaults?.port),
+      Boolean(groupDefaults?.telnetPort),
+    );
+    let cleaned: Host = {
+      ...formWithoutProxyDraft,
+      ...(normalizedProxyConfig && { proxyConfig: normalizedProxyConfig }),
+      hostname,
       label: finalLabel,
       group: finalGroup,
       tags: form.tags || [],
-      port: form.port ?? (groupDefaults?.port ? undefined : 22),
-      // Clear password if savePassword is explicitly set to false
+      notes: form.notes?.trim() || undefined,
+      port: finalPort,
       password: form.savePassword === false ? undefined : form.password,
+      authMethod: resolveHostAuthMethodForPersistence({
+        host: form,
+        keys: availableKeys,
+        identities,
+        groupDefaults: effectiveGroupDefaults,
+      }),
+      authPolicyVersion: 1,
       managedSourceId: finalManagedSourceId,
     };
+    if (pluginProtocolActive) {
+      const pluginConnection = sanitizePluginConnection(cleaned.pluginConnection, cleaned.protocol);
+      if (!pluginConnection) return;
+      cleaned = stripBuiltInConnectionFieldsForPluginHost({ ...cleaned, pluginConnection });
+    }
+    cleaned = prepareTelnetCredentialsForSave(normalizePrimaryTelnetState(cleaned));
+    if (
+      onImportKey &&
+      pendingReferenceKeyPath &&
+      cleaned.identityFilePaths?.includes(pendingReferenceKeyPath)
+    ) {
+      const fileName = pendingReferenceKeyPath.split('/').pop() || pendingReferenceKeyPath;
+      const key = onImportKey({
+        source: 'reference',
+        filePath: pendingReferenceKeyPath,
+        label: fileName,
+        privateKey: '',
+        category: 'key',
+      });
+      cleaned = {
+        ...cleaned,
+        identityFileId: key.id,
+        identityFilePaths: [pendingReferenceKeyPath],
+        authMethod: "key",
+      };
+    }
     const preserveLegacyTheme = initialData?.theme != null && cleaned.themeOverride !== false;
     const preserveLegacyFontFamily = initialData?.fontFamily != null && cleaned.fontFamilyOverride !== false;
     const preserveLegacyFontSize = initialData?.fontSize != null && cleaned.fontSizeOverride !== false;
@@ -408,7 +622,86 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     } else if (preserveLegacyFontSize && cleaned.fontSize == null) {
       cleaned.fontSize = initialData?.fontSize;
     }
-    onSave(cleaned);
+
+    if ((cleaned.protocol && cleaned.protocol !== "ssh") || cleaned.moshEnabled || cleaned.etEnabled) {
+      delete cleaned.x11Forwarding;
+    }
+    if (onSnippetsChange || onHostsChange) {
+      const hostId = cleaned.id;
+      if (snippets.length === 0 && !baselineHydratedRef.current) {
+        // Vault may publish hosts before snippets hydrate. Do not wipe unresolved
+        // connectScriptIds while the script catalog is still incomplete.
+      } else {
+        const savedQueueIds = openingQueueIdsRef.current;
+        const finalQueueIds = getEditableHostConnectScriptIds(cleaned, snippets);
+        const synced = syncSnippetsForHostConnectQueueSave(
+          snippets,
+          hostId,
+          savedQueueIds,
+          finalQueueIds,
+          {
+            baselineSnippets: baselineSnippetsRef.current,
+            hosts: allHosts,
+          },
+        );
+        cleaned = {
+          ...cleaned,
+          connectScriptIds: synced.connectScriptIds.length > 0
+            ? synced.connectScriptIds
+            : undefined,
+          // sanitizeHost reconstitutes connectScriptIds from loginScriptId when
+          // the explicit queue is absent; clear the legacy field when emptied.
+          ...(synced.connectScriptIds.length === 0
+            ? { loginScriptId: undefined }
+            : {}),
+        };
+        if (synced.changed && onSnippetsChange) {
+          onSnippetsChange(synced.snippets);
+        }
+        if (onHostsChange && synced.hosts.length > 0) {
+          const peerChanged = synced.hosts.some((host) => {
+            if (host.id === cleaned.id) return false;
+            const original = allHosts.find((entry) => entry.id === host.id);
+            return original !== undefined && original !== host;
+          });
+          if (peerChanged) {
+            // Append only the script IDs this save newly queued onto each peer.
+            // Leave the edited host alone so onSave can three-way merge it.
+            onHostsChange((prevHosts) => {
+              const peerAdds = new Map<string, string[]>();
+              for (const syncedHost of synced.hosts) {
+                if (syncedHost.id === cleaned.id) continue;
+                const snapshot = allHosts.find((entry) => entry.id === syncedHost.id);
+                if (!snapshot || snapshot === syncedHost) continue;
+                const snapshotIds = snapshot.connectScriptIds ?? [];
+                const addedIds = (syncedHost.connectScriptIds ?? []).filter(
+                  (id) => !snapshotIds.includes(id),
+                );
+                if (addedIds.length > 0) peerAdds.set(syncedHost.id, addedIds);
+              }
+              return prevHosts.map((host) => {
+                if (host.id === cleaned.id) return host;
+                const addedIds = peerAdds.get(host.id);
+                if (!addedIds || addedIds.length === 0) return host;
+                const currentIds = host.connectScriptIds ?? [];
+                const mergedIds = [...currentIds];
+                for (const id of addedIds) {
+                  if (!mergedIds.includes(id)) mergedIds.push(id);
+                }
+                if (
+                  mergedIds.length === currentIds.length
+                  && mergedIds.every((id, index) => id === currentIds[index])
+                ) {
+                  return host;
+                }
+                return { ...host, connectScriptIds: mergedIds };
+              });
+            });
+          }
+        }
+      }
+    }
+    onSave(stripBuiltInConnectionFieldsForPluginHost(cleaned));
   };
 
   const handleCreateGroup = () => {
@@ -424,13 +717,11 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     setActiveSubPanel("none");
   };
 
-  // Get available hosts for chain (exclude current host)
   const availableHostsForChain = useMemo(() => {
     const chainedIds = new Set(form.hostChain?.hostIds || []);
     return allHosts.filter((h) => h.id !== form.id && !chainedIds.has(h.id));
   }, [allHosts, form.id, form.hostChain?.hostIds]);
 
-  // Get hosts in chain
   const chainedHosts = useMemo(() => {
     const ids = form.hostChain?.hostIds || [];
     return ids
@@ -438,7 +729,6 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       .filter(Boolean) as Host[];
   }, [allHosts, form.hostChain?.hostIds]);
 
-  // Compute group options for Combobox
   const groupOptions: ComboboxOption[] = useMemo(() => {
     return groups.map((g) => ({
       value: g,
@@ -447,13 +737,11 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     }));
   }, [groups]);
 
-  // Compute tag options for MultiCombobox
   const tagOptions: ComboboxOption[] = useMemo(() => {
     const allTagSet = new Set([...allTags, ...(form.tags || [])]);
     return Array.from(allTagSet).map((t) => ({ value: t, label: t }));
   }, [allTags, form.tags]);
 
-  // Available keys by category
   const keysByCategory = useMemo(() => {
     return {
       key: availableKeys.filter((k) => k.category === "key"),
@@ -462,10 +750,20 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     };
   }, [availableKeys]);
 
-  const selectedIdentity = useMemo(() => {
-    if (!form.identityId) return undefined;
-    return identities.find((i) => i.id === form.identityId);
-  }, [form.identityId, identities]);
+  const selectedTelnetIdentity = useMemo(() => {
+    if (!form.telnetIdentityId) return undefined;
+    return identities.find((i) => i.id === form.telnetIdentityId);
+  }, [form.telnetIdentityId, identities]);
+
+  const telnetIdentityOptions: ComboboxOption[] = useMemo(
+    () =>
+      identities.map((identity) => ({
+        value: identity.id,
+        label: identity.label,
+        sublabel: identity.username,
+      })),
+    [identities],
+  );
 
   const filteredIdentitySuggestions = useMemo(() => {
     if (selectedIdentity) return [];
@@ -499,6 +797,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         identityFileId: undefined,
         identityFilePaths: undefined,
       }));
+      setPendingReferenceKeyPath(null);
       setSelectedCredentialType(null);
       setCredentialPopoverOpen(false);
       setIdentitySuggestionsOpen(false);
@@ -507,11 +806,23 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   );
 
   const clearIdentity = useCallback(() => {
-    setForm((prev) => ({ ...prev, identityId: undefined }));
+    setForm((prev) => detachEffectiveHostIdentity(prev, effectiveAuth.username));
     setIdentitySuggestionsOpen(false);
+  }, [effectiveAuth.username]);
+
+  const updateTelnetIdentity = useCallback((identityId: string) => {
+    setForm((prev) => ({
+      ...prev,
+      telnetIdentityId: identityId || undefined,
+      ...(identityId
+        ? {
+          telnetUsername: undefined,
+          telnetPassword: undefined,
+        }
+        : {}),
+    }));
   }, []);
 
-  // Render sub-panels
   if (activeSubPanel === "create-group") {
     return (
       <CreateGroupPanel
@@ -524,6 +835,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
@@ -532,11 +844,16 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     return (
       <ProxyPanel
         proxyConfig={form.proxyConfig}
+        proxyProfiles={proxyProfiles}
+        identities={identities}
+        selectedProxyProfileId={form.proxyProfileId}
         onUpdateProxy={updateProxyConfig}
+        onSelectProxyProfile={selectProxyProfile}
         onClearProxy={clearProxyConfig}
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
@@ -555,11 +872,11 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
 
-  // Environment Variables sub-panel
   if (activeSubPanel === "env-vars") {
     return (
       <EnvVarsPanel
@@ -584,11 +901,11 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         onCancel={onCancel}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
 
-  // Theme selection sub-panel (SSH)
   if (activeSubPanel === "theme-select") {
     return (
       <ThemeSelectPanel
@@ -606,18 +923,17 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         showBackButton={true}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
 
-  // Theme selection sub-panel (Telnet)
   if (activeSubPanel === "telnet-theme-select") {
     return (
       <ThemeSelectPanel
         open={true}
         selectedThemeId={effectiveTelnetThemeId}
         onSelect={(themeId) => {
-          // Update telnet protocol theme
           const telnetConfig = form.protocols?.find(
             (p) => p.protocol === "telnet",
           );
@@ -627,12 +943,11 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
             );
             setForm((prev) => ({ ...prev, protocols: newProtocols }));
           } else {
-            // Create new telnet protocol config with theme
             const newProtocols = [
               ...(form.protocols || []),
               {
                 protocol: "telnet" as const,
-                port: form.telnetPort || 23,
+                port: effectiveTelnetPort,
                 enabled: true,
                 theme: themeId,
               },
@@ -645,18 +960,20 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         onBack={() => setActiveSubPanel("none")}
         showBackButton={true}
         layout={layout}
+        {...asideResizeProps}
       />
     );
   }
 
-  // Main panel
   return (
     <AsidePanel
       open={true}
       onClose={onCancel}
       width="w-[420px]"
       layout={layout}
+      className={className}
       dataSection="host-details-panel"
+      {...asideResizeProps}
       title={
         initialData ? t("hostDetails.title.details") : t("hostDetails.title.new")
       }
@@ -666,7 +983,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
           size="icon"
           className="h-8 w-8"
           onClick={handleSubmit}
-          disabled={!form.hostname}
+          disabled={!canSaveHost}
           aria-label={t("hostDetails.saveAria")}
         >
           <Check size={16} />
@@ -674,25 +991,19 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       }
     >
       <AsidePanelContent>
-        <Card className="p-3 space-y-3 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <Settings2 size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">
-              {t("hostDetails.section.general")}
-            </p>
-          </div>
+        <HostDetailsSection
+          icon={<Settings2 size={14} className="text-muted-foreground" />}
+          title={t("hostDetails.section.general")}
+        >
           <Input
             placeholder={t("hostDetails.label.placeholder")}
             value={form.label}
             onChange={(e) => {
               let value = e.target.value;
-              // Only strip spaces if the TARGET group belongs to a managed source
-              // (don't use form.managedSourceId as it reflects old state before group change)
               const targetGroup = groupInputValue.trim() || form.group || "";
               const willBeManaged = managedSources.some(s =>
                 targetGroup === s.groupName || targetGroup.startsWith(s.groupName + "/")
               );
-              // Also check protocol - only SSH hosts can be managed
               const canBeManaged = !form.protocol || form.protocol === "ssh";
               if (willBeManaged && canBeManaged) {
                 value = value.replace(/\s/g, '');
@@ -702,7 +1013,6 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
             className="h-10"
           />
 
-          {/* Group selection with Combobox */}
           <div className="flex items-center gap-2">
             <div className="h-10 w-10 rounded-lg bg-secondary/80 flex items-center justify-center shrink-0">
               <FolderPlus size={16} className="text-muted-foreground" />
@@ -726,7 +1036,6 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
             />
           </div>
 
-          {/* Tag selection with MultiCombobox */}
           <div className="flex items-center gap-2">
             <div className="h-10 w-10 rounded-lg bg-secondary/80 flex items-center justify-center shrink-0">
               <Tag size={16} className="text-muted-foreground" />
@@ -742,1156 +1051,222 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
               triggerClassName="flex-1 min-h-10"
             />
           </div>
-        </Card>
+        </HostDetailsSection>
 
-        <Card className="p-3 space-y-2 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <MapPin size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">
-              {t("hostDetails.section.address")}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <DistroAvatar
-              host={form as Host}
-              fallback={
-                form.label?.slice(0, 2).toUpperCase() ||
-                form.hostname?.slice(0, 2).toUpperCase() ||
-                "H"
-              }
-              className="h-10 w-10"
-            />
-            <Input
-              placeholder={t("hostDetails.hostname.placeholder")}
-              value={form.hostname}
-              onChange={(e) => update("hostname", e.target.value)}
-              className="h-10 flex-1"
-            />
-          </div>
-        </Card>
+        <PluginConnectionSection
+          form={form}
+          setForm={setForm}
+          t={t}
+          onValidityChange={setPluginConnectionValid}
+          identities={identities}
+          keys={availableKeys}
+        />
 
-        <Card className="p-3 space-y-3 bg-card border-border/80 overflow-hidden">
-          <div className="flex items-center gap-2">
-            <KeyRound size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">
-              {t("hostDetails.section.portCredentials")}
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="flex-1 min-w-0 h-10 flex items-center gap-2 bg-secondary/70 border border-border/70 rounded-md px-3">
-              <span className="text-xs text-muted-foreground">SSH on</span>
-              <div className="ml-auto w-1/2 min-w-0 flex items-center gap-2 justify-end">
-                <Input
-                  type="number"
-                  value={form.port ?? ""}
-                  onChange={(e) => update("port", e.target.value ? Number(e.target.value) : undefined)}
-                  placeholder={groupDefaults?.port ? String(groupDefaults.port) : "22"}
-                  className="h-8 flex-1 min-w-0 text-center"
-                />
-                <span className="text-xs text-muted-foreground">
-                  {t("hostDetails.port")}
-                </span>
-              </div>
-            </div>
-          </div>
-          <div className="grid gap-2">
-            {selectedIdentity ? (
-              <div className="flex items-center gap-2 h-10 px-3 rounded-md border border-border/70 bg-secondary/60">
-                <User size={16} className="text-muted-foreground" />
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium truncate">
-                    {selectedIdentity.label}
-                  </div>
-                </div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8 shrink-0"
-                  onClick={clearIdentity}
-                  title={t("common.clear")}
-                >
-                  <X size={14} />
-                </Button>
-              </div>
-            ) : form.identityId ? (
-              <div className="flex items-center gap-2 h-10 px-3 rounded-md border border-border/70 bg-secondary/60">
-                <User size={16} className="text-muted-foreground" />
-                <div className="min-w-0 flex-1">
-                  <div className="text-sm font-medium truncate">
-                    {t("hostDetails.identity.missing")}
-                  </div>
-                </div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8 shrink-0"
-                  onClick={clearIdentity}
-                  title={t("common.clear")}
-                >
-                  <X size={14} />
-                </Button>
-              </div>
-            ) : (
-              (() => {
-                const hasIdentities = identities.length > 0;
-                if (!hasIdentities) {
-                  return (
-                    <Input
-                      placeholder={groupDefaults?.username || t("hostDetails.username.placeholder")}
-                      value={form.username}
-                      onChange={(e) => update("username", e.target.value)}
-                      className="h-10"
-                    />
-                  );
-                }
+        {!pluginProtocolActive ? <HostDetailsConnectionSections
+          t={t}
+          form={form}
+          setForm={setForm}
+          update={update}
+          groupDefaults={effectiveGroupDefaults}
+          effectiveAuthMethod={effectiveAuthMethod}
+          effectiveUsername={effectiveAuth.username}
+          effectiveIdentityId={effectiveAuthHost.identityId}
+          selectedIdentity={selectedIdentity}
+          clearIdentity={clearIdentity}
+          identities={identities}
+          identitySuggestionsOpen={identitySuggestionsOpen}
+          filteredIdentitySuggestions={filteredIdentitySuggestions}
+          setIdentitySuggestionsOpen={setIdentitySuggestionsOpen}
+          availableKeys={availableKeys}
+          applyIdentity={applyIdentity}
+          showPassword={showPassword}
+          setShowPassword={setShowPassword}
+          pendingReferenceKeyPath={pendingReferenceKeyPath}
+          setPendingReferenceKeyPath={setPendingReferenceKeyPath}
+          selectedCredentialType={selectedCredentialType}
+          setSelectedCredentialType={setSelectedCredentialType}
+          credentialPopoverOpen={credentialPopoverOpen}
+          setCredentialPopoverOpen={setCredentialPopoverOpen}
+          keysByCategory={keysByCategory}
+          newKeyFilePath={newKeyFilePath}
+          setNewKeyFilePath={setNewKeyFilePath}
+          addLocalKeyFilePath={addLocalKeyFilePath}
+          handleDistroModeChange={handleDistroModeChange}
+          distroOptions={distroOptions}
+          effectiveFormDistro={effectiveFormDistro}
+          getDistroOptionLabel={getDistroOptionLabel}
+        /> : null}
 
-                return (
-                  <Popover
-                    open={
-                      identitySuggestionsOpen &&
-                      filteredIdentitySuggestions.length > 0
-                    }
-                    onOpenChange={setIdentitySuggestionsOpen}
-                  >
-                    <PopoverTrigger asChild>
-                      <div className="relative">
-                        <Input
-                          placeholder={groupDefaults?.username || t("hostDetails.username.placeholder")}
-                          value={form.username}
-                          onChange={(e) => {
-                            const next = e.target.value;
-                            update("username", next);
-                            const q = next.toLowerCase().trim();
-                            const matches = q
-                              ? identities.filter(
-                                (i) =>
-                                  i.label.toLowerCase().includes(q) ||
-                                  i.username.toLowerCase().includes(q),
-                              )
-                              : identities;
-                            setIdentitySuggestionsOpen(matches.length > 0);
-                          }}
-                          onFocus={() => {
-                            const q = (form.username || "").toLowerCase().trim();
-                            const matches = q
-                              ? identities.filter(
-                                (i) =>
-                                  i.label.toLowerCase().includes(q) ||
-                                  i.username.toLowerCase().includes(q),
-                              )
-                              : identities;
-                            setIdentitySuggestionsOpen(matches.length > 0);
-                          }}
-                          className="h-10 pr-9"
-                        />
-                        <button
-                          type="button"
-                          className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                          onClick={() => {
-                            setIdentitySuggestionsOpen((prev) => {
-                              if (prev) return false;
-                              const q = (form.username || "")
-                                .toLowerCase()
-                                .trim();
-                              const matches = q
-                                ? identities.filter(
-                                  (i) =>
-                                    i.label.toLowerCase().includes(q) ||
-                                    i.username.toLowerCase().includes(q),
-                                )
-                                : identities;
-                              return matches.length > 0;
-                            });
-                          }}
-                          title={t("hostDetails.identity.suggestions")}
-                        >
-                          <ChevronDown size={16} />
-                        </button>
-                      </div>
-                    </PopoverTrigger>
-                    <PopoverContent
-                      className="p-0 border-border/60"
-                      align="start"
-                      sideOffset={4}
-                      onOpenAutoFocus={(e) => e.preventDefault()}
-                      style={{ width: "var(--radix-popover-trigger-width)" }}
-                    >
-                      <ScrollArea className="max-h-[280px]">
-                        <div className="p-1">
-                          {filteredIdentitySuggestions.length === 0 ? (
-                            <div className="py-4 text-center text-sm text-muted-foreground">
-                              {t("common.noResultsFound")}
-                            </div>
-                          ) : (
-                            <div className="space-y-1">
-                              {filteredIdentitySuggestions.map((identity) => {
-                                const keyLabel = identity.keyId
-                                  ? availableKeys.find(
-                                    (k) => k.id === identity.keyId,
-                                  )?.label
-                                  : undefined;
-                                const methodLabel =
-                                  identity.authMethod === "certificate"
-                                    ? t("hostDetails.credential.certificate")
-                                    : identity.authMethod === "key"
-                                      ? t("hostDetails.credential.key")
-                                      : t("keychain.identity.method.passwordOnly");
-                                const summaryParts = [
-                                  identity.username,
-                                  identity.password ? "******" : undefined,
-                                  keyLabel,
-                                ].filter(Boolean);
+        {onSnippetsChange ? (
+          <HostDetailsScriptsSection
+            host={form}
+            onHostChange={setForm}
+            snippets={snippets}
+            t={t}
+          />
+        ) : null}
 
-                                return (
-                                  <button
-                                    key={identity.id}
-                                    type="button"
-                                    className="w-full flex items-center gap-3 px-3 py-2 rounded-md hover:bg-secondary/80 transition-colors text-left"
-                                    onMouseDown={(e) => {
-                                      e.preventDefault();
-                                      applyIdentity(identity);
-                                    }}
-                                  >
-                                    <div className="h-8 w-8 rounded-md bg-green-500/15 text-green-500 flex items-center justify-center shrink-0">
-                                      <User size={16} />
-                                    </div>
-                                    <div className="min-w-0 flex-1">
-                                      <div className="text-sm font-medium truncate">
-                                        {identity.label}
-                                      </div>
-                                      <div className="text-xs text-muted-foreground truncate">
-                                        {methodLabel}
-                                        {summaryParts.length
-                                          ? ` - ${summaryParts.join(", ")}`
-                                          : ""}
-                                      </div>
-                                    </div>
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </div>
-                      </ScrollArea>
-                    </PopoverContent>
-                  </Popover>
-                );
-              })()
-            )}
-
-            {!selectedIdentity && !form.identityId && (
-              <div className="relative">
-                <Input
-                  placeholder={t("hostDetails.password.placeholder")}
-                  type={showPassword ? "text" : "password"}
-                  value={form.password || ""}
-                  onChange={(e) => update("password", e.target.value)}
-                  className="h-10 pr-10"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground transition-colors"
-                  title={showPassword ? t("hostDetails.password.hide") : t("hostDetails.password.show")}
-                >
-                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                </button>
-              </div>
-            )}
-
-            {/* Save Password toggle - shown when password is entered */}
-            {!selectedIdentity && !form.identityId && form.password && (
-              <div className="flex items-center justify-between py-1">
-                <span className="text-xs text-muted-foreground">
-                  {t("hostDetails.password.save")}
-                </span>
-                <Switch
-                  checked={form.savePassword ?? true}
-                  onCheckedChange={(val) => update("savePassword" as keyof Host, val)}
-                />
-              </div>
-            )}
-
-            {/* Local key file paths display */}
-            {!selectedIdentity && !form.identityFileId && form.identityFilePaths && form.identityFilePaths.length > 0 && (
-              <div className="space-y-1.5">
-                {form.identityFilePaths.map((keyPath, idx) => (
-                  <div key={idx} className="flex items-center gap-2 p-2 rounded-md bg-secondary/50 border border-border/60 overflow-hidden">
-                    <FileKey size={14} className="text-primary shrink-0" />
-                    <span className="text-xs w-0 flex-1 truncate font-mono" title={keyPath}>
-                      {keyPath}
-                    </span>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-6 w-6 shrink-0"
-                      onClick={() => {
-                        const paths = form.identityFilePaths?.filter((_, i) => i !== idx) || [];
-                        update("identityFilePaths", paths.length > 0 ? paths : undefined);
-                      }}
-                    >
-                      <Trash2 size={12} />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Selected credential display */}
-            {!selectedIdentity && form.identityFileId && (
-              <div className="flex items-center gap-2 p-2 rounded-md bg-secondary/50 border border-border/60">
-                {form.authMethod === "certificate" ? (
-                  <Shield size={14} className="text-primary" />
-                ) : (
-                  <Key size={14} className="text-primary" />
-                )}
-                <span className="text-sm flex-1 truncate">
-                  {availableKeys.find((k) => k.id === form.identityFileId)
-                    ?.label || "Key"}
-                </span>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6"
-                  onClick={() => {
-                    update("identityFileId", undefined);
-                    update("authMethod", "password");
-                    setSelectedCredentialType(null);
-                  }}
-                >
-                  <X size={12} />
-                </Button>
-              </div>
-            )}
-
-            {/* Credential type selection with inline popover - hidden when credential is selected */}
-            {!selectedIdentity &&
-              !form.identityFileId &&
-              !selectedCredentialType && (
-                <Popover
-                  open={credentialPopoverOpen}
-                  onOpenChange={setCredentialPopoverOpen}
-                >
-                  <PopoverTrigger asChild>
-                    <button
-                      type="button"
-                      className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors py-1"
-                    >
-                      <Plus size={12} />
-                      <span>{t("hostDetails.credential.keyCertificate")}</span>
-                    </button>
-                  </PopoverTrigger>
-                  <PopoverContent
-                    className="w-[200px] p-1"
-                    align="start"
-                    sideOffset={4}
-                  >
-                    <div className="space-y-0.5">
-                      <button
-                        type="button"
-                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md hover:bg-secondary/80 transition-colors text-left"
-                        onClick={() => {
-                          setSelectedCredentialType("key");
-                          setCredentialPopoverOpen(false);
-                        }}
-                      >
-                        <Key size={16} className="text-muted-foreground" />
-                        <span className="text-sm font-medium">
-                          {t("hostDetails.credential.key")}
-                        </span>
-                      </button>
-
-                      <button
-                        type="button"
-                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md hover:bg-secondary/80 transition-colors text-left"
-                        onClick={() => {
-                          setSelectedCredentialType("certificate");
-                          setCredentialPopoverOpen(false);
-                        }}
-                      >
-                        <Shield size={16} className="text-muted-foreground" />
-                        <span className="text-sm font-medium">
-                          {t("hostDetails.credential.certificate")}
-                        </span>
-                      </button>
-
-                      <button
-                        type="button"
-                        className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md hover:bg-secondary/80 transition-colors text-left"
-                        onClick={() => {
-                          setSelectedCredentialType("localKeyFile");
-                          setCredentialPopoverOpen(false);
-                        }}
-                      >
-                        <FileKey size={16} className="text-muted-foreground" />
-                        <span className="text-sm font-medium">
-                          {t("hostDetails.credential.localKeyFile")}
-                        </span>
-                      </button>
-                    </div>
-                  </PopoverContent>
-                </Popover>
-              )}
-
-            {/* Key selection combobox - appears after selecting "Key" type */}
-            {!selectedIdentity &&
-              selectedCredentialType === "key" &&
-              !form.identityFileId && (
-                <div className="flex items-center gap-1">
-                  <Combobox
-                    options={keysByCategory.key.map((k) => ({
-                      value: k.id,
-                      label: k.label,
-                      sublabel: `${k.type}${k.keySize ? ` ${k.keySize}` : ""}`,
-                      icon: <Key size={14} className="text-muted-foreground" />,
-                    }))}
-                    value={form.identityFileId}
-                    onValueChange={(val) => {
-                      update("identityFileId", val);
-                      update("authMethod", "key");
-                      update("identityFilePaths", undefined);
-                      setSelectedCredentialType(null);
-                    }}
-                    placeholder={t("hostDetails.keys.search")}
-                    emptyText={t("hostDetails.keys.empty")}
-                    icon={<Key size={14} className="text-muted-foreground" />}
-                    className="flex-1"
-                  />
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() => setSelectedCredentialType(null)}
-                  >
-                    <X size={14} />
-                  </Button>
-                </div>
-              )}
-
-            {/* Certificate selection combobox - appears after selecting "Certificate" type */}
-            {!selectedIdentity &&
-              selectedCredentialType === "certificate" &&
-              !form.identityFileId && (
-                <div className="flex items-center gap-1">
-                  <Combobox
-                    options={keysByCategory.certificate.map((k) => ({
-                      value: k.id,
-                      label: k.label,
-                      icon: (
-                        <Shield size={14} className="text-muted-foreground" />
-                      ),
-                    }))}
-                    value={form.identityFileId}
-                    onValueChange={(val) => {
-                      update("identityFileId", val);
-                      update("authMethod", "certificate");
-                      update("identityFilePaths", undefined);
-                      setSelectedCredentialType(null);
-                    }}
-                    placeholder={t("hostDetails.certs.search")}
-                    emptyText={t("hostDetails.certs.empty")}
-                    icon={
-                      <Shield size={14} className="text-muted-foreground" />
-                    }
-                    className="flex-1"
-                  />
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 shrink-0"
-                    onClick={() => setSelectedCredentialType(null)}
-                  >
-                    <X size={14} />
-                  </Button>
-                </div>
-              )}
-
-            {/* Local key file path input - appears after selecting "Local Key File" type */}
-            {!selectedIdentity &&
-              selectedCredentialType === "localKeyFile" &&
-              !form.identityFileId && (
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-1 min-w-0">
-                    <input
-                      type="text"
-                      className="flex-1 min-w-0 h-8 px-2 text-xs font-mono bg-background border border-border/60 rounded-md focus:outline-none focus:ring-1 focus:ring-ring"
-                      placeholder={t("hostDetails.credential.localKeyFilePlaceholder")}
-                      value={newKeyFilePath}
-                      onChange={(e) => setNewKeyFilePath(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && newKeyFilePath.trim()) {
-                          e.preventDefault();
-                          const paths = [...(form.identityFilePaths || []), newKeyFilePath.trim()];
-                          update("identityFilePaths", paths);
-                          update("identityFileId", undefined);
-                          update("authMethod", "key");
-                          setNewKeyFilePath("");
-                        }
-                      }}
-                    />
-                    <Button
-                      variant="secondary"
-                      size="icon"
-                      className="h-8 w-8 shrink-0"
-                      title={t("hostDetails.credential.browseKeyFile")}
-                      onClick={async () => {
-                        const bridge = (window as unknown as { netcatty?: NetcattyBridge }).netcatty;
-                        if (!bridge?.selectFile) return;
-                        const filePath = await bridge.selectFile(
-                          "Select SSH Private Key",
-                          undefined,
-                          [{ name: "All Files", extensions: ["*"] }]
-                        );
-                        if (filePath) {
-                          const paths = [...(form.identityFilePaths || []), filePath];
-                          update("identityFilePaths", paths);
-                          update("identityFileId", undefined);
-                          update("authMethod", "key");
-                        }
-                      }}
-                    >
-                      <FolderOpen size={14} />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-8 w-8 shrink-0"
-                      onClick={() => {
-                        setSelectedCredentialType(null);
-                        setNewKeyFilePath("");
-                      }}
-                    >
-                      <X size={14} />
-                    </Button>
-                  </div>
-                </div>
-              )}
-          </div>
-        </Card>
-
-        <Card className="p-3 space-y-3 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <FolderLock size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">
-              {t("hostDetails.section.sftp")}
-            </p>
-          </div>
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <div className="text-sm font-medium">
-                {t("hostDetails.sftp.sudo")}
-              </div>
-              <div className="text-xs text-muted-foreground">
-                {t("hostDetails.sftp.sudo.desc")}
-              </div>
-            </div>
+        <HostDetailsSection
+          icon={<FileText size={14} className="text-muted-foreground shrink-0" />}
+          title={t("hostDetails.notes.label")}
+          hint={t("hostDetails.notes.help")}
+          action={
             <Switch
-              checked={form.sftpSudo || false}
-              onCheckedChange={(val) => update("sftpSudo", val)}
-            />
-          </div>
-          {form.sftpSudo && !form.password && !selectedIdentity?.password && (
-            <p className="text-xs text-amber-500">
-              {t("hostDetails.sftp.sudo.passwordWarning")}
-            </p>
-          )}
-          <div className="flex items-center justify-between gap-4">
-            <div className="space-y-0.5">
-              <div className="text-sm font-medium">
-                {t("hostDetails.sftp.encoding")}
-              </div>
-              <div className="text-xs text-muted-foreground">
-                {t("hostDetails.sftp.encoding.desc")}
-              </div>
-            </div>
-            <Select
-              value={form.sftpEncoding || "auto"}
-              onValueChange={(val) => update("sftpEncoding", val as Host["sftpEncoding"])}
-            >
-              <SelectTrigger className="h-8 w-28">
-                <SelectValue placeholder={t("sftp.encoding.label")} />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="auto">{t("sftp.encoding.auto")}</SelectItem>
-                <SelectItem value="utf-8">{t("sftp.encoding.utf8")}</SelectItem>
-                <SelectItem value="gb18030">{t("sftp.encoding.gb18030")}</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </Card>
-
-        {form.os === "linux" && (
-          <Card className="p-3 space-y-3 bg-card border-border/80">
-            <div className="flex items-center gap-2">
-              <img src="/distro/linux.svg" alt="Linux" className="h-3.5 w-3.5 opacity-70 dark:invert" />
-              <p className="text-xs font-semibold">{t("hostDetails.distro.title")}</p>
-            </div>
-            <p className="text-xs text-muted-foreground">{t("hostDetails.distro.desc")}</p>
-
-            <div className="grid gap-2 md:grid-cols-2">
-              <div className="space-y-1">
-                <span className="text-xs text-muted-foreground">{t("hostDetails.distro.mode")}</span>
-                <Select
-                  value={form.distroMode || "auto"}
-                  onValueChange={(val) => handleDistroModeChange(val as "auto" | "manual")}
-                >
-                  <SelectTrigger className="h-8" aria-label={t("hostDetails.distro.mode")}>
-                    <span className="truncate whitespace-nowrap pr-2 text-left">
-                      {form.distroMode === "manual"
-                        ? t("hostDetails.distro.mode.manual")
-                        : t("hostDetails.distro.mode.auto")}
-                    </span>
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="auto">{t("hostDetails.distro.mode.auto")}</SelectItem>
-                    <SelectItem value="manual">{t("hostDetails.distro.mode.manual")}</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {form.distroMode === "manual" ? (
-                <div className="space-y-1">
-                  <span className="text-xs text-muted-foreground">{t("hostDetails.distro.manualLabel")}</span>
-                  <Select
-                    value={form.manualDistro}
-                    onValueChange={(val) => update("manualDistro", val)}
-                  >
-                    <SelectTrigger className="h-8" aria-label={t("hostDetails.distro.manualLabel")}>
-                      {(() => {
-                        const selectedOption = distroOptions.find((option) => option.value === form.manualDistro);
-                        return selectedOption ? (
-                          <div className="flex min-w-0 items-center gap-2 pr-2">
-                            <div
-                              className={cn(
-                                "flex h-4 w-4 shrink-0 items-center justify-center overflow-hidden rounded-[2px]",
-                                selectedOption.bgClass,
-                              )}
-                            >
-                              {selectedOption.icon ? (
-                                <img
-                                  src={selectedOption.icon}
-                                  alt={selectedOption.label}
-                                  className="h-3 w-3 object-contain invert brightness-0"
-                                />
-                              ) : (
-                                <div className="h-2 w-2 rounded-full bg-white/70" />
-                              )}
-                            </div>
-                            <span className="truncate whitespace-nowrap">{selectedOption.label}</span>
-                          </div>
-                        ) : (
-                          <SelectValue placeholder={t("hostDetails.distro.unknown")} />
-                        );
-                      })()}
-                    </SelectTrigger>
-                    <SelectContent className="min-w-[14rem]">
-                      {distroOptions.map((option) => (
-                        <SelectItem key={option.value} value={option.value}>
-                          <div className="flex items-center gap-2">
-                            <div
-                              className={cn(
-                                "flex h-4 w-4 shrink-0 items-center justify-center overflow-hidden rounded-[2px]",
-                                option.bgClass,
-                              )}
-                            >
-                              {option.icon ? (
-                                <img
-                                  src={option.icon}
-                                  alt={option.label}
-                                  className="h-3 w-3 object-contain invert brightness-0"
-                                />
-                              ) : (
-                                <div className="h-2 w-2 rounded-full bg-white/70" />
-                              )}
-                            </div>
-                            <span className="whitespace-nowrap">{option.label}</span>
-                          </div>
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              ) : (
-                <div className="space-y-1">
-                  <span className="text-xs text-muted-foreground">{t("hostDetails.distro.detectedLabel")}</span>
-                  <div className="flex h-8 items-center rounded-md border border-border/60 bg-background/50 px-3 text-sm">
-                    {effectiveFormDistro
-                      ? getDistroOptionLabel(effectiveFormDistro)
-                      : t("hostDetails.distro.unknown")}
-                  </div>
-                </div>
-              )}
-            </div>
-          </Card>
-        )}
-
-        <Card className="p-3 space-y-3 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <Palette size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">
-              {t("hostDetails.section.appearance")}
-            </p>
-          </div>
-
-          {/* SSH Theme Selection */}
-          <button
-            type="button"
-            className="w-full flex items-center gap-3 p-2 rounded-lg bg-secondary/50 hover:bg-secondary transition-colors text-left"
-            onClick={() => setActiveSubPanel("theme-select")}
-          >
-            <div
-              className="w-12 h-8 rounded-md border border-border/60 flex items-center justify-center text-[6px] font-mono overflow-hidden"
-              style={{
-                backgroundColor:
-                  customThemeStore.getThemeById(effectiveThemeId)?.colors.background || "#100F0F",
-                color:
-                  customThemeStore.getThemeById(effectiveThemeId)?.colors.foreground || "#CECDC3",
-              }}
-            >
-              <div className="p-0.5">
-                <div
-                  style={{
-                    color: customThemeStore.getThemeById(effectiveThemeId)?.colors.green,
-                  }}
-                >
-                  $
-                </div>
-              </div>
-            </div>
-            <span className="text-sm flex-1">
-              {customThemeStore.getThemeById(effectiveThemeId)?.name || "Flexoki Dark"}
-            </span>
-          </button>
-          {hasEffectiveThemeOverride && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="w-full justify-start text-primary"
-              onClick={() => setForm((prev) => clearHostThemeOverride(prev))}
-            >
-              {t("common.useGlobal")}
-            </Button>
-          )}
-
-          {/* Font Size */}
-          <div className="flex items-center gap-2">
-            <span className="text-sm text-muted-foreground">Font Size:</span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                if (effectiveFontSize > MIN_FONT_SIZE) {
-                  setForm((prev) => ({
-                    ...prev,
-                    fontSize: effectiveFontSize - 1,
-                    fontSizeOverride: true,
-                  }));
-                }
-              }}
-              disabled={effectiveFontSize <= MIN_FONT_SIZE}
-              className="px-2 h-8"
-            >
-              -
-            </Button>
-            <Input
-              type="number"
-              min={MIN_FONT_SIZE}
-              max={MAX_FONT_SIZE}
-              value={effectiveFontSize}
-              onChange={(e) => {
-                const val = parseInt(e.target.value);
-                if (val >= MIN_FONT_SIZE && val <= MAX_FONT_SIZE) {
-                  setForm((prev) => ({
-                    ...prev,
-                    fontSize: val,
-                    fontSizeOverride: true,
-                  }));
-                }
-              }}
-              className="w-16 text-center h-8"
-            />
-            <span className="text-sm text-muted-foreground">pt</span>
-            {hasEffectiveFontSizeOverride && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="ml-auto h-8 text-primary"
-                onClick={() => setForm((prev) => clearHostFontSizeOverride(prev))}
-              >
-                {t("common.useGlobal")}
-              </Button>
-            )}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                if (effectiveFontSize < MAX_FONT_SIZE) {
-                  setForm((prev) => ({
-                    ...prev,
-                    fontSize: effectiveFontSize + 1,
-                    fontSizeOverride: true,
-                  }));
-                }
-              }}
-              disabled={effectiveFontSize >= MAX_FONT_SIZE}
-              className="px-2 h-8"
-            >
-              +
-            </Button>
-          </div>
-        </Card>
-
-        <Card className="p-3 space-y-3 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <Wifi size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">{t("hostDetails.section.mosh")}</p>
-          </div>
-          <ToggleRow
-            label="Mosh"
-            enabled={!!form.moshEnabled}
-            onToggle={() => {
-              const enabling = !form.moshEnabled;
-              if (enabling && form.deviceType === 'network') {
-                // Network device mode is incompatible with Mosh — clear it
-                setForm(prev => ({ ...prev, moshEnabled: true, deviceType: undefined }));
-              } else {
-                update("moshEnabled", enabling);
+              checked={showNotesEditor}
+              onCheckedChange={setShowNotesEditor}
+              aria-label={
+                showNotesEditor
+                  ? t("hostDetails.notes.toggle.hide")
+                  : t("hostDetails.notes.toggle.show")
               }
-            }}
-          />
-        </Card>
+            />
+          }
+        >
+          {showNotesEditor ? (
+            <HostNotesEditor
+              panelKey={form.id}
+              value={form.notes ?? ""}
+              onChange={(notes) => update("notes", notes)}
+              showHeader={false}
+              defaultTab="edit"
+            />
+          ) : null}
+        </HostDetailsSection>
 
-        {/* Agent Forwarding */}
-        <Card className="p-3 space-y-2 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <Forward size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">{t("hostDetails.section.agentForwarding")}</p>
-          </div>
-          <ToggleRow
-            label={t("hostDetails.agentForwarding")}
-            enabled={!!form.agentForwarding}
-            onToggle={() => update("agentForwarding", !form.agentForwarding)}
-          />
-          <p className="text-xs text-muted-foreground">
-            {t("hostDetails.agentForwarding.desc")}
-          </p>
-          {form.agentForwarding && sshAgentStatus && !sshAgentStatus.running && (
-            <div className="flex items-start gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20">
-              <AlertTriangle size={14} className="text-yellow-500 mt-0.5 flex-shrink-0" />
-              <div className="space-y-1">
-                <p className="text-xs text-yellow-600 dark:text-yellow-400 font-medium">
-                  {t("hostDetails.agentForwarding.agentNotRunning")}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  {t("hostDetails.agentForwarding.agentNotRunningHint")}
-                </p>
-              </div>
-            </div>
-          )}
-        </Card>
+        <HostDetailsAdvancedSections
+          t={t}
+          form={form}
+          setForm={setForm}
+          update={update}
+          effectiveThemeId={effectiveThemeId}
+          hasEffectiveThemeOverride={hasEffectiveThemeOverride}
+          effectiveFontSize={effectiveFontSize}
+          hasEffectiveFontSizeOverride={hasEffectiveFontSizeOverride}
+          sshAgentStatus={sshAgentStatus}
+          sshForwardingAgentStatus={sshForwardingAgentStatus}
+          effectiveGroupDefaults={effectiveGroupDefaults}
+          effectiveAuthMethod={effectiveAuthMethod}
+          showAlgorithmOverrides={showAlgorithmOverrides}
+          setShowAlgorithmOverrides={setShowAlgorithmOverrides}
+          chainedHosts={chainedHosts}
+          setActiveSubPanel={setActiveSubPanel}
+          clearHostChain={clearHostChain}
+          proxySummaryType={proxySummaryType}
+          proxySummaryLabel={proxySummaryLabel}
+          proxySummaryTooltip={proxySummaryTooltip}
+          clearProxyConfig={clearProxyConfig}
+        />
 
-        {/* Network Device Mode — only for SSH hosts without Mosh (serial already uses raw mode) */}
-        {(!form.protocol || form.protocol === 'ssh') && !form.moshEnabled && (
-        <Card className="p-3 space-y-2 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <Router size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">{t("hostDetails.section.deviceType")}</p>
-          </div>
-          <ToggleRow
-            label={t("hostDetails.deviceType")}
-            enabled={form.deviceType === 'network'}
-            onToggle={() => update("deviceType", form.deviceType === 'network' ? undefined : 'network')}
-          />
-          <p className="text-xs text-muted-foreground break-words">
-            {t("hostDetails.deviceType.desc")}
-          </p>
-          {form.deviceType === 'network' && (
-            <div className="flex items-start gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20">
-              <AlertTriangle size={14} className="text-yellow-500 mt-0.5 flex-shrink-0" />
-              <p className="text-xs text-yellow-600 dark:text-yellow-400 break-words">
-                {t("hostDetails.deviceType.warning")}
-              </p>
-            </div>
-          )}
-        </Card>
-        )}
-
-        {/* Legacy Algorithms */}
-        <Card className="p-3 space-y-2 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <ShieldAlert size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">{t("hostDetails.section.legacyAlgorithms")}</p>
-          </div>
-          <ToggleRow
-            label={t("hostDetails.legacyAlgorithms")}
-            enabled={!!form.legacyAlgorithms}
-            onToggle={() => update("legacyAlgorithms", !form.legacyAlgorithms)}
-          />
-          <p className="text-xs text-muted-foreground break-words">
-            {t("hostDetails.legacyAlgorithms.desc")}
-          </p>
-          {form.legacyAlgorithms && (
-            <div className="flex items-start gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20">
-              <AlertTriangle size={14} className="text-yellow-500 mt-0.5 flex-shrink-0" />
-              <p className="text-xs text-yellow-600 dark:text-yellow-400 break-words">
-                {t("hostDetails.legacyAlgorithms.warning")}
-              </p>
-            </div>
-          )}
-          <div className="flex items-center justify-between">
-            <p className="text-xs text-muted-foreground">{t("hostDetails.backspaceBehavior")}</p>
-            <select
-              className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-              value={form.backspaceBehavior ?? ""}
-              onChange={(e) => update("backspaceBehavior", e.target.value || undefined)}
-            >
-              <option value="">{t("hostDetails.backspaceBehavior.default")}</option>
-              <option value="ctrl-h">^H (0x08)</option>
-            </select>
-          </div>
-        </Card>
-
-        {/* Proxy via Hosts (Jump Hosts / ProxyJump) */}
-        <Card className="p-3 space-y-2 bg-card border-border/80">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Link2 size={14} className="text-muted-foreground" />
-              <p className="text-xs font-semibold">
-                {t("hostDetails.jumpHosts")}
-              </p>
-            </div>
-            {chainedHosts.length > 0 ? (
-              <Badge variant="secondary" className="text-xs">
-                {t("hostDetails.jumpHosts.hops", { count: chainedHosts.length })}
-              </Badge>
-            ) : (
-              <Badge
-                variant="outline"
-                className="text-xs text-muted-foreground"
-              >
-                {t("hostDetails.jumpHosts.direct")}
-              </Badge>
-            )}
-          </div>
-          {chainedHosts.length > 0 && (
-            <button
-              className="w-full flex flex-col items-start gap-1 p-2 rounded-md bg-secondary/50 hover:bg-secondary transition-colors cursor-pointer"
-              onClick={() => setActiveSubPanel("chain")}
-            >
-              <div className="w-full flex items-center justify-between">
-                <div className="flex items-center gap-1 min-w-0 flex-1">
-                  <Link2
-                    size={14}
-                    className="text-muted-foreground flex-shrink-0"
-                  />
-                  <span className="text-xs text-muted-foreground">
-                    {t("hostDetails.jumpHosts.hops", { count: chainedHosts.length })}
-                  </span>
-                </div>
-                <X
-                  size={14}
-                  className="text-muted-foreground hover:text-destructive flex-shrink-0"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    clearHostChain();
-                  }}
-                />
-              </div>
-              <div className="w-full space-y-1 pl-5">
-                {chainedHosts.slice(0, 5).map((h, idx) => (
-                  <div key={h.id} className="flex items-center gap-1 text-sm">
-                    <span className="text-muted-foreground">{idx + 1}.</span>
-                    <span className="truncate">
-                      {h.label !== h.hostname ? `${h.hostname} (${h.label})` : h.hostname}
-                    </span>
-                  </div>
-                ))}
-                {chainedHosts.length > 5 && (
-                  <div className="text-xs text-muted-foreground">
-                    +{chainedHosts.length - 5} more...
-                  </div>
-                )}
-              </div>
-            </button>
-          )}
-          {chainedHosts.length === 0 && (
-            <Button
-              variant="ghost"
-              className="w-full h-9 justify-start gap-2 text-sm"
-              onClick={() => setActiveSubPanel("chain")}
-            >
-              <Plus size={14} />
-              {t("hostDetails.jumpHosts.configure")}
-            </Button>
-          )}
-        </Card>
-
-        {/* Proxy Configuration */}
-        <Card className="p-3 space-y-2 bg-card border-border/80 overflow-hidden">
-          <div className="flex items-center gap-2">
-            <Globe size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">{t("hostDetails.proxy")}</p>
-          </div>
-          {form.proxyConfig?.host ? (
-            <button
-              className="w-full min-w-0 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 p-2 rounded-md bg-secondary/50 hover:bg-secondary transition-colors cursor-pointer overflow-hidden"
-              onClick={() => setActiveSubPanel("proxy")}
-            >
-              <Badge variant="secondary" className="text-xs shrink-0">
-                {form.proxyConfig.type?.toUpperCase()}
-              </Badge>
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="block min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-sm">
-                      {form.proxyConfig.host}:{form.proxyConfig.port}
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" align="start" className="max-w-xs break-all">
-                    {form.proxyConfig.type?.toUpperCase()} {form.proxyConfig.host}:{form.proxyConfig.port}
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-              <X
-                size={14}
-                className="text-muted-foreground hover:text-destructive flex-shrink-0"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  clearProxyConfig();
-                }}
-              />
-            </button>
-          ) : (
-            <Button
-              variant="ghost"
-              className="w-full h-9 justify-start gap-2 text-sm"
-              onClick={() => setActiveSubPanel("proxy")}
-            >
-              <Plus size={14} />
-              {t("hostDetails.proxy.configure")}
-            </Button>
-          )}
-        </Card>
-
-        {/* Environment Variables */}
-        <Card className="p-3 space-y-2 bg-card border-border/80">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Variable size={14} className="text-muted-foreground" />
-              <p className="text-xs font-semibold">{t("hostDetails.envVars")}</p>
-            </div>
-          </div>
-          {(form.environmentVariables?.length || 0) > 0 ? (
-            <button
-              className="w-full flex items-center gap-1 p-2 rounded-md bg-secondary/50 hover:bg-secondary transition-colors cursor-pointer"
-              onClick={() => setActiveSubPanel("env-vars")}
-            >
-              <span className="text-sm truncate">
-                {form.environmentVariables
-                  ?.slice(0, 2)
-                  .map((v) => `${v.name}=${v.value}`)
-                  .join(", ")}
-                {(form.environmentVariables?.length || 0) > 2 && "..."}
-              </span>
-              <X
-                size={14}
-                className="text-muted-foreground hover:text-destructive flex-shrink-0 ml-auto"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setForm((prev) => ({ ...prev, environmentVariables: undefined }));
-                }}
-              />
-            </button>
-          ) : (
-            <Button
-              variant="ghost"
-              className="w-full h-9 justify-start gap-2 text-sm"
-              onClick={() => setActiveSubPanel("env-vars")}
-            >
-              <Plus size={14} />
-              {t("hostDetails.envVars.add")}
-            </Button>
-          )}
-        </Card>
-
-        {/* Startup Command */}
-        <Card className="p-3 space-y-2 bg-card border-border/80">
-          <div className="flex items-center gap-2">
-            <TerminalSquare size={14} className="text-muted-foreground" />
-            <p className="text-xs font-semibold">{t("hostDetails.startupCommand")}</p>
-          </div>
-          <Textarea
-            placeholder={groupDefaults?.startupCommand || t("hostDetails.startupCommand.placeholder")}
-            value={form.startupCommand || ""}
-            onChange={(e) => update("startupCommand", e.target.value)}
-            className="min-h-[80px] font-mono text-sm"
-            rows={3}
-          />
-          <p className="text-xs text-muted-foreground">
-            {t("hostDetails.startupCommand.help")}
-          </p>
-        </Card>
-
-        {/* Telnet Protocol Section - Separator and Configuration */}
         <div className="flex items-center gap-3 py-2">
           <div className="flex-1 h-px bg-border/60" />
           <span className="text-xs text-muted-foreground">{t("hostDetails.otherProtocols")}</span>
           <div className="flex-1 h-px bg-border/60" />
         </div>
 
-        {/* Telnet Protocol Card */}
         {form.telnetEnabled || form.protocol === "telnet" ? (
-          <Card className="p-3 space-y-3 bg-card border-border/80">
+          <HostDetailsSection
+            icon={<Plus size={14} className="text-muted-foreground" />}
+            title="Telnet"
+          >
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 bg-secondary/70 border border-border/70 rounded-md px-2 py-1">
+              <div className="flex-1 min-w-0 h-10 flex items-center gap-2 bg-secondary/70 border border-border/70 rounded-md px-3">
                 <span className="text-xs text-muted-foreground">{t("hostDetails.telnetOn")}</span>
-                <Input
-                  type="number"
-                  value={form.telnetPort || 23}
-                  onChange={(e) => update("telnetPort", Number(e.target.value))}
-                  className="h-8 w-16 text-center"
-                />
-                <span className="text-xs text-muted-foreground">{t("hostDetails.port")}</span>
+                <div className="ml-auto w-1/2 min-w-0 flex items-center gap-2 justify-end">
+	                  <Input
+	                    type="number"
+	                    value={effectiveTelnetPort}
+	                    onChange={(e) => update("telnetPort", parseOptionalPortInput(e.target.value))}
+	                    className="h-8 flex-1 min-w-0 text-center"
+	                  />
+                  <span className="text-xs text-muted-foreground">{t("hostDetails.port")}</span>
+                </div>
               </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                onClick={() => update("telnetEnabled", false)}
-              >
-                <X size={14} />
-              </Button>
+              {form.protocol !== "telnet" && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                  onClick={() => update("telnetEnabled", false)}
+                >
+                  <X size={14} />
+                </Button>
+              )}
             </div>
 
-            {/* Telnet Credentials */}
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-xs text-muted-foreground">{t("hostDetails.telnet.setDefault")}</span>
+              <Switch
+                checked={form.protocol === "telnet"}
+                onCheckedChange={(checked) => {
+                  const nextProtocol = checked ? "telnet" : "ssh";
+                  setForm((prev) => ({
+                    ...prev,
+                    protocol: nextProtocol,
+                    port: resolvePrimaryProtocolSwitchPort(
+                      prev.port,
+                      nextProtocol,
+                      Boolean(groupDefaults?.telnetPort),
+                      Boolean(groupDefaults?.port),
+                    ),
+                  }));
+                }}
+              />
+            </div>
+
             <p className="text-xs font-semibold">{t("hostDetails.telnet.credentials")}</p>
-            <Input
-              placeholder={t("hostDetails.telnet.username")}
-              value={form.telnetUsername || form.username || ""}
-              onChange={(e) =>
-                update("telnetUsername" as keyof Host, e.target.value)
-              }
-              className="h-10"
-            />
-            <Input
-              placeholder={t("hostDetails.telnet.password")}
-              type="password"
-              value={form.telnetPassword || form.password || ""}
-              onChange={(e) =>
-                update("telnetPassword" as keyof Host, e.target.value)
-              }
-              className="h-10"
+            {identities.length > 0 && (
+              <Combobox
+                options={telnetIdentityOptions}
+                value={form.telnetIdentityId || ""}
+                onValueChange={updateTelnetIdentity}
+                placeholder={t("hostDetails.telnet.identity.placeholder")}
+                emptyText={t("common.noResultsFound")}
+                className="w-full"
+              />
+            )}
+            {form.telnetIdentityId ? (
+              <div className="text-xs text-muted-foreground">
+                {selectedTelnetIdentity
+                  ? `${selectedTelnetIdentity.username} - ${selectedTelnetIdentity.label}`
+                  : t("hostDetails.identity.missing")}
+              </div>
+            ) : (
+              <>
+                <Input
+                  placeholder={t("hostDetails.telnet.username")}
+                  value={effectiveTelnetUsername}
+                  onChange={(e) =>
+                    update("telnetUsername" as keyof Host, e.target.value)
+                  }
+                  className="h-10"
+                />
+                <div className="relative">
+                  <Input
+                    placeholder={t("hostDetails.telnet.password")}
+                    type={showTelnetPassword ? "text" : "password"}
+                    value={effectiveTelnetPassword}
+                    onChange={(e) =>
+                      update("telnetPassword" as keyof Host, e.target.value)
+                    }
+                    className="h-10 pr-10"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowTelnetPassword(!showTelnetPassword)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {showTelnetPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </>
+            )}
+
+            <TerminalEncodingSelect
+              value={form.charset}
+              inheritedValue={effectiveGroupDefaults?.charset}
+              onValueChange={(value) => update("charset", value)}
             />
 
-            {/* Telnet Charset */}
-            <Input
-              placeholder={groupDefaults?.charset || t("hostDetails.charset.placeholder")}
-              value={form.charset || "UTF-8"}
-              onChange={(e) => update("charset", e.target.value)}
-              className="h-10"
-            />
-
-            {/* Telnet Theme Selection */}
             <button
               type="button"
               className="w-full flex items-center gap-3 p-2 rounded-lg bg-secondary/50 hover:bg-secondary transition-colors text-left"
@@ -1920,14 +1295,13 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
                 {customThemeStore.getThemeById(effectiveTelnetThemeId)?.name || "Flexoki Dark"}
               </span>
             </button>
-          </Card>
+          </HostDetailsSection>
         ) : (
           <Button
             variant="ghost"
             className="w-full h-10 justify-start gap-2 border border-dashed border-border/60"
             onClick={() => {
               update("telnetEnabled", true);
-              update("telnetPort", 23);
             }}
           >
             <Plus size={14} />
@@ -1939,7 +1313,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         <Button
           className="w-full h-10"
           onClick={handleSubmit}
-          disabled={!form.hostname}
+          disabled={!canSaveHost}
         >
           {t("common.save")}
         </Button>
@@ -1948,27 +1322,5 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
   );
 };
 
-interface ToggleRowProps {
-  label: string;
-  enabled: boolean;
-  onToggle: () => void;
-}
-
-const ToggleRow: React.FC<ToggleRowProps> = ({ label, enabled, onToggle }) => {
-  const { t } = useI18n();
-  return (
-    <div className="flex items-center justify-between h-10 px-3 rounded-md border border-border/70 bg-secondary/70">
-      <span className="text-sm">{label}</span>
-      <Button
-        variant={enabled ? "secondary" : "ghost"}
-        size="sm"
-        className={cn("h-8 min-w-[72px]", enabled && "bg-primary/20")}
-        onClick={onToggle}
-      >
-        {enabled ? t("common.enabled") : t("common.disabled")}
-      </Button>
-    </div>
-  );
-};
 
 export default HostDetailsPanel;

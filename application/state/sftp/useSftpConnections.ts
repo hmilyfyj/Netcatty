@@ -1,70 +1,263 @@
-import { useCallback, useEffect, useRef } from "react";
-import type { Dispatch, MutableRefObject, SetStateAction } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import type { MutableRefObject } from "react";
 import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
-import type {
-  DockerContainerSummary,
-  Host,
-  Identity,
-  SftpConnection,
-  SftpFileEntry,
-  SftpFilenameEncoding,
-  SSHKey,
-} from "../../../domain/models";
-import type { SftpPane } from "./types";
+import type { Host, Identity, KnownHost, SftpConnection, SftpFileEntry, SftpFilenameEncoding, SSHKey } from "../../../domain/models";
+import { createKnownHostFromHostKeyInfo } from "../../../domain/knownHosts";
+import type { SftpHostKeyInfo, SftpHostKeyVerificationState, SftpPane } from "./types";
 import { useSftpDirectoryListing } from "./useSftpDirectoryListing";
 import { useSftpHostCredentials } from "./useSftpHostCredentials";
 import { buildCacheKey, getSharedRemoteHostCache, setSharedRemoteHostCache } from "./sharedRemoteHostCache";
-import { isDockerSftpConnection } from "./backend";
+import { resolveRemoteSftpStartState } from "./sftpConnectStartPath";
+import { normalizeSftpPaneNavigationPath } from "./utils";
+import {
+  setDirectoryCacheEntry,
+  type DirectoryListingCache,
+} from "./directoryListingCache";
 
 interface UseSftpConnectionsParams {
   hosts: Host[];
   keys: SSHKey[];
   identities: Identity[];
+  knownHosts?: KnownHost[];
+  onAddKnownHost?: (knownHost: KnownHost) => void;
+  terminalSettings?: { keepaliveInterval: number; keepaliveCountMax: number };
   leftTabsRef: MutableRefObject<{ tabs: SftpPane[]; activeTabId: string | null }>;
   rightTabsRef: MutableRefObject<{ tabs: SftpPane[]; activeTabId: string | null }>;
   leftTabs: { tabs: SftpPane[] };
   rightTabs: { tabs: SftpPane[] };
   leftPane: SftpPane;
   rightPane: SftpPane;
-  setLeftTabs: Dispatch<SetStateAction<{ tabs: SftpPane[]; activeTabId: string | null }>>;
-  setRightTabs: Dispatch<SetStateAction<{ tabs: SftpPane[]; activeTabId: string | null }>>;
+  setLeftTabs: React.Dispatch<React.SetStateAction<{ tabs: SftpPane[]; activeTabId: string | null }>>;
+  setRightTabs: React.Dispatch<React.SetStateAction<{ tabs: SftpPane[]; activeTabId: string | null }>>;
   getActivePane: (side: "left" | "right") => SftpPane | null;
   updateTab: (side: "left" | "right", tabId: string, updater: (prev: SftpPane) => SftpPane) => void;
   navSeqRef: MutableRefObject<{ left: number; right: number }>;
-  dirCacheRef: MutableRefObject<Map<string, { files: SftpFileEntry[]; timestamp: number }>>;
+  dirCacheRef: MutableRefObject<DirectoryListingCache>;
   sftpSessionsRef: MutableRefObject<Map<string, string>>;
   lastConnectedHostRef: MutableRefObject<{ left: Host | "local" | null; right: Host | "local" | null }>;
   connectionCacheKeyMapRef: MutableRefObject<Map<string, string>>;
+  connectedHostByTabIdRef: MutableRefObject<Map<string, Host | "local">>;
   reconnectingRef: MutableRefObject<{ left: boolean; right: boolean }>;
   makeCacheKey: (connectionId: string, path: string, encoding?: SftpFilenameEncoding) => string;
   clearCacheForConnection: (connectionId: string) => void;
   createEmptyPane: (id?: string, showHiddenFiles?: boolean) => SftpPane;
   autoConnectLocalOnMount?: boolean;
+  /** Fired after a browse SFTP id is closed so renderer retainers can drop. */
+  onRemoteSessionClosed?: (sftpId: string) => void;
+}
+
+export interface SftpConnectOptions {
+  forceNewTab?: boolean;
+  ignoreSharedCache?: boolean;
+  initialPath?: string;
+  /** Reconnect this tab instead of whichever tab is currently active on the side. */
+  tabId?: string;
+  onTabCreated?: (tabId: string) => void;
+  sourceSessionId?: string;
+}
+
+type SftpOpenBridge = Pick<NetcattyBridge, "openSftp"> &
+  Partial<Pick<NetcattyBridge, "openSftpForSession">>;
+
+interface OpenSftpWithSessionPreferenceParams {
+  bridge: SftpOpenBridge | null | undefined;
+  sourceSessionId?: string;
+  openOptions: NetcattySSHOptions;
+}
+
+export function takeSftpConnectionMetadataForClose(params: {
+  connectionId: string;
+  sftpSessions: Map<string, string>;
+  connectionCacheKeys: Map<string, string>;
+  clearCacheForConnection: (connectionId: string) => void;
+}): string | undefined {
+  const sftpId = params.sftpSessions.get(params.connectionId);
+  params.sftpSessions.delete(params.connectionId);
+  params.connectionCacheKeys.delete(params.connectionId);
+  params.clearCacheForConnection(params.connectionId);
+  return sftpId;
+}
+
+export async function releaseSftpConnectionMetadata(params: {
+  connectionId: string;
+  isLocal?: boolean;
+  sftpSessions: Map<string, string>;
+  connectionCacheKeys: Map<string, string>;
+  clearCacheForConnection: (connectionId: string) => void;
+  closeSftp: (sftpId: string) => Promise<unknown>;
+  onRemoteSessionClosed?: (sftpId: string) => void;
+}): Promise<void> {
+  const sftpId = takeSftpConnectionMetadataForClose(params);
+  if (params.isLocal || !sftpId) return;
+  try {
+    await params.closeSftp(sftpId);
+  } catch {
+    // Best-effort: backend owner cleanup remains the final safety net.
+  }
+  params.onRemoteSessionClosed?.(sftpId);
+}
+
+/** Hardcoded home-path candidates when SSH exec / listable realpath fail. */
+export function buildSftpHomeDirCandidates(username?: string | null): string[] {
+  if (username === "root") return ["/root"];
+  if (username) return [`/home/${username}`, "/root"];
+  return ["/root"];
+}
+
+export function createSftpConnectionId(
+  side: "left" | "right",
+  randomUUID: () => string = () => crypto.randomUUID(),
+): string {
+  return `${side}-${randomUUID()}`;
+}
+
+/** Open SFTP through an already-authenticated terminal session before retrying normal auth. */
+export async function openSftpWithSessionPreference({
+  bridge,
+  sourceSessionId,
+  openOptions,
+}: OpenSftpWithSessionPreferenceParams): Promise<string> {
+  if (!bridge?.openSftp) throw new Error("SFTP bridge unavailable");
+  if (sourceSessionId && bridge.openSftpForSession) {
+    try {
+      return await bridge.openSftpForSession(sourceSessionId, openOptions);
+    } catch {
+      // Fall through to the existing SFTP open path so users still get a usable
+      // file browser when the live SSH transport cannot provide an SFTP channel.
+    }
+  }
+  return bridge.openSftp(openOptions);
+}
+
+/** One complete SFTP connect attempt: optional shared-channel reuse, then one fresh dial. */
+export const openSftpConnectionOnce = openSftpWithSessionPreference;
+
+export function rejectHostKeyVerificationRequest(
+  bridge: Partial<Pick<NetcattyBridge, "respondHostKeyVerification">> | null | undefined,
+  requestId: string,
+): void {
+  void bridge?.respondHostKeyVerification?.(requestId, false, false);
+}
+
+/**
+ * Pinned reconnects must follow a tab across left/right moves. Callers may still
+ * pass the side captured at upload start; resolve the tab's live side instead.
+ */
+export function resolvePinnedReconnectSide(
+  requestedSide: "left" | "right",
+  tabId: string | undefined,
+  leftTabs: ReadonlyArray<{ id: string }>,
+  rightTabs: ReadonlyArray<{ id: string }>,
+): "left" | "right" {
+  if (!tabId) return requestedSide;
+  if (leftTabs.some((tab) => tab.id === tabId)) return "left";
+  if (rightTabs.some((tab) => tab.id === tabId)) return "right";
+  throw new Error("SFTP tab is no longer available");
+}
+
+export function createPinnedReconnectSideResolver(
+  requestedSide: "left" | "right",
+  tabId: string | undefined,
+  getLeftTabs: () => ReadonlyArray<{ id: string }>,
+  getRightTabs: () => ReadonlyArray<{ id: string }>,
+): () => "left" | "right" {
+  let lastResolvedSide = resolvePinnedReconnectSide(
+    requestedSide,
+    tabId,
+    getLeftTabs(),
+    getRightTabs(),
+  );
+  return () => {
+    try {
+      lastResolvedSide = resolvePinnedReconnectSide(
+        requestedSide,
+        tabId,
+        getLeftTabs(),
+        getRightTabs(),
+      );
+    } catch {
+      // Keep the last known side so stale-session cleanup remains non-throwing
+      // when the tab is closed during an asynchronous reconnect.
+    }
+    return lastResolvedSide;
+  };
+}
+
+export function runSftpConnectOnceByKey(
+  inFlight: Map<string, Promise<void>>,
+  key: string,
+  run: () => Promise<void>,
+): Promise<void> {
+  const existing = inFlight.get(key);
+  if (existing) return existing;
+
+  const promise = run().finally(() => {
+    if (inFlight.get(key) === promise) {
+      inFlight.delete(key);
+    }
+  });
+  inFlight.set(key, promise);
+  return promise;
+}
+
+export function buildSftpConnectInFlightKey(params: {
+  side: "left" | "right";
+  tabId: string;
+  targetConnectionKey: string;
+  sourceSessionId?: string;
+  initialPath?: string;
+  forceNewTab?: boolean;
+}): string {
+  return [
+    params.side,
+    params.tabId,
+    params.targetConnectionKey,
+    params.sourceSessionId ?? "",
+    params.initialPath ?? "",
+    params.forceNewTab ? "force-new-tab" : "",
+  ].join("\u0000");
 }
 
 interface UseSftpConnectionsResult {
-  connect: (side: "left" | "right", host: Host | "local", options?: ConnectOptions) => Promise<void>;
-  connectDockerContainer: (
-    side: "left" | "right",
-    options: { host: Host; sourceSessionId: string; container: DockerContainerSummary },
-    connectOptions?: ConnectOptions,
-  ) => Promise<void>;
+  connect: (side: "left" | "right", host: Host | "local", options?: SftpConnectOptions) => Promise<void>;
   disconnect: (side: "left" | "right") => Promise<void>;
   listLocalFiles: (path: string) => Promise<SftpFileEntry[]>;
   listRemoteFiles: (sftpId: string, path: string, encoding?: SftpFilenameEncoding) => Promise<SftpFileEntry[]>;
-  listDockerFiles: (sessionId: string, containerId: string, path: string) => Promise<SftpFileEntry[]>;
+  hostKeyVerification: SftpHostKeyVerificationState | null;
+  rejectHostKeyVerification: () => void;
+  acceptHostKeyVerification: () => void;
+  acceptAndSaveHostKeyVerification: () => void;
 }
 
-interface ConnectOptions {
-  forceNewTab?: boolean;
-  onTabCreated?: (tabId: string) => void;
-  sourceSessionId?: string | null;
-}
+type HostKeyVerificationRequest = SftpHostKeyInfo & {
+  requestId: string;
+  sessionId?: string;
+};
+
+const toSftpHostKeyInfo = (request: HostKeyVerificationRequest): SftpHostKeyInfo => ({
+  hostname: request.hostname,
+  port: request.port || 22,
+  keyType: request.keyType,
+  fingerprint: request.fingerprint,
+  publicKey: request.publicKey,
+  status: request.status,
+  knownHostId: request.knownHostId,
+  knownFingerprint: request.knownFingerprint,
+});
+
+const createKnownHostFromSftpHostKeyInfo = (
+  hostKeyInfo: SftpHostKeyInfo,
+  now = Date.now(),
+  idSuffix = Math.random().toString(36).slice(2, 11),
+): KnownHost => createKnownHostFromHostKeyInfo(hostKeyInfo, { now, idSuffix });
 
 export const useSftpConnections = ({
   hosts,
   keys,
   identities,
+  knownHosts,
+  onAddKnownHost,
+  terminalSettings,
   leftTabsRef,
   rightTabsRef,
   leftTabs,
@@ -80,23 +273,122 @@ export const useSftpConnections = ({
   sftpSessionsRef,
   lastConnectedHostRef,
   connectionCacheKeyMapRef,
+  connectedHostByTabIdRef,
   reconnectingRef,
   makeCacheKey,
   clearCacheForConnection,
   createEmptyPane,
   autoConnectLocalOnMount = true,
+  onRemoteSessionClosed,
 }: UseSftpConnectionsParams): UseSftpConnectionsResult => {
-  const getHostCredentials = useSftpHostCredentials({ hosts, keys, identities });
-  const { listLocalFiles, listRemoteFiles, listDockerFiles } = useSftpDirectoryListing();
+  const onRemoteSessionClosedRef = useRef(onRemoteSessionClosed);
+  onRemoteSessionClosedRef.current = onRemoteSessionClosed;
+  const notifyRemoteSessionClosed = useCallback((sftpId: string | undefined) => {
+    if (sftpId) onRemoteSessionClosedRef.current?.(sftpId);
+  }, []);
+  const getHostCredentials = useSftpHostCredentials({ hosts, keys, identities, knownHosts, terminalSettings });
+  const { listLocalFiles, listRemoteFiles } = useSftpDirectoryListing();
+  const [hostKeyVerification, setHostKeyVerification] = useState<SftpHostKeyVerificationState | null>(null);
+  const hostKeyVerificationRef = useRef<(SftpHostKeyVerificationState & { requestId: string; sessionId: string }) | null>(null);
+  const activeHostKeySessionsRef = useRef<Map<string, { side: "left" | "right"; tabId: string }>>(new Map());
+  const connectInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+
+  const setPendingHostKeyVerification = useCallback((
+    next: (SftpHostKeyVerificationState & { requestId: string; sessionId: string }) | null,
+  ) => {
+    hostKeyVerificationRef.current = next;
+    setHostKeyVerification(next ? {
+      hostKeyInfo: next.hostKeyInfo,
+      progressLogs: next.progressLogs,
+    } : null);
+  }, []);
+
+  useEffect(() => {
+    const dispose = netcattyBridge.get()?.onHostKeyVerification?.((request: HostKeyVerificationRequest) => {
+      const sessionId = request.sessionId;
+      if (!sessionId) return;
+      const activeSession = activeHostKeySessionsRef.current.get(sessionId);
+      if (!activeSession) return;
+
+      const hostKeyInfo = toSftpHostKeyInfo(request);
+      const logLine = request.status === "changed"
+        ? `Host key changed for ${request.hostname}. Waiting for confirmation...`
+        : `Host key verification required for ${request.hostname}.`;
+
+      let activeSide: "left" | "right";
+      try {
+        activeSide = resolvePinnedReconnectSide(
+          activeSession.side,
+          activeSession.tabId,
+          leftTabsRef.current.tabs,
+          rightTabsRef.current.tabs,
+        );
+      } catch {
+        rejectHostKeyVerificationRequest(netcattyBridge.get(), request.requestId);
+        return;
+      }
+      updateTab(activeSide, activeSession.tabId, (prev) => ({
+        ...prev,
+        connectionLogs: [...prev.connectionLogs, logLine],
+      }));
+      setPendingHostKeyVerification({
+        requestId: request.requestId,
+        sessionId,
+        hostKeyInfo,
+        progressLogs: [logLine],
+      });
+    });
+
+    return () => {
+      dispose?.();
+    };
+  }, [leftTabsRef, rightTabsRef, setPendingHostKeyVerification, updateTab]);
+
+  const respondToHostKeyVerification = useCallback((accept: boolean, addToKnownHosts = false) => {
+    const pending = hostKeyVerificationRef.current;
+    if (!pending) return;
+    if (accept && addToKnownHosts) {
+      onAddKnownHost?.(createKnownHostFromSftpHostKeyInfo(pending.hostKeyInfo));
+    }
+    void netcattyBridge.get()?.respondHostKeyVerification?.(
+      pending.requestId,
+      accept,
+      addToKnownHosts,
+    );
+    setPendingHostKeyVerification(null);
+  }, [onAddKnownHost, setPendingHostKeyVerification]);
+
+  const rejectHostKeyVerification = useCallback(() => {
+    respondToHostKeyVerification(false);
+  }, [respondToHostKeyVerification]);
+
+  const acceptHostKeyVerification = useCallback(() => {
+    respondToHostKeyVerification(true, false);
+  }, [respondToHostKeyVerification]);
+
+  const acceptAndSaveHostKeyVerification = useCallback(() => {
+    respondToHostKeyVerification(true, true);
+  }, [respondToHostKeyVerification]);
 
   const connect = useCallback(
-    async (side: "left" | "right", host: Host | "local", options?: ConnectOptions) => {
+    async (requestedSide: "left" | "right", host: Host | "local", options?: SftpConnectOptions) => {
+      // Follow pinned tabs that were dragged to the other side mid-reconnect.
+      const resolveTargetSide = createPinnedReconnectSideResolver(
+        requestedSide,
+        options?.tabId,
+        () => leftTabsRef.current.tabs,
+        () => rightTabsRef.current.tabs,
+      );
+      const side = resolveTargetSide();
       const setTabs = side === "left" ? setLeftTabs : setRightTabs;
 
       let activeTabId: string | null = null;
       const sideTabs = side === "left" ? leftTabsRef.current : rightTabsRef.current;
 
-      if (!sideTabs.activeTabId || options?.forceNewTab) {
+      if (options?.tabId) {
+        // Background reconnect for a pinned upload must not retarget the focused tab.
+        activeTabId = options.tabId;
+      } else if (!sideTabs.activeTabId || options?.forceNewTab) {
         const newPane = createEmptyPane();
         activeTabId = newPane.id;
         setTabs((prev) => ({
@@ -109,29 +401,132 @@ export const useSftpConnections = ({
 
       if (!activeTabId) return;
 
-      const isReconnectAttempt = reconnectingRef.current[side];
+      // Pinned reconnect of a non-active tab must not clobber the active tab's
+      // lastConnectedHost / reconnecting recovery state on this side.
+      const isPinnedBackgroundReconnect =
+        !!options?.tabId
+        && !!sideTabs.activeTabId
+        && options.tabId !== sideTabs.activeTabId;
+      const clearSideReconnecting = () => {
+        if (!isPinnedBackgroundReconnect) {
+          reconnectingRef.current[side] = false;
+        }
+      };
+
+      const getTargetPaneEarly = () => {
+        const targetSide = resolveTargetSide();
+        const tabs = targetSide === "left" ? leftTabsRef.current.tabs : rightTabsRef.current.tabs;
+        return tabs.find((tab) => tab.id === activeTabId) ?? null;
+      };
+      const updateTargetTab = (updater: (prev: SftpPane) => SftpPane) => {
+        updateTab(resolveTargetSide(), activeTabId, updater);
+      };
+
+      // Capture path/endpoint before we replace the connection so same-endpoint
+      // auto-reconnect can land back where the user was browsing instead of home.
+      // Do not inherit path across endpoints (including same hostId with different
+      // hostname/port/user) if a reconnect flag is still set while switching.
+      const previousConnection = getTargetPaneEarly()?.connection;
+      const previousPath = previousConnection?.currentPath;
+      const previousConnectionKey = !previousConnection
+        ? null
+        : previousConnection.isLocal
+          ? "local"
+          : (connectionCacheKeyMapRef.current.get(previousConnection.id) ?? null);
+      const targetConnectionKey = host === "local"
+        ? "local"
+        : buildCacheKey(
+          host.id,
+          host.hostname,
+          host.port,
+          host.protocol,
+          host.sftpSudo,
+          host.username,
+          host.sftpFileProtocol,
+        );
+      if (
+        !isPinnedBackgroundReconnect
+        && reconnectingRef.current[side]
+        && previousConnectionKey
+        && previousConnectionKey !== targetConnectionKey
+      ) {
+        clearSideReconnecting();
+      }
+      // Background pin reconnects resume via options.initialPath, not the side-wide flag.
+      const isReconnectAttempt = isPinnedBackgroundReconnect
+        ? !!options?.initialPath
+        : reconnectingRef.current[side];
+      const sameEndpointReconnect =
+        isReconnectAttempt
+        && !!previousPath
+        && previousConnectionKey === targetConnectionKey;
+      const effectiveInitialPath =
+        options?.initialPath
+        ?? (sameEndpointReconnect ? previousPath : undefined);
 
       // Notify caller of the tab ID synchronously, before any async work.
       // This allows callers to map metadata (e.g. connection keys) to the tab
       // immediately, avoiding race conditions with deferred effects.
       options?.onTabCreated?.(activeTabId);
 
-      const connectionId = `${side}-${Date.now()}`;
+      const connectInFlightKey = buildSftpConnectInFlightKey({
+        side,
+        tabId: activeTabId,
+        targetConnectionKey,
+        sourceSessionId: host === "local" ? undefined : options?.sourceSessionId,
+        initialPath: effectiveInitialPath,
+        forceNewTab: options?.forceNewTab,
+      });
 
-      navSeqRef.current[side] += 1;
-      const connectRequestId = navSeqRef.current[side];
+      return runSftpConnectOnceByKey(connectInFlightRef.current, connectInFlightKey, async () => {
+        const connectionId = createSftpConnectionId(side);
 
-      lastConnectedHostRef.current[side] = host;
+        navSeqRef.current[side] += 1;
+        const connectRequestId = navSeqRef.current[side];
+        const getTargetPane = () => {
+          const targetSide = resolveTargetSide();
+          const tabs = targetSide === "left" ? leftTabsRef.current.tabs : rightTabsRef.current.tabs;
+          return tabs.find((tab) => tab.id === activeTabId) ?? null;
+        };
+        const isTargetConnectionCurrent = () => {
+          const pane = getTargetPane();
+          if (!pane) return false;
+          if (pane.connection?.id === connectionId) return true;
+          return !pane.connection && navSeqRef.current[side] === connectRequestId;
+        };
+      const isTargetConnectionAtPath = (path: string) => {
+        const connection = getTargetPane()?.connection;
+        if (!connection) return navSeqRef.current[side] === connectRequestId;
+        return connection?.id === connectionId && connection.currentPath === path;
+      };
+      const closeSftpSessionForConnection = async () => {
+        await releaseSftpConnectionMetadata({
+          connectionId,
+          sftpSessions: sftpSessionsRef.current,
+          connectionCacheKeys: connectionCacheKeyMapRef.current,
+          clearCacheForConnection,
+          closeSftp: async (sftpId) => netcattyBridge.get()?.closeSftp(sftpId),
+          onRemoteSessionClosed: (sftpId) => notifyRemoteSessionClosed(sftpId),
+        });
+      };
+
+      // Keep side-wide recovery host pointed at the active tab only.
+      if (!isPinnedBackgroundReconnect) {
+        lastConnectedHostRef.current[side] = host;
+      }
+      // Always remember the full connect-time Host for this tab so background
+      // upload reconnects can restore session-time overrides (not just vault hostId).
+      connectedHostByTabIdRef.current.set(activeTabId, host);
       // Store the cache key for this connection so pane actions can look it up
       // by connectionId instead of relying on the per-side lastConnectedHostRef.
       if (host !== "local") {
         connectionCacheKeyMapRef.current.set(
           connectionId,
-          buildCacheKey(host.id, host.hostname, host.port, host.protocol, host.sftpSudo, host.username),
+          buildCacheKey(host.id, host.hostname, host.port, host.protocol, host.sftpSudo, host.username, host.sftpFileProtocol),
         );
       }
 
-      const currentPane = getActivePane(side);
+      const currentPane = getTargetPaneEarly();
       // Reset encoding to host's configured encoding or "auto" when connecting to a new host
       // This ensures proper auto-detection works and respects host-level encoding settings
       const filenameEncoding: SftpFilenameEncoding =
@@ -141,20 +536,19 @@ export const useSftpConnections = ({
       // don't close its SFTP session or clear its cache.
       if (!options?.forceNewTab) {
         if (currentPane?.connection) {
-          clearCacheForConnection(currentPane.connection.id);
-        }
-        if (currentPane?.connection && !currentPane.connection.isLocal) {
-          const oldSftpId = sftpSessionsRef.current.get(currentPane.connection.id);
-          if (oldSftpId) {
-            // Delete the mapping BEFORE the async closeSftp call to prevent
-            // concurrent code from using a stale sftpId that the backend may
-            // have already removed during the await.
-            sftpSessionsRef.current.delete(currentPane.connection.id);
+          const oldSftpId = takeSftpConnectionMetadataForClose({
+            connectionId: currentPane.connection.id,
+            sftpSessions: sftpSessionsRef.current,
+            connectionCacheKeys: connectionCacheKeyMapRef.current,
+            clearCacheForConnection,
+          });
+          if (!currentPane.connection.isLocal && oldSftpId) {
             try {
               await netcattyBridge.get()?.closeSftp(oldSftpId);
             } catch {
               // Ignore errors when closing stale SFTP sessions
             }
+            notifyRemoteSessionClosed(oldSftpId);
           }
         }
       }
@@ -166,18 +560,22 @@ export const useSftpConnections = ({
           homeDir = isWindows ? "C:\\Users\\damao" : "/Users/damao";
         }
 
+        const startPath = normalizeSftpPaneNavigationPath(
+          effectiveInitialPath || homeDir,
+          homeDir,
+        );
+
         const connection: SftpConnection = {
           id: connectionId,
           hostId: "local",
           hostLabel: "Local",
           isLocal: true,
-          backendType: "local",
           status: "connected",
-          currentPath: homeDir,
+          currentPath: startPath,
           homeDir,
         };
 
-        updateTab(side, activeTabId, (prev) => ({
+        updateTargetTab((prev) => ({
           ...prev,
           connection,
           loading: true,
@@ -188,23 +586,23 @@ export const useSftpConnections = ({
         }));
 
         try {
-          const files = await listLocalFiles(homeDir);
-          if (navSeqRef.current[side] !== connectRequestId) return;
-          dirCacheRef.current.set(makeCacheKey(connectionId, homeDir, filenameEncoding), {
+          const files = await listLocalFiles(startPath);
+          if (!isTargetConnectionAtPath(startPath)) return;
+          setDirectoryCacheEntry(dirCacheRef.current, makeCacheKey(connectionId, startPath, filenameEncoding), {
             files,
             timestamp: Date.now(),
           });
-          reconnectingRef.current[side] = false;
-          updateTab(side, activeTabId, (prev) => ({
+          clearSideReconnecting();
+          updateTargetTab((prev) => ({
             ...prev,
             files,
             loading: false,
             reconnecting: false,
           }));
         } catch (err) {
-          if (navSeqRef.current[side] !== connectRequestId) return;
-          reconnectingRef.current[side] = false;
-          updateTab(side, activeTabId, (prev) => ({
+          if (!isTargetConnectionAtPath(startPath)) return;
+          clearSideReconnecting();
+          updateTargetTab((prev) => ({
             ...prev,
             error: err instanceof Error ? err.message : "Failed to list directory",
             loading: false,
@@ -212,26 +610,40 @@ export const useSftpConnections = ({
           }));
         }
       } else {
-        const hostCacheKey = buildCacheKey(host.id, host.hostname, host.port, host.protocol, host.sftpSudo, host.username);
-        const sharedHostCacheCandidate = getSharedRemoteHostCache(hostCacheKey);
-        const sharedHostCache =
-          sharedHostCacheCandidate?.filenameEncoding === filenameEncoding
-            ? sharedHostCacheCandidate
-            : null;
-        const cachedStartPath = sharedHostCache?.path ?? "/";
+        const hostCacheKey = buildCacheKey(host.id, host.hostname, host.port, host.protocol, host.sftpSudo, host.username, host.sftpFileProtocol);
+        const sharedHostCacheCandidate = options?.ignoreSharedCache
+          ? null
+          : getSharedRemoteHostCache(hostCacheKey);
+        const { initialPath, sharedHostCache, cachedStartPath } = resolveRemoteSftpStartState({
+          filenameEncoding,
+          ignoreSharedCache: options?.ignoreSharedCache,
+          initialPath: effectiveInitialPath,
+          sharedHostCacheCandidate,
+        });
+        const normalizedCachedStartPath = normalizeSftpPaneNavigationPath(
+          cachedStartPath,
+          sharedHostCache?.homeDir,
+          sharedHostCache?.path,
+        );
+
+        const sourceSessionId = options?.sourceSessionId;
 
         const connection: SftpConnection = {
           id: connectionId,
           hostId: host.id,
           hostLabel: host.label,
           isLocal: false,
-          backendType: "sftp",
           status: "connecting",
-          currentPath: cachedStartPath,
-          sourceSessionId: options?.sourceSessionId ?? undefined,
+          currentPath: normalizedCachedStartPath,
+          // Suppress loading animation when connection reuse is requested.
+          // If the backend falls back to a fresh connection, the pane stays
+          // non-interactive (loading=true) with stale cached files visible —
+          // no worse than the previous UX of always showing a spinner.
+          reusedConnection: !!sourceSessionId,
+          fileProtocol: host.sftpFileProtocol ?? 'auto',
         };
 
-        updateTab(side, activeTabId, (prev) => ({
+        updateTargetTab((prev) => ({
           ...prev,
           connection,
           // Always show loading while connecting — even with cached files.
@@ -247,6 +659,7 @@ export const useSftpConnections = ({
 
         // Subscribe to SFTP connection progress events for auth logging
         const sftpSessionId = `sftp-${connectionId}`;
+        activeHostKeySessionsRef.current.set(sftpSessionId, { side, tabId: activeTabId });
         let unsubSftpProgress: (() => void) | undefined;
         const bridge = netcattyBridge.get();
         if (bridge?.onSftpConnectionProgress) {
@@ -281,8 +694,8 @@ export const useSftpConnections = ({
                 logLine = `${label} - ${status}${detail ? `: ${detail}` : ''}`;
             }
             // Only update if this is still the active request (avoids stale logs leaking)
-            if (navSeqRef.current[side] !== connectRequestId) return;
-            updateTab(side, activeTabId, (prev) => ({
+            if (!isTargetConnectionCurrent()) return;
+            updateTargetTab((prev) => ({
               ...prev,
               connectionLogs: [...prev.connectionLogs, logLine],
             }));
@@ -290,82 +703,29 @@ export const useSftpConnections = ({
         }
 
         try {
-          const credentials = getHostCredentials(host);
           const openSftp = bridge?.openSftp;
-          const openSftpForSession = bridge?.openSftpForSession;
           if (!openSftp) throw new Error("SFTP bridge unavailable");
 
-          const isAuthError = (err: unknown): boolean => {
-            if (!(err instanceof Error)) return false;
-            const msg = err.message.toLowerCase();
-            return (
-              msg.includes("authentication") ||
-              msg.includes("auth") ||
-              msg.includes("password") ||
-              msg.includes("permission denied")
-            );
-          };
-
-          const hasKey = !!credentials.privateKey;
-          const hasPassword = !!credentials.password;
-          const sourceSessionId = options?.sourceSessionId ?? null;
-
-          let sftpId: string | undefined;
-          if (sourceSessionId && openSftpForSession) {
-            try {
-              updateTab(side, activeTabId, (prev) => ({
-                ...prev,
-                connectionLogs: [...prev.connectionLogs, "Reusing active terminal SSH connection..."],
-              }));
-              sftpId = await openSftpForSession(sourceSessionId, { timeoutMs: 15_000 });
-            } catch {
-              updateTab(side, activeTabId, (prev) => ({
-                ...prev,
-                connectionLogs: [
-                  ...prev.connectionLogs,
-                  "Falling back to a dedicated SFTP connection...",
-                ],
-              }));
-            }
-          }
-
-          if (!sftpId) {
-            if (hasKey) {
-              try {
-                const keyFirstCredentials = {
-                  sessionId: `sftp-${connectionId}`,
-                  ...credentials,
-                };
-                if (!credentials.sudo) {
-                  keyFirstCredentials.password = undefined;
-                }
-                sftpId = await openSftp(keyFirstCredentials);
-              } catch (err) {
-                if (hasPassword && isAuthError(err)) {
-                  sftpId = await openSftp({
-                    sessionId: `sftp-${connectionId}`,
-                    ...credentials,
-                    privateKey: undefined,
-                    certificate: undefined,
-                    publicKey: undefined,
-                    keyId: undefined,
-                    keySource: undefined,
-                  });
-                } else {
-                  throw err;
-                }
-              }
-            } else {
-              sftpId = await openSftp({
-                sessionId: `sftp-${connectionId}`,
-                ...credentials,
-              });
-            }
-          }
+          const credentials = getHostCredentials(host);
+          // The main-process SSH auth driver owns key/password/MFA fallback.
+          // Keep one renderer connect entry so a failed fresh dial is never
+          // immediately repeated after a shared-channel attempt fails.
+          const sftpId = await openSftpConnectionOnce({
+            bridge,
+            sourceSessionId,
+            openOptions: {
+              sessionId: sftpSessionId,
+              ...credentials,
+            },
+          });
 
           if (!sftpId) throw new Error("Failed to open SFTP session");
 
           sftpSessionsRef.current.set(connectionId, sftpId);
+          if (!isTargetConnectionCurrent()) {
+            await closeSftpSessionForConnection();
+            return;
+          }
 
           let startPath = sharedHostCache?.path ?? "/";
           let homeDir = sharedHostCache?.homeDir ?? startPath;
@@ -377,7 +737,7 @@ export const useSftpConnections = ({
 
             if (bridge?.getSftpHomeDir) {
               try {
-                const result = await bridge.getSftpHomeDir(sftpId);
+                const result = await bridge.getSftpHomeDir(sftpId, host.sftpEncoding);
                 if (result?.success && result.homeDir) {
                   startPath = result.homeDir;
                   homeDir = result.homeDir;
@@ -389,15 +749,7 @@ export const useSftpConnections = ({
             }
 
             if (!detected) {
-              const candidates: string[] = [];
-              if (credentials.username === "root") {
-                candidates.push("/root");
-              } else if (credentials.username) {
-                candidates.push(`/home/${credentials.username}`);
-                candidates.push("/root");
-              } else {
-                candidates.push("/root");
-              }
+              const candidates = buildSftpHomeDirCandidates(credentials.username);
               const statSftp = bridge?.statSftp;
               if (statSftp) {
                 for (const candidate of candidates) {
@@ -430,11 +782,16 @@ export const useSftpConnections = ({
             }
           }
 
+          if (initialPath) {
+            startPath = initialPath;
+          }
+          startPath = normalizeSftpPaneNavigationPath(startPath, homeDir);
+
           const provisionalCacheKey = sharedHostCache
             ? makeCacheKey(connectionId, startPath, filenameEncoding)
             : null;
           if (sharedHostCache && provisionalCacheKey) {
-            dirCacheRef.current.set(provisionalCacheKey, {
+            setDirectoryCacheEntry(dirCacheRef.current, provisionalCacheKey, {
               files: sharedHostCache.files,
               timestamp: Date.now(),
             });
@@ -450,8 +807,9 @@ export const useSftpConnections = ({
               dirCacheRef.current.delete(provisionalCacheKey);
             }
             // Fall back to homeDir, then "/", chaining attempts.
+            // Remembered/reconnect paths can be stale even when shared cache is gone.
             let fallbackSucceeded = false;
-            if (sharedHostCache && startPath !== homeDir) {
+            if (startPath !== homeDir) {
               try {
                 startPath = homeDir;
                 files = await listRemoteFiles(sftpId, startPath, filenameEncoding);
@@ -469,12 +827,32 @@ export const useSftpConnections = ({
                 // root also failed
               }
             }
+            // Last resort: home candidates. Covers provisional "/" from realpath
+            // when discovery treated root as home and listing it failed, so
+            // /home/<user> or /root can still recover the session.
+            if (!fallbackSucceeded) {
+              for (const candidate of buildSftpHomeDirCandidates(credentials.username)) {
+                if (candidate === startPath) continue;
+                try {
+                  files = await listRemoteFiles(sftpId, candidate, filenameEncoding);
+                  startPath = candidate;
+                  homeDir = candidate;
+                  fallbackSucceeded = true;
+                  break;
+                } catch {
+                  // Ignore missing/permission errors
+                }
+              }
+            }
             if (!fallbackSucceeded) {
               throw new Error("Cannot list any remote directory");
             }
           }
-          if (navSeqRef.current[side] !== connectRequestId) return;
-          dirCacheRef.current.set(makeCacheKey(connectionId, startPath, filenameEncoding), {
+          if (!isTargetConnectionCurrent()) {
+            await closeSftpSessionForConnection();
+            return;
+          }
+          setDirectoryCacheEntry(dirCacheRef.current, makeCacheKey(connectionId, startPath, filenameEncoding), {
             files,
             timestamp: Date.now(),
           });
@@ -485,9 +863,9 @@ export const useSftpConnections = ({
             filenameEncoding,
           });
 
-          reconnectingRef.current[side] = false;
+          clearSideReconnecting();
 
-          updateTab(side, activeTabId, (prev) => ({
+          updateTargetTab((prev) => ({
             ...prev,
             connection: prev.connection
               ? {
@@ -495,6 +873,7 @@ export const useSftpConnections = ({
                   status: "connected",
                   currentPath: startPath,
                   homeDir,
+                  reusedConnection: undefined,
                 }
               : null,
             files,
@@ -503,9 +882,15 @@ export const useSftpConnections = ({
             connectionLogs: [], // Clear after successful connect to avoid replay during navigation
           }));
         } catch (err) {
-          if (navSeqRef.current[side] !== connectRequestId) return;
-          reconnectingRef.current[side] = false;
-          updateTab(side, activeTabId, (prev) => ({
+          if (!isTargetConnectionCurrent()) {
+            await closeSftpSessionForConnection();
+            return;
+          }
+          // A backend may already be open when initial directory discovery
+          // fails. Never leave that handle mapped behind an error pane.
+          await closeSftpSessionForConnection();
+          clearSideReconnecting();
+          updateTargetTab((prev) => ({
             ...prev,
             connection: prev.connection
               ? {
@@ -523,9 +908,14 @@ export const useSftpConnections = ({
             reconnecting: false,
           }));
         } finally {
+          activeHostKeySessionsRef.current.delete(sftpSessionId);
+          if (hostKeyVerificationRef.current?.sessionId === sftpSessionId) {
+            setPendingHostKeyVerification(null);
+          }
           unsubSftpProgress?.();
         }
       }
+      });
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -537,162 +927,11 @@ export const useSftpConnections = ({
       makeCacheKey,
       listLocalFiles,
       listRemoteFiles,
+      setPendingHostKeyVerification,
     ],
   );
 
   const initialConnectDoneRef = useRef(false);
-
-  const connectDockerContainer = useCallback(
-    async (
-      side: "left" | "right",
-      dockerOptions: { host: Host; sourceSessionId: string; container: DockerContainerSummary },
-      options?: ConnectOptions,
-    ) => {
-      const { host, sourceSessionId, container } = dockerOptions;
-      const setTabs = side === "left" ? setLeftTabs : setRightTabs;
-      const sideTabs = side === "left" ? leftTabsRef.current : rightTabsRef.current;
-
-      let activeTabId: string | null = null;
-      if (!sideTabs.activeTabId || options?.forceNewTab) {
-        const newPane = createEmptyPane();
-        activeTabId = newPane.id;
-        setTabs((prev) => ({
-          tabs: [...prev.tabs, newPane],
-          activeTabId: newPane.id,
-        }));
-      } else {
-        activeTabId = sideTabs.activeTabId;
-      }
-
-      if (!activeTabId) return;
-
-      options?.onTabCreated?.(activeTabId);
-
-      const connectionId = `${side}-docker-${Date.now()}`;
-      navSeqRef.current[side] += 1;
-      const connectRequestId = navSeqRef.current[side];
-      lastConnectedHostRef.current[side] = host;
-      const hostCacheKey = buildCacheKey(host.id, host.hostname, host.port, host.protocol, host.sftpSudo, host.username);
-      connectionCacheKeyMapRef.current.set(connectionId, `${hostCacheKey}::docker:${container.id}`);
-
-      const currentPane = getActivePane(side);
-      if (!options?.forceNewTab) {
-        if (currentPane?.connection) {
-          clearCacheForConnection(currentPane.connection.id);
-        }
-        if (currentPane?.connection && !currentPane.connection.isLocal) {
-          const oldSftpId = sftpSessionsRef.current.get(currentPane.connection.id);
-          if (oldSftpId) {
-            sftpSessionsRef.current.delete(currentPane.connection.id);
-            try {
-              await netcattyBridge.get()?.closeSftp(oldSftpId);
-            } catch {
-              // ignore stale close
-            }
-          }
-        }
-      }
-
-      const initialPath = container.workingDir || "/";
-      const connection: SftpConnection = {
-        id: connectionId,
-        hostId: host.id,
-        hostLabel: `${host.label} / ${container.name}`,
-        isLocal: false,
-        backendType: "docker-container",
-        status: "connecting",
-        currentPath: initialPath,
-        homeDir: initialPath,
-        sourceSessionId,
-        containerId: container.id,
-        containerName: container.name,
-        containerWorkingDir: container.workingDir,
-      };
-
-      updateTab(side, activeTabId, (prev) => ({
-        ...prev,
-        connection,
-        loading: true,
-        reconnecting: false,
-        error: null,
-        connectionLogs: [],
-        files: [],
-        filenameEncoding: "utf-8",
-      }));
-
-      try {
-        let startPath = initialPath;
-        let files: SftpFileEntry[] = [];
-        try {
-          files = await listDockerFiles(sourceSessionId, container.id, startPath);
-        } catch (error) {
-          if (startPath !== "/") {
-            startPath = "/";
-            files = await listDockerFiles(sourceSessionId, container.id, startPath);
-          } else {
-            throw error;
-          }
-        }
-
-        if (navSeqRef.current[side] !== connectRequestId) return;
-
-        dirCacheRef.current.set(makeCacheKey(connectionId, startPath, "utf-8"), {
-          files,
-          timestamp: Date.now(),
-        });
-
-        reconnectingRef.current[side] = false;
-        updateTab(side, activeTabId, (prev) => ({
-          ...prev,
-          connection: prev.connection
-            ? {
-                ...prev.connection,
-                status: "connected",
-                currentPath: startPath,
-                homeDir: startPath,
-              }
-            : null,
-          files,
-          loading: false,
-          reconnecting: false,
-        }));
-      } catch (err) {
-        if (navSeqRef.current[side] !== connectRequestId) return;
-        reconnectingRef.current[side] = false;
-        updateTab(side, activeTabId, (prev) => ({
-          ...prev,
-          connection: prev.connection
-            ? {
-                ...prev.connection,
-                status: "error",
-                error: err instanceof Error ? err.message : "打开容器失败",
-              }
-            : null,
-          error: err instanceof Error ? err.message : "打开容器失败",
-          loading: false,
-          reconnecting: false,
-        }));
-      }
-    },
-    [
-      clearCacheForConnection,
-      createEmptyPane,
-      getActivePane,
-      listDockerFiles,
-      makeCacheKey,
-      reconnectingRef,
-      setLeftTabs,
-      setRightTabs,
-      sftpSessionsRef,
-      updateTab,
-      leftTabsRef,
-      rightTabsRef,
-      navSeqRef,
-      lastConnectedHostRef,
-      connectionCacheKeyMapRef,
-      dirCacheRef,
-    ],
-  );
 
   useEffect(() => {
     if (
@@ -711,13 +950,34 @@ export const useSftpConnections = ({
   useEffect(() => {
     const reconnectTimers: number[] = [];
 
-    const scheduleReconnect = (side: "left" | "right") => {
+    /** Prefer lastConnectedHostRef; fall back to vault host via connection.hostId. */
+    const resolveReconnectHost = (side: "left" | "right"): Host | "local" | null => {
       const lastHost = lastConnectedHostRef.current[side];
-      if (!lastHost || !reconnectingRef.current[side]) return;
+      if (lastHost) return lastHost;
+
+      const connection = getActivePane(side)?.connection;
+      if (!connection) return null;
+      if (connection.isLocal) {
+        lastConnectedHostRef.current[side] = "local";
+        return "local";
+      }
+      if (!connection.hostId) return null;
+      const host = hosts.find((candidate) => candidate.id === connection.hostId) ?? null;
+      if (host) {
+        // Seed the ref so later refresh/session-error paths do not depend on tab races.
+        lastConnectedHostRef.current[side] = host;
+      }
+      return host;
+    };
+
+    const scheduleReconnect = (side: "left" | "right") => {
+      if (!reconnectingRef.current[side]) return;
+      const host = resolveReconnectHost(side);
+      if (!host) return;
 
       const timer = window.setTimeout(() => {
         if (!reconnectingRef.current[side]) return;
-        void connect(side, lastHost);
+        void connect(side, host);
       }, 1000);
       reconnectTimers.push(timer);
     };
@@ -732,7 +992,15 @@ export const useSftpConnections = ({
     return () => {
       reconnectTimers.forEach((timer) => window.clearTimeout(timer));
     };
-  }, [leftPane.reconnecting, rightPane.reconnecting, connect, lastConnectedHostRef, reconnectingRef]);
+  }, [
+    leftPane.reconnecting,
+    rightPane.reconnecting,
+    connect,
+    getActivePane,
+    hosts,
+    lastConnectedHostRef,
+    reconnectingRef,
+  ]);
 
   const disconnect = useCallback(
     async (side: "left" | "right") => {
@@ -744,22 +1012,27 @@ export const useSftpConnections = ({
 
       navSeqRef.current[side] += 1;
 
-      if (pane.connection) {
-        clearCacheForConnection(pane.connection.id);
-      }
+      const sftpId = pane.connection
+        ? takeSftpConnectionMetadataForClose({
+          connectionId: pane.connection.id,
+          sftpSessions: sftpSessionsRef.current,
+          connectionCacheKeys: connectionCacheKeyMapRef.current,
+          clearCacheForConnection,
+        })
+        : undefined;
 
       reconnectingRef.current[side] = false;
       lastConnectedHostRef.current[side] = null;
+      connectedHostByTabIdRef.current.delete(activeTabId);
 
-      if (pane.connection && !pane.connection.isLocal && !isDockerSftpConnection(pane.connection)) {
-        const sftpId = sftpSessionsRef.current.get(pane.connection.id);
+      if (pane.connection && !pane.connection.isLocal) {
         if (sftpId) {
           try {
             await netcattyBridge.get()?.closeSftp(sftpId);
           } catch {
             // Ignore errors when closing SFTP session during disconnect
           }
-          sftpSessionsRef.current.delete(pane.connection.id);
+          notifyRemoteSessionClosed(sftpId);
         }
       }
 
@@ -771,10 +1044,12 @@ export const useSftpConnections = ({
 
   return {
     connect,
-    connectDockerContainer,
     disconnect,
     listLocalFiles,
     listRemoteFiles,
-    listDockerFiles,
+    hostKeyVerification,
+    rejectHostKeyVerification,
+    acceptHostKeyVerification,
+    acceptAndSaveHostKeyVerification,
   };
 };

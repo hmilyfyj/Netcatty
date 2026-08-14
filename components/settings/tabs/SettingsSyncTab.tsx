@@ -1,12 +1,15 @@
 import React, { useCallback } from "react";
 import type { PortForwardingRule } from "../../../domain/models";
 import type { SyncPayload } from "../../../domain/sync";
-import { buildSyncPayload, applySyncPayload } from "../../../application/syncPayload";
+import {
+  buildCloudSyncPayload,
+  applySyncPayload,
+  getEffectivePortForwardingRulesForSync,
+  prepareLocalVaultPayloadApply,
+} from "../../../application/syncPayload";
 import { applyProtectedSyncPayload } from "../../../application/localVaultBackups";
 import type { SyncableVaultData } from "../../../application/syncPayload";
 import { useI18n } from "../../../application/i18n/I18nProvider";
-import { STORAGE_KEY_PORT_FORWARDING } from "../../../infrastructure/config/storageKeys";
-import { localStorageAdapter } from "../../../infrastructure/persistence/localStorageAdapter";
 import { getEffectiveKnownHosts } from "../../../infrastructure/syncHelpers";
 import { CloudSyncSettings } from "../../CloudSyncSettings";
 import { SettingsTabContent } from "../settings-ui";
@@ -14,7 +17,7 @@ import { SettingsTabContent } from "../settings-ui";
 export default function SettingsSyncTab(props: {
   vault: SyncableVaultData;
   portForwardingRules: PortForwardingRule[];
-  importDataFromString: (data: string) => void;
+  importDataFromString: (data: string) => void | Promise<void>;
   importPortForwardingRules: (rules: PortForwardingRule[]) => void;
   clearVaultData: () => void;
   onSettingsApplied?: () => void;
@@ -29,39 +32,66 @@ export default function SettingsSyncTab(props: {
   } = props;
   const { t } = useI18n();
 
-  const onBuildPayload = useCallback((): SyncPayload => {
-    // If hook state is empty but localStorage has data, the async store
-    // initialization hasn't finished yet.  Read from localStorage directly
-    // to avoid uploading empty arrays and overwriting the remote snapshot.
-    let effectiveRules = portForwardingRules;
-    if (effectiveRules.length === 0) {
-      const stored = localStorageAdapter.read<PortForwardingRule[]>(
-        STORAGE_KEY_PORT_FORWARDING,
-      );
-      if (stored && Array.isArray(stored) && stored.length > 0) {
-        // Strip transient per-device fields (status, error, lastUsedAt)
-        // that setGlobalRules persists to localStorage but shouldn't be
-        // included in the cloud sync snapshot.
-        effectiveRules = stored.map(({ status: _status, error: _error, ...rest }) => ({
-          ...rest,
-          status: "inactive" as const,
-          error: undefined,
-          lastUsedAt: undefined,
-        }));
-      }
-    }
+  const getEffectivePortForwardingRules = useCallback((): PortForwardingRule[] => {
+    return getEffectivePortForwardingRulesForSync(portForwardingRules) ?? [];
+  }, [portForwardingRules]);
 
+  const onBuildPayload = useCallback((): Promise<SyncPayload> => {
+    return buildCloudSyncPayload(vault, getEffectivePortForwardingRules());
+  }, [vault, getEffectivePortForwardingRules]);
+
+  const onBuildLocalPayload = useCallback(async (): Promise<SyncPayload> => {
     const effectiveKnownHosts = getEffectiveKnownHosts(vault.knownHosts);
+    const { buildLocalVaultPayloadAsync } = await import('../../../application/syncPayload');
+    return buildLocalVaultPayloadAsync(
+      { ...vault, knownHosts: effectiveKnownHosts ?? [] },
+      getEffectivePortForwardingRules(),
+    );
+  }, [vault, getEffectivePortForwardingRules]);
 
-    return buildSyncPayload({ ...vault, knownHosts: effectiveKnownHosts }, effectiveRules);
-  }, [vault, portForwardingRules]);
+  const onApplyMigrationPayload = useCallback(
+    (payload: SyncPayload) =>
+      applySyncPayload(payload, {
+        importVaultData: importDataFromString,
+        importPortForwardingRules,
+        onSettingsApplied,
+      }),
+    [importDataFromString, importPortForwardingRules, onSettingsApplied],
+  );
 
   const onApplyPayload = useCallback(
     (payload: SyncPayload) =>
       applyProtectedSyncPayload({
-        buildPreApplyPayload: onBuildPayload,
-        applyPayload: () =>
-          applySyncPayload(payload, {
+        buildPreApplyPayload: onBuildLocalPayload,
+        applyPayload: () => onApplyMigrationPayload(payload),
+        translateProtectiveBackupFailure: (message) =>
+          t("cloudSync.localBackups.protectiveBackupFailed", { message }),
+      }),
+    [onApplyMigrationPayload, onBuildLocalPayload, t],
+  );
+
+  const onApplyConvergentPayload = useCallback(
+    (
+      payload: SyncPayload,
+      commitReplica: () => Promise<void>,
+    ) => applyProtectedSyncPayload({
+      buildPreApplyPayload: onBuildLocalPayload,
+      applyPayload: async () => {
+        await onApplyMigrationPayload(payload);
+        await commitReplica();
+      },
+      translateProtectiveBackupFailure: (message) =>
+        t("cloudSync.localBackups.protectiveBackupFailed", { message }),
+    }),
+    [onApplyMigrationPayload, onBuildLocalPayload, t],
+  );
+
+  const onApplyLocalPayload = useCallback(
+    (payload: SyncPayload) =>
+      applyProtectedSyncPayload({
+        buildPreApplyPayload: onBuildLocalPayload,
+        prepareApply: () =>
+          prepareLocalVaultPayloadApply(payload, {
             importVaultData: importDataFromString,
             importPortForwardingRules,
             onSettingsApplied,
@@ -69,7 +99,7 @@ export default function SettingsSyncTab(props: {
         translateProtectiveBackupFailure: (message) =>
           t("cloudSync.localBackups.protectiveBackupFailed", { message }),
       }),
-    [importDataFromString, importPortForwardingRules, onBuildPayload, onSettingsApplied, t],
+    [importDataFromString, importPortForwardingRules, onBuildLocalPayload, onSettingsApplied, t],
   );
 
   const clearAllLocalData = useCallback(() => {
@@ -81,7 +111,11 @@ export default function SettingsSyncTab(props: {
     <SettingsTabContent value="sync">
       <CloudSyncSettings
         onBuildPayload={onBuildPayload}
+        onBuildLocalPayload={onBuildLocalPayload}
+        onApplyMigrationPayload={onApplyMigrationPayload}
         onApplyPayload={onApplyPayload}
+        onApplyConvergentPayload={onApplyConvergentPayload}
+        onApplyLocalPayload={onApplyLocalPayload}
         onClearLocalData={clearAllLocalData}
       />
     </SettingsTabContent>

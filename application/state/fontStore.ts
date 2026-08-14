@@ -1,6 +1,14 @@
 import { useSyncExternalStore } from 'react';
 import { TERMINAL_FONTS, type TerminalFont } from '../../infrastructure/config/fonts';
-import { getMonospaceFonts } from '../../lib/localFonts';
+import {
+  clearLocalFontsCache,
+  getAllSystemFontFamilyNames,
+  getMonospaceFonts,
+} from '../../lib/localFonts';
+import {
+  clearFontAvailabilityCache,
+  setSystemFamilies,
+} from '../../lib/fontAvailability';
 
 /**
  * Global font store - singleton pattern using useSyncExternalStore
@@ -10,6 +18,7 @@ type Listener = () => void;
 
 interface FontStoreState {
   availableFonts: TerminalFont[];
+  installedFontFamilies: string[] | null;
   isLoading: boolean;
   isLoaded: boolean;
   error: string | null;
@@ -18,6 +27,7 @@ interface FontStoreState {
 class FontStore {
   private state: FontStoreState = {
     availableFonts: TERMINAL_FONTS,
+    installedFontFamilies: null,
     isLoading: false,
     isLoaded: false,
     error: null,
@@ -26,6 +36,7 @@ class FontStore {
 
   // Getters for individual state slices
   getAvailableFonts = (): TerminalFont[] => this.state.availableFonts;
+  getInstalledFontFamilies = (): string[] | null => this.state.installedFontFamilies;
   getIsLoading = (): boolean => this.state.isLoading;
   getIsLoaded = (): boolean => this.state.isLoaded;
   getError = (): string | null => this.state.error;
@@ -60,8 +71,19 @@ class FontStore {
     this.setState({ isLoading: true, error: null });
 
     try {
-      const localFonts = await getMonospaceFonts();
-      
+      // Populate the authoritative installed-family set used by
+      // fontAvailability.isFontInstalled. Runs in parallel with the
+      // monospace-only query (both share an underlying cache).
+      const [localFonts, installedFontFamilies] = await Promise.all([
+        getMonospaceFonts(),
+        getAllSystemFontFamilyNames(),
+      ]);
+      setSystemFamilies(
+        installedFontFamilies
+          ? new Set(installedFontFamilies.map((family) => family.toLowerCase()))
+          : null,
+      );
+
       // Combine default fonts with local fonts, deduplicate by id
       const fontMap = new Map<string, TerminalFont>();
 
@@ -82,6 +104,7 @@ class FontStore {
 
       this.setState({
         availableFonts: Array.from(fontMap.values()),
+        installedFontFamilies,
         isLoading: false,
         isLoaded: true,
       });
@@ -90,11 +113,20 @@ class FontStore {
       console.warn('Failed to fetch local fonts, using defaults:', error);
       this.setState({
         availableFonts: TERMINAL_FONTS,
+        installedFontFamilies: null,
         isLoading: false,
         isLoaded: true,
         error: errorMessage,
       });
     }
+  };
+
+  refresh = async (): Promise<void> => {
+    if (this.state.isLoading) return;
+    clearLocalFontsCache();
+    clearFontAvailabilityCache();
+    this.setState({ isLoaded: false });
+    await this.initialize();
   };
 
   /**
@@ -126,23 +158,22 @@ export const useAvailableFonts = (): TerminalFont[] => {
   );
 };
 
-/**
- * Get font loading state
- */
-export const useFontsLoading = (): boolean => {
+export const useInstalledFontFamilies = (): string[] | null => {
+  if (!fontStore.getIsLoaded() && !fontStore.getIsLoading()) {
+    fontStore.initialize();
+  }
   return useSyncExternalStore(
     fontStore.subscribe,
-    fontStore.getIsLoading
+    fontStore.getInstalledFontFamilies,
   );
 };
 
-/**
- * Get font by ID with fallback - useful for components that need a specific font
- */
-export const useFontById = (fontId: string): TerminalFont => {
-  const fonts = useAvailableFonts();
-  return fonts.find(f => f.id === fontId) || fonts[0] || TERMINAL_FONTS[0];
-};
+export const useFontsLoading = (): boolean => useSyncExternalStore(
+  fontStore.subscribe,
+  fontStore.getIsLoading,
+);
+
+export const refreshFonts = (): Promise<void> => fontStore.refresh();
 
 /**
  * Initialize fonts eagerly (call at app startup)

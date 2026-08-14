@@ -6,31 +6,79 @@
 const net = require("node:net");
 const fs = require("node:fs");
 const path = require("node:path");
+const { randomUUID } = require("node:crypto");
 const os = require("node:os");
+const crypto = require("node:crypto");
 const { exec } = require("node:child_process");
+require("./boringSslDhCompat.cjs").installBoringSslDhCompat();
 const { Client: SSHClient, utils: sshUtils } = require("ssh2");
 const { NetcattyAgent } = require("./netcattyAgent.cjs");
 const keyboardInteractiveHandler = require("./keyboardInteractiveHandler.cjs");
 const passphraseHandler = require("./passphraseHandler.cjs");
-const { createProxySocket } = require("./proxyUtils.cjs");
-const tempDirBridge = require("./tempDirBridge.cjs");
+const hostKeyVerifier = require("./hostKeyVerifier.cjs");
+const { createProxySocket, runWhenProxyConnectionReady } = require("./proxyUtils.cjs");
+const { attachX11Forwarding } = require("./x11Forwarding.cjs");
+const { createPtyOutputBuffer } = require("./ptyOutputBuffer.cjs");
 const {
   buildAuthHandler,
   createKeyboardInteractiveHandler,
+  createOrderedStringAuthHandler,
+  createAuthPhase,
+  markAuthPhasePartialSuccess,
+  canRepeatKeyboardInteractive,
+  shouldSkipKiPasswordAutoFill,
   applyAuthToConnOpts,
   safeSend: authSafeSend,
   requestPassphrasesForEncryptedKeys,
   findAllDefaultPrivateKeys: findAllDefaultPrivateKeysFromHelper,
   getSshAgentSocket,
+  getAvailableAgentSocket: getAvailableSystemAgentSocket,
+  getAvailableForwardingAgentSocket,
+  prepareSystemSshAgentForAuth,
+  readFileNoFollow,
+  expandIdentityFilePath,
+  isAutoFillablePasswordChallenge,
+  preparePrivateKeyForAuth,
+  loadIdentityFileForAuth,
+  loadFirstIdentityFileForAuth,
+  hasUserConfiguredKey,
+  isPasswordProvided,
+  PassphraseCancelledError,
+  isPassphraseCancelledError,
 } = require("./sshAuthHelper.cjs");
 const sessionLogStreamManager = require("./sessionLogStreamManager.cjs");
-const { trackSessionIdlePrompt } = require("./ai/shellUtils.cjs");
-const { createZmodemSentry } = require("./zmodemHelper.cjs");
+const { trackSessionIdlePrompt, looksLikeIdleAutoLogout } = require("./ai/shellUtils.cjs");
+const { createZmodemSentry, waitForWritableDrain } = require("./zmodemHelper.cjs");
+const tempDirBridge = require("./tempDirBridge.cjs");
+const {
+  buildAlgorithms,
+  _resetAlgorithmSupportCacheForTests,
+} = require("./sshAlgorithms.cjs");
+const { enableSshNoDelay, enableTcpNoDelay } = require("./tcpNoDelay.cjs");
+const { createTcpConnectLatencyProbe } = require("./tcpConnectLatency.cjs");
+const {
+  configureTerminalSessionDataEmitter,
+} = require("./emitTerminalSessionData.cjs");
 
 // Default SSH key names in priority order (preferred keys tried first)
 const PREFERRED_KEY_NAMES = ["id_ed25519", "id_ecdsa", "id_rsa"];
 // Match any private key file: id_* but not *.pub
 const SSH_KEY_PATTERN = /^id_[\w-]+$/;
+const {
+  createStartSessionApi,
+  resolveSshConnectionTimeouts,
+} = require("./sshBridge/startSession.cjs");
+const { ensureMacLocalNetworkAccess, attachMacLocalNetworkProbeResult } = require("./macLocalNetworkAccess.cjs");
+
+function quoteShellArg(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
+
+function hasUsableProxy(proxy) {
+  if (!proxy) return false;
+  if (proxy.type === "command") return !!proxy.command?.trim();
+  return !!(proxy.host && proxy.port);
+}
 
 /**
  * Quick check if file content looks like an SSH private key.
@@ -123,9 +171,8 @@ async function findDefaultPrivateKey() {
   for (const name of sorted) {
     const keyPath = path.join(sshDir, name);
     try {
-      const stat = await fs.promises.stat(keyPath);
-      if (!stat.isFile()) continue;
-      const privateKey = await fs.promises.readFile(keyPath, "utf8");
+      const privateKey = await readFileNoFollow(keyPath);
+      if (!privateKey) continue;
       if (!looksLikePrivateKey(privateKey)) {
         log("Skipping non-key file", { keyPath, keyName: name });
         continue;
@@ -169,9 +216,8 @@ async function findAllDefaultPrivateKeys() {
   const promises = sorted.map(async (name) => {
     const keyPath = path.join(sshDir, name);
     try {
-      const stat = await fs.promises.stat(keyPath);
-      if (!stat.isFile()) return null;
-      const privateKey = await fs.promises.readFile(keyPath, "utf8");
+      const privateKey = await readFileNoFollow(keyPath);
+      if (!privateKey) return null;
       if (!looksLikePrivateKey(privateKey)) {
         log("Skipping non-key file", { keyPath, keyName: name });
         return null;
@@ -239,74 +285,138 @@ async function getAvailableAgentSocket() {
   return getSshAgentSocket();
 }
 
-const DEBUG_SSH = process.env.NETCATTY_SSH_DEBUG === "1";
+const SSH_DEBUG_REDACTED_KEYS = new Set([
+  "password",
+  "passphrase",
+  "privateKey",
+  "key",
+  "certificate",
+]);
+let sshDebugLoggingEnabled = process.env.NETCATTY_SSH_DEBUG === "1";
+let sshDebugLogFilePath = tempDirBridge.getTempFilePath("netcatty-ssh.log");
 
-// Debug logger (disabled by default)
-const logFile = DEBUG_SSH
-  ? path.join(require("os").tmpdir(), "netcatty-ssh.log")
-  : null;
-const log = (msg, data) => {
-  if (!DEBUG_SSH) return;
-  const line = `[${new Date().toISOString()}] ${msg} ${data ? JSON.stringify(data) : ""}\n`;
-  try { fs.appendFileSync(logFile, line); } catch { }
-  console.log("[SSH]", msg, data ? JSON.stringify(data, null, 2) : "");
-};
-
-/**
- * Build SSH algorithm configuration.
- * When legacyEnabled is true, legacy algorithms are appended to each list
- * (lower priority than modern ones) for compatibility with older network equipment.
- */
-function buildAlgorithms(legacyEnabled) {
-  const algorithms = {
-    cipher: [
-      'aes128-gcm@openssh.com', 'aes256-gcm@openssh.com',
-      'aes128-ctr', 'aes192-ctr', 'aes256-ctr',
-    ],
-    kex: [
-      'curve25519-sha256', 'curve25519-sha256@libssh.org',
-      'ecdh-sha2-nistp256', 'ecdh-sha2-nistp384', 'ecdh-sha2-nistp521',
-      'diffie-hellman-group14-sha256',
-      'diffie-hellman-group16-sha512', 'diffie-hellman-group18-sha512',
-      'diffie-hellman-group-exchange-sha256',
-    ],
-    compress: ['none'],
-  };
-
-  if (legacyEnabled) {
-    algorithms.kex.push(
-      'diffie-hellman-group14-sha1',
-      'diffie-hellman-group1-sha1',
-    );
-    algorithms.cipher.push(
-      'aes128-cbc', 'aes256-cbc', '3des-cbc',
-    );
-    algorithms.serverHostKey = [
-      'ssh-ed25519', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521',
-      'rsa-sha2-512', 'rsa-sha2-256',
-      'ssh-rsa', 'ssh-dss',
-    ];
+function sanitizeSshDebugValue(value, key = "") {
+  if (SSH_DEBUG_REDACTED_KEYS.has(key)) return "[redacted]";
+  if (Array.isArray(value)) return value.map((item) => sanitizeSshDebugValue(item));
+  if (value && typeof value === "object") {
+    const result = {};
+    for (const [entryKey, entryValue] of Object.entries(value)) {
+      result[entryKey] = sanitizeSshDebugValue(entryValue, entryKey);
+    }
+    return result;
   }
+  return value;
+}
 
-  return algorithms;
+function setSshDebugLoggingEnabled(enabled, options = {}) {
+  sshDebugLoggingEnabled = !!enabled;
+  if (typeof options.logFilePath === "string" && options.logFilePath.trim()) {
+    sshDebugLogFilePath = options.logFilePath;
+  }
+}
+
+function isSshDebugLoggingEnabled() {
+  return sshDebugLoggingEnabled;
+}
+
+function getSshDebugLogFilePath() {
+  return sshDebugLogFilePath;
+}
+
+function appendSshDiagnosticLog(msg, data, options = {}) {
+  const enabled = Object.prototype.hasOwnProperty.call(options, "enabled")
+    ? !!options.enabled
+    : isSshDebugLoggingEnabled();
+  if (!enabled) return;
+  const safeData = data ? sanitizeSshDebugValue(data) : undefined;
+  const line = `[${new Date().toISOString()}] ${msg} ${safeData ? JSON.stringify(safeData) : ""}\n`;
+  try { fs.appendFileSync(sshDebugLogFilePath, line); } catch { }
+  console.log("[SSH]", msg, safeData ? JSON.stringify(safeData, null, 2) : "");
+}
+
+const log = appendSshDiagnosticLog;
+log.isEnabled = isSshDebugLoggingEnabled;
+
+function createSshDiagnosticLogger(enabled) {
+  const isEnabled = !!enabled;
+  const logger = (msg, data) => appendSshDiagnosticLog(msg, data, { enabled: isEnabled });
+  logger.isEnabled = () => isEnabled;
+  return logger;
+}
+
+function shouldLogSshDebugMessage(msg) {
+  if (typeof msg !== "string") return false;
+  return /auth|publickey|keyboard|handshake|kex|newkeys|dh gex/i.test(msg);
+}
+
+function attachSshDebugLogger(connectOpts, logger = log) {
+  if (typeof logger.isEnabled === "function" && !logger.isEnabled()) return;
+  connectOpts.debug = (msg) => {
+    if (shouldLogSshDebugMessage(msg)) {
+      logger("ssh2 debug", { msg });
+    }
+  };
+}
+
+function logSshAlgorithms(label, algorithms, extra = {}, logger = log) {
+  logger(`${label} algorithm configuration`, {
+    ...extra,
+    kex: algorithms.kex,
+    cipher: algorithms.cipher,
+    hmac: algorithms.hmac,
+    serverHostKey: algorithms.serverHostKey,
+  });
+}
+
+async function getSshDebugLogInfo() {
+  let size = 0;
+  let exists = false;
+  try {
+    const stat = await fs.promises.stat(sshDebugLogFilePath);
+    exists = stat.isFile();
+    size = stat.size;
+  } catch {
+    exists = false;
+  }
+  return {
+    enabled: isSshDebugLoggingEnabled(),
+    path: sshDebugLogFilePath,
+    exists,
+    size,
+  };
+}
+
+async function openSshDebugLogDir() {
+  if (!electronModule?.shell?.openPath) return { success: false, error: "shell unavailable" };
+  try {
+    await fs.promises.mkdir(path.dirname(sshDebugLogFilePath), { recursive: true });
+    const error = await electronModule.shell.openPath(path.dirname(sshDebugLogFilePath));
+    return error ? { success: false, error } : { success: true };
+  } catch (err) {
+    return { success: false, error: err?.message || String(err) };
+  }
 }
 
 // Session storage - shared reference passed from main
 let sessions = null;
 let electronModule = null;
-const sshTransports = new Map();
+let terminalOutputChannel = null;
+let selectZmodemUploadFiles = null;
+let selectZmodemDownloadDirectory = null;
 
 // Authentication method cache - remembers successful auth methods per host
 // Key format: "username@hostname:port"
 // Value: { method: "password" | "publickey" | "publickey-default" }
 // Cache persists until auth failure, then cleared to retry all methods
-const authMethodCache = new Map();
+const { createSshAuthMethodCache } = require("./sshAuthMethodCache.cjs");
+const authMethodCache = createSshAuthMethodCache();
 
 // Per-session terminal encoding (default: utf-8)
 const sessionEncodings = new Map();
 // Per-session stateful iconv decoders (keyed by sessionId, value: { stdout, stderr })
 const sessionDecoders = new Map();
 const iconv = require("iconv-lite");
+const { encodeTerminalInput, normalizeTerminalEncoding } = require("./terminalEncoding.cjs");
 
 function getSessionDecoder(sessionId, stream) {
   let decoders = sessionDecoders.get(sessionId);
@@ -353,18 +463,28 @@ function clearCachedAuthMethod(username, hostname, port) {
   authMethodCache.delete(key);
 }
 
-// Normalize charset inputs (often provided as bare encodings like "UTF-8")
-// into a usable LANG locale for remote shells.
-function resolveLangFromCharset(charset) {
-  if (!charset) return "en_US.UTF-8";
-  const trimmed = String(charset).trim();
-  if (/^utf-?8$/i.test(trimmed) || /^utf8$/i.test(trimmed)) {
-    return "en_US.UTF-8";
-  }
-  return trimmed;
-}
-
 const { safeSend } = require("./ipcUtils.cjs");
+const { openBoundedForwardOutCallback } = require("./boundedSshChannelOpen.cjs");
+const {
+  createConnectionRef,
+  acquireConnectionRef,
+  releaseConnectionRef,
+  transferConnectionRef,
+  consumePendingShellReconnectRisk,
+  findReusableSession,
+  findTransportByEndpoint,
+  resolveTransportForReuse,
+  beginTransportDial,
+  waitForTransportDial,
+  completeTransportDial,
+  failTransportDial,
+  buildConnectionReuseEndpoint,
+  resolveConnectionKeepalivePolicy,
+  normalizeEndpoint,
+  discardAllTransports,
+} = require("./sshConnectionPool.cjs");
+
+const zmodemOverwritePending = new Map(); // requestId -> (decision) => void
 
 /**
  * Initialize the SSH bridge with dependencies
@@ -372,47 +492,33 @@ const { safeSend } = require("./ipcUtils.cjs");
 function init(deps) {
   sessions = deps.sessions;
   electronModule = deps.electronModule;
+  terminalOutputChannel = deps.terminalOutputChannel || null;
+  selectZmodemUploadFiles = deps.selectZmodemUploadFiles || null;
+  selectZmodemDownloadDirectory = deps.selectZmodemDownloadDirectory || null;
+  configureTerminalSessionDataEmitter({
+    getSession: (sessionId) => sessions?.get(sessionId),
+    outputChannel: terminalOutputChannel,
+    onSessionActivity: deps.reportOpenedSessionActivity,
+  });
 }
 
-function createTransportId() {
-  return `ssh-transport-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+function openTerminalOutputSession(sessionId, webContents) {
+  terminalOutputChannel?.openSession?.(sessionId, webContents);
 }
 
-function stopSessionArtifacts(sessionId, session) {
-  sessionLogStreamManager.stopStream(sessionId);
-  session?.zmodemSentry?.cancel();
-  sessionEncodings.delete(sessionId);
-  sessionDecoders.delete(sessionId);
-}
-
-function closeTransportById(transportId) {
-  const transport = sshTransports.get(transportId);
-  if (!transport) return;
-
-  sshTransports.delete(transportId);
-
-  try { transport.conn?.end(); } catch {}
-  for (const conn of transport.chainConnections || []) {
-    try { conn.end(); } catch {}
-  }
-}
-
-function detachSessionFromTransport(transportId, sessionId) {
-  const transport = sshTransports.get(transportId);
-  if (!transport) return;
-
-  transport.channelSessionIds.delete(sessionId);
-  if (transport.channelSessionIds.size === 0) {
-    closeTransportById(transportId);
-  }
+function closeTerminalOutputSession(sessionId) {
+  terminalOutputChannel?.closeSession?.(sessionId);
 }
 
 /**
  * Connect through a chain of jump hosts
  */
 async function connectThroughChain(event, options, jumpHosts, targetHost, targetPort, sessionId) {
+  const targetConnectionTimeouts = resolveSshConnectionTimeouts(options);
   const sender = event.sender;
   const connections = options?._connectionsRef || [];
+  const sshDiagnosticLogger = options?._sshDiagnosticLogger || log;
+  const keyboardInteractiveScope = options?._keyboardInteractiveScope || "terminal";
   let currentSocket = null;
 
   const sendProgress = (hop, total, label, status, error) => {
@@ -439,26 +545,134 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
         options._tunnelRef.chainConnections = connections;
       }
 
+      // Per-hop keepalive. Each jump entry already carries its own resolved
+      // interval/countMax (see resolveHostKeepalive in domain/host.ts), so
+      // a chain with a router as the bastion and a cloud host at the end
+      // can have keepalive=0 on the bastion and the cloud-friendly values
+      // on the final target — without one stepping on the other. We fall
+      // back to the target-call options for backward compat with older
+      // serializers that don't populate the per-hop fields yet.
+      const hopInterval = jump.keepaliveInterval ?? options.keepaliveInterval ?? 0;
+      const hopCountMax = jump.keepaliveCountMax ?? options.keepaliveCountMax ?? 10;
+      const hopConnectionTimeouts = resolveSshConnectionTimeouts(jump);
       // Build connection options
       const connOpts = {
         host: jump.hostname,
         port: jump.port || 22,
         username: jump.username || 'root',
-        readyTimeout: 120000, // 2 minutes to allow for keyboard-interactive (2FA/MFA)
-        // Use user-configured keepalive interval from options (in seconds -> convert to ms)
-        // 0 = disabled (no keepalive packets sent)
-        keepaliveInterval: options.keepaliveInterval > 0 ? options.keepaliveInterval * 1000 : 0,
-        keepaliveCountMax: options.keepaliveInterval > 0 ? 3 : 0,
+        timeout: hopConnectionTimeouts.tcpConnectTimeoutMs,
+        // ssh2 starts readyTimeout before TCP connects. The auth-ready timer
+        // below starts explicitly from the connection event instead.
+        readyTimeout: 0,
+        keepaliveInterval: hopInterval > 0 ? hopInterval * 1000 : 0,
+        keepaliveCountMax: hopInterval > 0 ? hopCountMax : 0,
         // Enable keyboard-interactive authentication (required for 2FA/MFA)
         tryKeyboard: true,
-        algorithms: buildAlgorithms(options.legacyAlgorithms),
+        // Per-hop algorithm settings. Two distinct semantics:
+        //
+        // - `legacyAlgorithms` is *append-only* — it widens the offered
+        //   list — so falling back to the target's setting when the hop
+        //   didn't override is safe and matches the historic chain-wide
+        //   behavior (a user with a single old leaf only needs to flip
+        //   the toggle on the leaf).
+        //
+        // - `skipEcdsaHostKey` and `algorithmOverrides` *narrow* the
+        //   offered list (the first removes every `ecdsa-sha2-*`, the
+        //   second replaces a category outright). Propagating those to
+        //   a bastion that doesn't need them can lock the hop to
+        //   algorithms it doesn't accept — e.g. an Ed25519-only bastion
+        //   would still negotiate while ECDSA was offered, but breaks
+        //   when the leaf's ECDSA skip is applied to it. Treat both as
+        //   strictly per-host: an unset hop value uses the hop's default
+        //   offer, not the leaf's narrower setting.
+        algorithms: buildAlgorithms(
+          jump.legacyAlgorithms ?? options.legacyAlgorithms,
+          {
+            skipEcdsaHostKey: jump.skipEcdsaHostKey,
+            algorithmOverrides: jump.algorithmOverrides,
+          },
+        ),
       };
+      connOpts.hostVerifier = hostKeyVerifier.createHostVerifier({
+        sender,
+        sessionId,
+        hostname: jump.hostname,
+        port: jump.port || 22,
+        knownHosts: options.knownHosts,
+        verifyHostKeys: jump.verifyHostKeys ?? options.verifyHostKeys,
+        bootEpoch: options.bootEpoch,
+      });
+      attachSshDebugLogger(connOpts, sshDiagnosticLogger);
+      logSshAlgorithms("Jump host", connOpts.algorithms, {
+        hostname: jump.hostname,
+        port: jump.port || 22,
+        legacyAlgorithms: !!(jump.legacyAlgorithms ?? options.legacyAlgorithms),
+        skipEcdsaHostKey: !!jump.skipEcdsaHostKey,
+        hasAlgorithmOverrides: !!jump.algorithmOverrides,
+      }, sshDiagnosticLogger);
 
       // Auth - support agent (certificate), key, password, and default key fallback
       const hasCertificate =
         typeof jump.certificate === "string" && jump.certificate.trim().length > 0;
 
+      const systemAuthAgent = hasCertificate
+        ? null
+        : await prepareSystemSshAgentForAuth(jump, `[Chain] Hop ${i + 1}:`);
+
+      const identityFile = !jump.privateKey && !systemAuthAgent
+        ? await loadFirstIdentityFileForAuth({
+          sender,
+          identityFilePaths: jump.identityFilePaths,
+          hostname: hopLabel,
+          initialPassphrase: jump.passphrase,
+          passphraseSignal: options._passphraseSignal,
+          sessionId: options.sessionId,
+          bootEpoch: options.bootEpoch,
+          logPrefix: `[Chain] Hop ${i + 1}:`,
+          onPassphrasePromptShown: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, "auth-attempt", "waiting for user input...",
+          ),
+          onPassphrasePromptResolved: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, "auth-attempt", "user responded",
+          ),
+          onLoaded: (loaded) => {
+            if (loaded.passphrase) {
+              sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'passphrase required');
+            }
+            console.log(`[Chain] Hop ${i + 1}: loaded identity file ${loaded.keyPath}`);
+          },
+          onError: (err, keyPath) => {
+            console.warn(`[Chain] Hop ${i + 1}: failed to read identity file ${keyPath}:`, err.message);
+          },
+        })
+        : null;
+      const inlineKey = jump.privateKey && !systemAuthAgent
+        ? await preparePrivateKeyForAuth({
+          sender,
+          privateKey: jump.privateKey,
+          keyId: jump.keyId,
+          keyName: jump.keyId || jump.label || jump.username,
+          hostname: hopLabel,
+          initialPassphrase: jump.passphrase,
+          passphraseSignal: options._passphraseSignal,
+          sessionId: options.sessionId,
+          bootEpoch: options.bootEpoch,
+          logPrefix: `[Chain] Hop ${i + 1}:`,
+          onPassphrasePromptShown: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, "auth-attempt", "waiting for user input...",
+          ),
+          onPassphrasePromptResolved: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, "auth-attempt", "user responded",
+          ),
+        })
+        : null;
+      const effectivePrivateKey = inlineKey?.privateKey || identityFile?.privateKey;
+      const effectivePassphrase = inlineKey?.passphrase || identityFile?.passphrase;
+
       let authAgent = null;
+      if (systemAuthAgent) {
+        connOpts.agent = systemAuthAgent;
+      }
       if (hasCertificate) {
         authAgent = new NetcattyAgent({
           mode: "certificate",
@@ -466,26 +680,33 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           meta: {
             label: jump.keyId || jump.username || "",
             certificate: jump.certificate,
-            privateKey: jump.privateKey,
-            passphrase: jump.passphrase,
+            privateKey: effectivePrivateKey,
+            passphrase: effectivePassphrase,
           },
         });
         connOpts.agent = authAgent;
-      } else if (jump.privateKey) {
-        connOpts.privateKey = jump.privateKey;
-        if (jump.passphrase) {
-          connOpts.passphrase = jump.passphrase;
-        } else if (isKeyEncrypted(jump.privateKey)) {
+      } else if (effectivePrivateKey) {
+        connOpts.privateKey = effectivePrivateKey;
+        if (effectivePassphrase) {
+          connOpts.passphrase = effectivePassphrase;
+        } else if (jump.privateKey && isKeyEncrypted(jump.privateKey)) {
           // Key is encrypted but no passphrase provided — prompt the user
           console.log(`[Chain] Hop ${i + 1}: key is encrypted, requesting passphrase`);
-          sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'passphrase required');
+          sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'waiting for user input...');
           const keyLabel = jump.label || hopLabel;
           const result = await passphraseHandler.requestPassphrase(
             sender,
             `SSH key for ${keyLabel}`,
             keyLabel,
-            hopLabel
+            hopLabel,
+            false,
+            {
+              signal: options._passphraseSignal,
+              sessionId: options.sessionId,
+              bootEpoch: options.bootEpoch,
+            }
           );
+          sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'user responded');
           if (result?.passphrase) {
             connOpts.passphrase = result.passphrase;
           } else {
@@ -493,42 +714,8 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
             // key so buildAuthHandler won't try it and stall auth.
             delete connOpts.privateKey;
             if (result?.cancelled) {
-              throw new Error(`Passphrase entry cancelled for ${hopLabel}`);
+              throw new PassphraseCancelledError(hopLabel);
             }
-          }
-        }
-      }
-
-      // Read identity files from local paths (e.g. from SSH config IdentityFile)
-      if (!connOpts.privateKey && !connOpts.agent && jump.identityFilePaths?.length > 0) {
-        for (const keyPath of jump.identityFilePaths) {
-          try {
-            const resolvedPath = keyPath.startsWith("~/")
-              ? path.join(os.homedir(), keyPath.slice(2))
-              : keyPath;
-            const keyContent = await fs.promises.readFile(resolvedPath, "utf8");
-            connOpts.privateKey = keyContent;
-            if (isKeyEncrypted(keyContent)) {
-              console.log(`[Chain] Hop ${i + 1}: identity file ${resolvedPath} is encrypted, requesting passphrase`);
-              sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'passphrase required');
-              const result = await passphraseHandler.requestPassphrase(
-                sender,
-                resolvedPath,
-                path.basename(resolvedPath),
-                hopLabel
-              );
-              if (result?.passphrase) {
-                connOpts.passphrase = result.passphrase;
-              } else {
-                // Cancelled/skipped/timeout — clear encrypted key, try next file
-                delete connOpts.privateKey;
-                continue;
-              }
-            }
-            console.log(`[Chain] Hop ${i + 1}: loaded identity file ${resolvedPath}`);
-            break;
-          } catch (err) {
-            console.warn(`[Chain] Hop ${i + 1}: failed to read identity file ${keyPath}:`, err.message);
           }
         }
       }
@@ -536,30 +723,45 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
       if (jump.password) connOpts.password = jump.password;
 
       // Get default keys (either from options if pre-fetched, or fetch them now)
-      const defaultKeys = options._defaultKeys || await findAllDefaultPrivateKeys();
+      const defaultKeys = systemAuthAgent && jump.identitiesOnly
+        ? []
+        : options._defaultKeys || await findAllDefaultPrivateKeys();
 
       // Build auth handler using shared helper
       // Pass unlocked encrypted keys from options so jump hosts can use them for retry
+      const fallbackAgentSocket = jump.useSshAgent === false
+        ? null
+        : jump.useSshAgent === true
+          ? undefined
+          : await getAvailableAgentSocket();
       const authConfig = buildAuthHandler({
+        authMethod: jump.authMethod,
+        requiresMfa: !!jump.requiresMfa,
         privateKey: connOpts.privateKey,
         password: connOpts.password,
         passphrase: connOpts.passphrase,
         agent: connOpts.agent,
         username: connOpts.username,
         logPrefix: `[Chain] Hop ${i + 1}`,
-        unlockedEncryptedKeys: options._unlockedEncryptedKeys || [],
+        unlockedEncryptedKeys: systemAuthAgent && jump.identitiesOnly
+          ? []
+          : options._unlockedEncryptedKeys || [],
         defaultKeys,
+        sshAgentSocketOverride: fallbackAgentSocket,
+        allowAgentFallback: jump.useSshAgent !== false,
         onAuthAttempt: (method) => {
           sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', method);
         },
       });
       applyAuthToConnOpts(connOpts, authConfig);
+      const hopAuthPhase = authConfig.authPhase || createAuthPhase();
 
       // If first hop and proxy is configured, connect through proxy
-      const hasUsableJumpProxy = !!(jump.proxy?.host && jump.proxy?.port);
+      const hasUsableJumpProxy = hasUsableProxy(jump.proxy);
       const effectiveHopProxy = isFirst ? ((hasUsableJumpProxy ? jump.proxy : null) || options.proxy) : null;
       if (effectiveHopProxy) {
         currentSocket = await createProxySocket(effectiveHopProxy, jump.hostname, jump.port || 22, {
+          timeoutMs: hopConnectionTimeouts.tcpConnectTimeoutMs,
           onSocket: (socket) => {
             if (options?._tunnelRef) {
               options._tunnelRef.pendingConn = socket;
@@ -583,11 +785,24 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
 
       // Connect this hop
       await new Promise((resolve, reject) => {
+        let settled = false;
+        let authReadyTimer = null;
+        let authBanner = "";
+        const clearAuthReadyTimer = () => {
+          if (authReadyTimer) {
+            clearTimeout(authReadyTimer);
+            authReadyTimer = null;
+          }
+        };
         conn.once('handshake', () => {
+          if (settled) return;
           console.log(`[Chain] Hop ${i + 1}/${totalHops}: ${hopLabel} handshake complete`);
           sendProgress(i + 1, totalHops + 1, hopLabel, 'authenticating');
         });
         conn.once('ready', () => {
+          if (settled) return;
+          settled = true;
+          clearAuthReadyTimer();
           console.log(`[Chain] Hop ${i + 1}/${totalHops}: ${hopLabel} connected`);
           sendProgress(i + 1, totalHops + 1, hopLabel, 'connected');
           if (options?._tunnelRef) {
@@ -597,58 +812,122 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
           resolve();
         });
         conn.once('error', (err) => {
+          if (settled) return;
+          settled = true;
+          clearAuthReadyTimer();
           console.error(`[Chain] Hop ${i + 1}/${totalHops}: ${hopLabel} error:`, err.message);
           sendProgress(i + 1, totalHops + 1, hopLabel, 'error', err.message);
+          if (isChainAuthError(err)) {
+            err.isJumpHostAuthError = true;
+            err.jumpHostIndex = i;
+            err.jumpHostLabel = hopLabel;
+            err.jumpHostHostname = jump.hostname;
+            err.message = `Jump host authentication failed for "${hopLabel}": ${err.message}`;
+          }
           reject(err);
         });
         conn.once('timeout', () => {
+          if (settled) return;
+          settled = true;
+          clearAuthReadyTimer();
           console.error(`[Chain] Hop ${i + 1}/${totalHops}: ${hopLabel} timeout`);
           const errMsg = `Connection timeout to ${hopLabel}`;
           sendProgress(i + 1, totalHops + 1, hopLabel, 'error', errMsg);
+          try { conn.destroy(); } catch { }
           reject(new Error(errMsg));
         });
+        conn.once('close', () => {
+          if (settled) return;
+          settled = true;
+          clearAuthReadyTimer();
+          const errMsg = `Connection to ${hopLabel} closed before authentication completed`;
+          sendProgress(i + 1, totalHops + 1, hopLabel, 'error', errMsg);
+          reject(new Error(errMsg));
+        });
+        conn.on('banner', (message) => {
+          authBanner = String(message || "").trim();
+        });
         // Handle keyboard-interactive authentication for jump hosts (2FA/MFA)
-        const chainKiHandler = createKeyboardInteractiveHandler({
+        conn.on('keyboard-interactive', createKeyboardInteractiveHandler({
           sender,
           sessionId,
+          hostId: jump.hostId,
           hostname: hopLabel,
           password: jump.password,
           logPrefix: `[Chain] Hop ${i + 1}/${totalHops}`,
-        });
-        conn.on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
-          if (prompts && prompts.length > 0) {
-            sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'waiting for user input...');
-          }
-          const wrappedFinish = (...args) => {
-            sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'user responded');
-            finish(...args);
-          };
-          chainKiHandler(name, instructions, lang, prompts, wrappedFinish);
-        });
+          scope: keyboardInteractiveScope,
+          bootEpoch: options.bootEpoch,
+          getAuthBanner: () => authBanner,
+          shouldSkipAutoFill: () => shouldSkipKiPasswordAutoFill(hopAuthPhase),
+          onAutoFill: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'using saved password',
+          ),
+          onPromptShown: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'waiting for user input...',
+          ),
+          onUserResponded: () => sendProgress(
+            i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'user responded',
+          ),
+        }));
         console.log(`[Chain] Hop ${i + 1}/${totalHops}: Connecting to ${hopLabel}...`);
+        conn.once('connect', () => {
+          runWhenProxyConnectionReady(conn._sock, () => {
+            try { conn._sock?.setTimeout?.(0); } catch { }
+            clearAuthReadyTimer();
+            authReadyTimer = setTimeout(
+              () => conn.emit('timeout'),
+              hopConnectionTimeouts.authReadyTimeoutMs,
+            );
+            authReadyTimer.unref?.();
+            sendProgress(i + 1, totalHops + 1, hopLabel, 'tcp-connected');
+            enableSshNoDelay(conn);
+          });
+        });
+        if (connOpts.sock) enableTcpNoDelay(connOpts.sock);
         conn.connect(connOpts);
       });
 
       connections.push(conn);
 
       // Determine next target
-      let nextHost, nextPort;
+      let nextHost, nextPort, nextConnectionTimeouts;
       if (isLast) {
         // Last jump host, forward to final target
         nextHost = targetHost;
         nextPort = targetPort;
+        nextConnectionTimeouts = targetConnectionTimeouts;
       } else {
         // Forward to next jump host
         const nextJump = jumpHosts[i + 1];
         nextHost = nextJump.hostname;
         nextPort = nextJump.port || 22;
+        nextConnectionTimeouts = resolveSshConnectionTimeouts(nextJump);
       }
 
       // Create forward stream to next hop
       console.log(`[Chain] Hop ${i + 1}/${totalHops}: Forwarding from ${hopLabel} to ${nextHost}:${nextPort}...`);
       sendProgress(i + 1, totalHops + 1, hopLabel, 'forwarding');
       currentSocket = await new Promise((resolve, reject) => {
-        conn.forwardOut('127.0.0.1', 0, nextHost, nextPort, (err, stream) => {
+        const forwardTimeoutMs = options?._forwardTimeoutMs
+          || nextConnectionTimeouts.tcpConnectTimeoutMs;
+        let settled = false;
+        const timeout = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          const errMsg = `Connection timeout from ${hopLabel} to ${nextHost}:${nextPort}`;
+          console.error(`[Chain] Hop ${i + 1}/${totalHops}: forwardOut from ${hopLabel} to ${nextHost}:${nextPort} TIMEOUT`);
+          sendProgress(i + 1, totalHops + 1, hopLabel, 'error', errMsg);
+          try { conn.destroy(); } catch { }
+          reject(new Error(errMsg));
+        }, forwardTimeoutMs);
+        if (!options?._forwardTimeoutMs) timeout.unref?.();
+        openBoundedForwardOutCallback(conn, '127.0.0.1', 0, nextHost, nextPort, (err, stream) => {
+          if (settled) {
+            try { stream?.destroy?.(); } catch { }
+            return;
+          }
+          settled = true;
+          clearTimeout(timeout);
           if (err) {
             console.error(`[Chain] Hop ${i + 1}/${totalHops}: forwardOut from ${hopLabel} to ${nextHost}:${nextPort} FAILED:`, err.message);
             reject(err);
@@ -680,1486 +959,47 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
 }
 
 /**
- * Start an SSH transport
+ * Start an SSH session
  */
-async function startSSHTransport(event, options) {
-  const sessionId =
-    options.sessionId ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const transportId = options.transportId || createTransportId();
-  const sender = event.sender;
-
-  const sendProgress = (hop, total, label, status, error) => {
-    if (!sender.isDestroyed()) {
-      sender.send("netcatty:chain:progress", { sessionId, hop, total, label, status, error });
-    }
-  };
-
-  try {
-    const conn = new SSHClient();
-    let chainConnections = [];
-    let connectionSocket = null;
-
-    // Determine if we have jump hosts
-    const jumpHosts = options.jumpHosts || [];
-    const hasJumpHosts = jumpHosts.length > 0;
-    const hasProxy = !!options.proxy;
-    const totalHops = jumpHosts.length + 1; // +1 for final target
-
-    // Build base connection options for final target
-    const connectOpts = {
-      host: options.hostname,
-      port: options.port || 22,
-      username: options.username || "root",
-      // `readyTimeout` covers the entire connection + authentication flow in ssh2.
-      readyTimeout: 20000, // Fast failure for non-interactive auth
-      // Use user-configured keepalive interval (in seconds -> convert to ms)
-      // 0 = disabled (no keepalive packets sent)
-      keepaliveInterval: options.keepaliveInterval > 0 ? options.keepaliveInterval * 1000 : 0,
-      keepaliveCountMax: options.keepaliveInterval > 0 ? 3 : 0,
-      // Enable keyboard-interactive authentication (required for 2FA/MFA)
-      tryKeyboard: true,
-      algorithms: buildAlgorithms(options.legacyAlgorithms),
-    };
-
-    // Authentication for final target
-    const hasCertificate = typeof options.certificate === "string" && options.certificate.trim().length > 0;
-    const effectivePassphrase = options.passphrase;
-
-    console.log("[SSH] Auth configuration:", {
-      hasCertificate,
-      keySource: options.keySource,
-      hasPublicKey: !!options.publicKey,
-      hasPrivateKey: !!options.privateKey,
-      hasPassword: !!options.password,
-      hasEffectivePassphrase: !!effectivePassphrase,
-    });
-
-    log("Auth configuration", {
-      hasCertificate,
-      keySource: options.keySource,
-      hasPublicKey: !!options.publicKey,
-      hasPrivateKey: !!options.privateKey,
-    });
-
-    let authAgent = null;
-    if (hasCertificate) {
-      authAgent = new NetcattyAgent({
-        mode: "certificate",
-        webContents: event.sender,
-        meta: {
-          label: options.keyId || options.username || "",
-          certificate: options.certificate,
-          privateKey: options.privateKey,
-          passphrase: effectivePassphrase,
-        },
-      });
-      connectOpts.agent = authAgent;
-    } else if (options.privateKey) {
-      connectOpts.privateKey = options.privateKey;
-      if (effectivePassphrase) {
-        connectOpts.passphrase = effectivePassphrase;
-      }
-    }
-
-    // Read identity files from local paths (e.g. from SSH config IdentityFile)
-    // Only if no explicit key was already configured
-    if (!connectOpts.privateKey && !connectOpts.agent && options.identityFilePaths?.length > 0) {
-      for (const keyPath of options.identityFilePaths) {
-        try {
-          const resolvedPath = keyPath.startsWith("~/")
-            ? path.join(os.homedir(), keyPath.slice(2))
-            : keyPath;
-          const keyContent = await fs.promises.readFile(resolvedPath, "utf8");
-          connectOpts.privateKey = keyContent;
-          // Check if key is encrypted — if so, prompt for passphrase
-          if (isKeyEncrypted(keyContent)) {
-            log("Identity file is encrypted, requesting passphrase", { keyPath: resolvedPath });
-            const result = await passphraseHandler.requestPassphrase(
-              sender,
-              resolvedPath,
-              path.basename(resolvedPath),
-              options.hostname
-            );
-            if (result?.passphrase) {
-              connectOpts.passphrase = result.passphrase;
-            } else {
-              // Cancelled/skipped/timeout — clear encrypted key, try next file
-              delete connectOpts.privateKey;
-              continue;
-            }
-          }
-          log("Loaded identity file", { keyPath: resolvedPath, encrypted: isKeyEncrypted(keyContent) });
-          break; // Use the first successfully loaded key
-        } catch (err) {
-          log("Failed to read identity file", { keyPath, error: err.message });
-        }
-      }
-    }
-
-    if (options.password && typeof options.password === "string" && options.password.trim().length > 0) {
-      connectOpts.password = options.password;
-    }
-
-    // Always try to find default SSH keys for fallback authentication
-    // This allows fallback even when password auth fails
-    let defaultKeyInfo = null;
-    let allDefaultKeys = [];
-    let usedDefaultKeyAsPrimary = false;
-    const defaultKey = await findDefaultPrivateKey();
-    if (defaultKey) {
-      defaultKeyInfo = defaultKey;
-      log("Found default SSH key for fallback", { keyPath: defaultKey.keyPath, keyName: defaultKey.keyName });
-    }
-    // Also find ALL default keys for comprehensive fallback
-    allDefaultKeys = await findAllDefaultPrivateKeys();
-
-    // Use unlocked encrypted keys if provided (from retry after auth failure)
-    // These are passed via _unlockedEncryptedKeys from startSSHSessionWrapper
-    const unlockedEncryptedKeys = options._unlockedEncryptedKeys || [];
-    if (unlockedEncryptedKeys.length > 0) {
-      log("Using unlocked encrypted keys from retry", {
-        count: unlockedEncryptedKeys.length,
-        keyNames: unlockedEncryptedKeys.map(k => k.keyName)
-      });
-    }
-
-    // If no primary auth method configured, try ssh-agent first, then ALL default keys
-    if (!connectOpts.privateKey && !connectOpts.password && !connectOpts.agent) {
-      // First, try to use ssh-agent if available (this is what regular SSH does)
-      const sshAgentSocket = await getAvailableAgentSocket();
-
-      if (sshAgentSocket) {
-        log("No auth method configured, trying ssh-agent first", { agentSocket: sshAgentSocket });
-        connectOpts.agent = sshAgentSocket;
-      }
-
-      // Mark that we need to try all default keys (handled in authMethods below)
-      if (allDefaultKeys.length > 0) {
-        log("Will try all default SSH keys as fallback", { count: allDefaultKeys.length, keyNames: allDefaultKeys.map(k => k.keyName) });
-        // Set first key for connectOpts.privateKey (required for ssh2 to allow publickey auth)
-        connectOpts.privateKey = allDefaultKeys[0].privateKey;
-        usedDefaultKeyAsPrimary = true;
-      } else {
-        log("No default SSH key found in ~/.ssh directory");
-      }
-    }
-
-    log("Final auth configuration", {
-      hasPrivateKey: !!connectOpts.privateKey,
-      hasPassword: !!connectOpts.password,
-      hasAgent: !!connectOpts.agent,
-      hasDefaultKeyFallback: !!defaultKeyInfo,
-    });
-
-    // Agent forwarding
-    if (options.agentForwarding) {
-      if (!connectOpts.agent) {
-        connectOpts.agent = await getAvailableAgentSocket();
-      }
-      // Only enable forwarding when an agent is actually available
-      if (connectOpts.agent) {
-        connectOpts.agentForward = true;
-      } else {
-        log("Agent forwarding requested but no agent available, skipping");
-      }
-    }
-
-    // Build authentication handler with fallback support
-    // ssh2 authHandler can be a function that returns the next auth method to try
-
-    // Check if we have a cached successful auth method for this host
-    const cachedMethod = getCachedAuthMethod(connectOpts.username, options.hostname, options.port);
-
-    // Track which method succeeded for caching
-    let lastTriedMethod = null;
-
-    if (authAgent) {
-      const order = ["none", "agent"];
-      if (connectOpts.password) order.push("password");
-      // Add default key fallback if available and no user key configured
-      // Must also set connectOpts.privateKey for ssh2 to actually try publickey auth
-      if (defaultKeyInfo && !options.privateKey) {
-        connectOpts.privateKey = defaultKeyInfo.privateKey;
-        order.push("publickey");
-      }
-      order.push("keyboard-interactive");
-      connectOpts.authHandler = order;
-      log("Auth order (agent mode)", { order });
-    } else {
-      // Build dynamic auth handler for fallback support
-      const authMethods = [];
-
-      // First try user-configured key if available (explicit user choice)
-      if (connectOpts.privateKey && !usedDefaultKeyAsPrimary) {
-        authMethods.push({ type: "publickey", key: connectOpts.privateKey, passphrase: connectOpts.passphrase, id: "publickey-user" });
-      }
-
-      // Then try agent if configured (try agent before password since it's usually faster)
-      if (connectOpts.agent) {
-        authMethods.push({ type: "agent", id: "agent" });
-      }
-
-      // Then try password if available (explicit user choice)
-      if (connectOpts.password) {
-        authMethods.push({ type: "password", id: "password" });
-      }
-
-      // Then try ALL default SSH keys as fallback (not just the first one!)
-      // This is critical because different servers may have different keys in authorized_keys
-      if (usedDefaultKeyAsPrimary && allDefaultKeys.length > 0) {
-        for (const keyInfo of allDefaultKeys) {
-          authMethods.push({
-            type: "publickey",
-            key: keyInfo.privateKey,
-            isDefault: true,
-            id: `publickey-default-${keyInfo.keyName}`
-          });
-        }
-      } else if (defaultKeyInfo && !options.privateKey && !usedDefaultKeyAsPrimary) {
-        // Single default key fallback (when user has configured other auth methods)
-        authMethods.push({ type: "publickey", key: defaultKeyInfo.privateKey, isDefault: true, id: "publickey-default" });
-      }
-
-      // Add unlocked encrypted default keys (user provided passphrases for these)
-      for (const keyInfo of unlockedEncryptedKeys) {
-        authMethods.push({
-          type: "publickey",
-          key: keyInfo.privateKey,
-          passphrase: keyInfo.passphrase,
-          isDefault: true,
-          id: `publickey-encrypted-${keyInfo.keyName}`
-        });
-      }
-
-      // Finally try keyboard-interactive
-      authMethods.push({ type: "keyboard-interactive", id: "keyboard-interactive" });
-
-      log("Auth methods configured", {
-        methods: authMethods.map(m => ({ type: m.type, id: m.id, isDefault: m.isDefault || false })),
-        cachedMethod,
-        usedDefaultKeyAsPrimary
-      });
-
-      // Reorder methods based on cached successful method
-      if (cachedMethod) {
-        const cachedIndex = authMethods.findIndex(m => m.id === cachedMethod);
-        if (cachedIndex > 0) {
-          const [cachedAuthMethod] = authMethods.splice(cachedIndex, 1);
-          authMethods.unshift(cachedAuthMethod);
-          log("Reordered auth methods based on cache", {
-            methods: authMethods.map(m => m.id)
-          });
-        }
-      }
-
-      // Always use dynamic authHandler to ensure consistent "none" probing
-      // and auth method logging regardless of how many methods are configured
-      if (authMethods.length >= 1) {
-        let authIndex = 0;
-        // Track methods that have been attempted (to avoid re-trying on failure)
-        // This prevents reusing the same key when server requires multiple publickey auth steps
-        // and also prevents re-attempting failed methods
-        const attemptedMethodIds = new Set();
-        // Track the first successful method for caching (not the last one in multi-step flows)
-        let firstSuccessfulMethod = null;
-        // Track if we've gone through a partialSuccess flow (multi-step auth)
-        let hadPartialSuccess = false;
-
-        connectOpts.authHandler = (methodsLeft, partialSuccess, callback) => {
-          log("authHandler called", { methodsLeft, partialSuccess, authIndex, attemptedMethodIds: Array.from(attemptedMethodIds) });
-
-          // Log rejection of previous method
-          if (lastTriedMethod && !partialSuccess) {
-            sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', `${lastTriedMethod} rejected`);
-          }
-
-          // On the very first call (methodsLeft === null), try "none" auth.
-          // Per RFC 4252, the "none" request is how the client discovers which
-          // methods the server supports.  It also allows passwordless login on
-          // embedded devices.  This matches the behavior of OpenSSH and Tabby.
-          if (methodsLeft === null && !attemptedMethodIds.has("none")) {
-            attemptedMethodIds.add("none");
-            lastTriedMethod = "none";
-            sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'none (no credentials)');
-            return callback("none");
-          }
-
-          // methodsLeft can be null on first call (before server responds with available methods)
-          // Include "agent" for SSH agent-based auth (used with agentForwarding)
-          const availableMethods = methodsLeft || ["publickey", "password", "keyboard-interactive", "agent"];
-
-          // Handle partialSuccess case (e.g., password succeeded but server requires additional auth like MFA)
-          // When partialSuccess is true, we should try the remaining methods the server is asking for
-          if (partialSuccess && methodsLeft && methodsLeft.length > 0) {
-            hadPartialSuccess = true;
-            // Record the first successful method (the one that triggered partialSuccess)
-            if (lastTriedMethod && !firstSuccessfulMethod) {
-              firstSuccessfulMethod = lastTriedMethod;
-              log("Recorded first successful method for caching", { method: firstSuccessfulMethod });
-            }
-            // Mark the last tried method as attempted (it succeeded, so we shouldn't retry it)
-            if (lastTriedMethod) {
-              attemptedMethodIds.add(lastTriedMethod);
-              log("Marked method as attempted (partial success)", { method: lastTriedMethod });
-            }
-
-            log("Partial success - server requires additional auth", { methodsLeft, attemptedMethodIds: Array.from(attemptedMethodIds) });
-
-            // Find a method from our list that matches what the server wants
-            // Skip methods that have already been attempted
-            for (const serverMethod of methodsLeft) {
-              // Map server method names to our method types
-              const matchingMethod = authMethods.find(m => {
-                // Skip already attempted methods
-                if (attemptedMethodIds.has(m.id)) return false;
-                if (serverMethod === "keyboard-interactive" && m.type === "keyboard-interactive") return true;
-                if (serverMethod === "password" && m.type === "password") return true;
-                if (serverMethod === "publickey" && (m.type === "publickey" || m.type === "agent")) return true;
-                return false;
-              });
-
-              if (matchingMethod) {
-                log("Found matching method for partial success", { serverMethod, matchingMethod: matchingMethod.id });
-                // Mark as attempted BEFORE returning to prevent re-use on failure
-                attemptedMethodIds.add(matchingMethod.id);
-                lastTriedMethod = matchingMethod.id;
-
-                if (matchingMethod.type === "keyboard-interactive") {
-                  log("Trying keyboard-interactive auth (partial success)", { id: matchingMethod.id });
-                  return callback("keyboard-interactive");
-                } else if (matchingMethod.type === "password") {
-                  log("Trying password auth (partial success)", { id: matchingMethod.id });
-                  return callback({
-                    type: "password",
-                    username: connectOpts.username,
-                    password: connectOpts.password,
-                  });
-                } else if (matchingMethod.type === "agent") {
-                  const agentType = typeof connectOpts.agent === "string" ? "path" : "NetcattyAgent";
-                  log("Trying agent auth (partial success)", { id: matchingMethod.id, agentType });
-                  return callback("agent");
-                } else if (matchingMethod.type === "publickey") {
-                  log("Trying publickey auth (partial success)", { id: matchingMethod.id });
-                  return callback({
-                    type: "publickey",
-                    username: connectOpts.username,
-                    key: matchingMethod.key,
-                    passphrase: matchingMethod.passphrase,
-                  });
-                }
-              }
-            }
-            // No matching method found for partial success
-            log("No matching method found for partial success requirements", { methodsLeft });
-            return callback(false);
-          }
-
-          while (authIndex < authMethods.length) {
-            const method = authMethods[authIndex];
-            authIndex++;
-
-            // Skip methods that have already been attempted (e.g., during partial success handling)
-            if (attemptedMethodIds.has(method.id)) {
-              log("Skipping already attempted method", { method: method.id });
-              continue;
-            }
-
-            // Check if this method is still available on server
-            // Note: "agent" uses "publickey" as the underlying method type
-            const methodName = method.type === "password" ? "password" :
-              method.type === "publickey" ? "publickey" :
-                method.type === "agent" ? "publickey" : "keyboard-interactive";
-            if (!availableMethods.includes(methodName) && !availableMethods.includes(method.type)) {
-              log("Auth method not available on server, skipping", { method: method.id });
-              continue;
-            }
-
-            // Mark as attempted BEFORE returning
-            attemptedMethodIds.add(method.id);
-            lastTriedMethod = method.id;
-
-            if (method.type === "agent") {
-              // Only log safe identifier, not the full agent object which may contain private keys
-              const agentType = typeof connectOpts.agent === "string" ? "path" : "NetcattyAgent";
-              log("Trying agent auth", { id: method.id, agentType });
-              sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'SSH agent');
-              // Return "agent" string to use SSH agent for authentication
-              return callback("agent");
-            } else if (method.type === "publickey") {
-              log("Trying publickey auth", { id: method.id, isDefault: method.isDefault || false });
-              const keyLabel = method.id.startsWith("publickey-default-")
-                ? `key ${method.id.replace("publickey-default-", "")}`
-                : method.id.startsWith("publickey-encrypted-")
-                  ? `key ${method.id.replace("publickey-encrypted-", "")} (encrypted)`
-                  : method.id === "publickey-user"
-                    ? "configured key"
-                    : method.id;
-              sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', keyLabel);
-              return callback({
-                type: "publickey",
-                username: connectOpts.username,
-                key: method.key,
-                passphrase: method.passphrase,
-              });
-            } else if (method.type === "password") {
-              log("Trying password auth", { id: method.id });
-              sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'password');
-              return callback({
-                type: "password",
-                username: connectOpts.username,
-                password: connectOpts.password,
-              });
-            } else if (method.type === "keyboard-interactive") {
-              log("Trying keyboard-interactive auth", { id: method.id });
-              sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'keyboard-interactive');
-              // Return string instead of object - ssh2 requires a prompt function
-              // for keyboard-interactive objects. Returning the string lets ssh2
-              // use its default handling and trigger the keyboard-interactive event.
-              return callback("keyboard-interactive");
-            }
-          }
-
-          log("All auth methods exhausted");
-          sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'all methods exhausted');
-          return callback(false);
-        };
-
-        // Store method reference for success callback
-        // For multi-step auth (partialSuccess), cache the first successful method, not the last
-        // This ensures next connection starts with the correct first factor
-        connectOpts._lastTriedMethodRef = () => {
-          if (hadPartialSuccess && firstSuccessfulMethod) {
-            log("Using first successful method for cache (multi-step auth)", { firstSuccessfulMethod });
-            return firstSuccessfulMethod;
-          }
-          return lastTriedMethod;
-        };
-      }
-    }
-
-    // Handle chain/proxy connections
-    if (hasJumpHosts) {
-      // Pass fetched keys to chain connection to avoid re-reading files
-      options._defaultKeys = allDefaultKeys;
-
-      const chainResult = await connectThroughChain(
-        event,
-        options,
-        jumpHosts,
-        options.hostname,
-        options.port || 22,
-        sessionId
-      );
-      connectionSocket = chainResult.socket;
-      chainConnections = chainResult.connections;
-
-      connectOpts.sock = connectionSocket;
-      delete connectOpts.host;
-      delete connectOpts.port;
-
-      sendProgress(totalHops, totalHops, options.hostname, 'connecting');
-    } else if (hasProxy) {
-      sendProgress(1, 1, options.hostname, 'connecting');
-      connectionSocket = await createProxySocket(
-        options.proxy,
-        options.hostname,
-        options.port || 22
-      );
-      connectOpts.sock = connectionSocket;
-      delete connectOpts.host;
-      delete connectOpts.port;
-    } else {
-      // Direct connection (no jump hosts, no proxy)
-      sendProgress(1, 1, options.hostname, 'connecting');
-    }
-
-    return new Promise((resolve, reject) => {
-      const logPrefix = hasJumpHosts ? '[Chain]' : '[SSH]';
-      let settled = false;
-
-      conn.once("handshake", () => {
-        console.log(`${logPrefix} ${options.hostname} handshake complete`);
-        sendProgress(totalHops, totalHops, options.hostname, 'authenticating');
-      });
-
-      conn.once("ready", () => {
-        console.log(`${logPrefix} ${options.hostname} ready`);
-
-        // Cache the successful auth method
-        if (connectOpts._lastTriedMethodRef) {
-          const successMethod = connectOpts._lastTriedMethodRef();
-          if (successMethod) {
-            setCachedAuthMethod(connectOpts.username, options.hostname, options.port, successMethod);
-          }
-        }
-
-        sendProgress(totalHops, totalHops, options.hostname, 'authenticated');
-        const transport = {
-          id: transportId,
-          conn,
-          chainConnections,
-          webContentsId: event.sender.id,
-          hostname: options.host || options.hostname || '',
-          username: options.username || '',
-          label: options.label || options.hostLabel || '',
-          remoteSshVersion: (conn && typeof conn._remoteVer === 'string') ? conn._remoteVer : '',
-          channelSessionIds: new Set(),
-          progress: {
-            totalHops,
-            hostname: options.hostname,
-          },
-        };
-        sshTransports.set(transportId, transport);
-
-        settled = true;
-        resolve({
-          transportId,
-          remoteSshVersion: transport.remoteSshVersion,
-        });
-      });
-
-      conn.on("error", (err) => {
-        // After the promise is settled, we can't reject again. But if the
-        // session was already established (resolved), we still need to notify
-        // the renderer about transport errors so the session shows as failed
-        // rather than silently closing.
-        // Don't send netcatty:exit here — the stream close handler will flush
-        // any buffered data first and then send exit with this error info.
-        if (settled) {
-          console.warn(`${logPrefix} ${options.hostname} post-settle error:`, err.message);
-          const transport = sshTransports.get(transportId);
-          if (transport) {
-            transport._transportError = err.message;
-            for (const channelSessionId of transport.channelSessionIds) {
-              const session = sessions.get(channelSessionId);
-              if (session) session._transportError = err.message;
-            }
-          }
-          return;
-        }
-
-        const contents = event.sender;
-
-        const isAuthError = err.message?.toLowerCase().includes('authentication') ||
-          err.message?.toLowerCase().includes('auth') ||
-          err.message?.toLowerCase().includes('password') ||
-          err.level === 'client-authentication';
-
-        // Clear cached auth method on auth failure so next attempt tries all methods
-        if (isAuthError) {
-          clearCachedAuthMethod(connectOpts.username, options.hostname, options.port);
-          console.log(`${logPrefix} ${options.hostname} auth failed:`, err.message);
-          safeSend(contents, "netcatty:auth:failed", {
-            sessionId,
-            error: err.message,
-            hostname: options.hostname
-          });
-        } else {
-          console.error(`${logPrefix} ${options.hostname} error:`, err.message);
-        }
-
-        sendProgress(totalHops, totalHops, options.hostname, 'error', err.message);
-        safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "error" });
-        stopSessionArtifacts(sessionId, sessions.get(sessionId));
-        sessions.delete(sessionId);
-        for (const c of chainConnections) {
-          try { c.end(); } catch { }
-        }
-        // Destroy the connection to prevent further socket errors from leaking
-        // as uncaught exceptions (e.g. ECONNRESET on embedded devices).
-        try { conn.destroy(); } catch { }
-        settled = true;
-        reject(err);
-      });
-
-      conn.once("timeout", () => {
-        console.error(`${logPrefix} ${options.hostname} connection timeout`);
-        const err = new Error(`Connection timeout to ${options.hostname}`);
-        const contents = event.sender;
-        sendProgress(totalHops, totalHops, options.hostname, 'error', err.message);
-        safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message, reason: "timeout" });
-        stopSessionArtifacts(sessionId, sessions.get(sessionId));
-        sessions.delete(sessionId);
-        for (const c of chainConnections) {
-          try { c.end(); } catch { }
-        }
-        try { conn.destroy(); } catch { }
-        settled = true;
-        reject(err);
-      });
-
-      conn.once("close", () => {
-        const contents = event.sender;
-        const transport = sshTransports.get(transportId);
-        if (!settled) {
-          sendProgress(totalHops, totalHops, options.hostname, 'error', `Connection to ${options.hostname} closed unexpectedly`);
-        }
-        if (transport) {
-          sshTransports.delete(transportId);
-          const transportError = transport._transportError;
-          for (const channelSessionId of [...transport.channelSessionIds]) {
-            const session = sessions.get(channelSessionId);
-            if (!session) continue;
-            const reason = transportError ? "error" : "closed";
-            safeSend(contents, "netcatty:exit", {
-              sessionId: channelSessionId,
-              exitCode: transportError ? 1 : 0,
-              error: transportError,
-              reason,
-            });
-            stopSessionArtifacts(channelSessionId, session);
-            sessions.delete(channelSessionId);
-          }
-          for (const c of transport.chainConnections || []) {
-            try { c.end(); } catch {}
-          }
-        } else {
-          for (const c of chainConnections) {
-            try { c.end(); } catch { }
-          }
-        }
-        if (!settled) {
-          settled = true;
-          reject(new Error(`Connection to ${options.hostname} closed unexpectedly`));
-        }
-      });
-
-      // Handle keyboard-interactive authentication (2FA/MFA)
-      conn.on("keyboard-interactive", (name, instructions, instructionsLang, prompts, finish) => {
-        console.log(`${logPrefix} ${options.hostname} keyboard-interactive auth requested`, {
-          name,
-          instructions,
-          promptCount: prompts?.length || 0,
-          prompts: prompts?.map(p => ({ prompt: p.prompt, echo: p.echo })),
-        });
-
-        // If there are no prompts, just call finish with empty array
-        if (!prompts || prompts.length === 0) {
-          console.log(`${logPrefix} No prompts, finishing keyboard-interactive`);
-          finish([]);
-          return;
-        }
-
-        sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'waiting for user input...');
-
-        // Forward ALL prompts to user - no auto-fill to avoid semantic detection issues
-        // (Prompt text is admin-customizable and may not contain expected keywords)
-        const requestId = keyboardInteractiveHandler.generateRequestId('ssh');
-
-        keyboardInteractiveHandler.storeRequest(requestId, (userResponses) => {
-          console.log(`${logPrefix} Received user responses, finishing keyboard-interactive`);
-          sendProgress(totalHops, totalHops, options.hostname, 'auth-attempt', 'user responded');
-          finish(userResponses);
-        }, sender.id, sessionId);
-
-        const promptsData = prompts.map((p) => ({
-          prompt: p.prompt,
-          echo: p.echo,
-        }));
-
-        console.log(`${logPrefix} Showing modal for ${promptsData.length} prompts`);
-
-        safeSend(sender, "netcatty:keyboard-interactive", {
-          requestId,
-          sessionId,
-          name: name || "",
-          instructions: instructions || "",
-          prompts: promptsData,
-          hostname: options.hostname,
-          savedPassword: options.password || null, // Pass saved password for optional fill button
-        });
-      });
-
-
-      // Enable keyboard-interactive authentication in authHandler
-      // Note: If authHandler is a function (for fallback support), keyboard-interactive
-      // is already included in the auth methods list
-      if (Array.isArray(connectOpts.authHandler)) {
-        // Add keyboard-interactive after the existing methods
-        if (!connectOpts.authHandler.includes("keyboard-interactive")) {
-          connectOpts.authHandler.push("keyboard-interactive");
-        }
-      } else if (typeof connectOpts.authHandler !== "function") {
-        // Create authHandler with keyboard-interactive support
-        // This path is taken when usedDefaultKeyAsPrimary=true (only keyboard-interactive in authMethods)
-        // Using array format is more reliable - ssh2 uses connectOpts credentials directly
-        const authMethods = [];
-        // Try agent FIRST (this is what regular SSH does - it checks ssh-agent before key files)
-        if (connectOpts.agent) authMethods.push("agent");
-        if (connectOpts.privateKey) authMethods.push("publickey");
-        if (connectOpts.password) authMethods.push("password");
-        authMethods.push("keyboard-interactive");
-        connectOpts.authHandler = authMethods;
-        log("Using simple array authHandler", { authMethods, usedDefaultKeyAsPrimary });
-      }
-      // If authHandler is a function, it already handles keyboard-interactive
-
-      // Increase timeout to allow for keyboard-interactive auth
-      connectOpts.readyTimeout = 120000; // 2 minutes for 2FA input
-
-      // Enable debug logging for ssh2 to diagnose auth issues
-      connectOpts.debug = (msg) => {
-        // Only log auth-related messages to avoid noise
-        if (msg.includes('Auth') || msg.includes('auth') || msg.includes('publickey') || msg.includes('keyboard')) {
-          log("ssh2 debug", { msg });
-        }
-      };
-
-      console.log(`${logPrefix} Connecting to ${options.hostname}...`);
-      conn.connect(connectOpts);
-    });
-  } catch (err) {
-    console.error("[Chain] SSH chain connection error:", err.message);
-    const contents = event.sender;
-    safeSend(contents, "netcatty:exit", { sessionId, exitCode: 1, error: err.message });
-    throw err;
-  }
-}
-
-async function openSSHChannel(event, options) {
-  const transport = sshTransports.get(options.transportId);
-  if (!transport || !transport.conn) {
-    throw new Error("SSH transport not found");
-  }
-
-  const sessionId =
-    options.sessionId ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const channelId =
-    options.channelId ||
-    `${sessionId}-channel`;
-  const cols = options.cols || 80;
-  const rows = options.rows || 24;
-  const contents = event.sender;
-  const totalHops = transport.progress?.totalHops || 1;
-  const hostname = transport.progress?.hostname || transport.hostname || "";
-
-  return new Promise((resolve, reject) => {
-    safeSend(contents, "netcatty:chain:progress", {
-      sessionId,
-      hop: totalHops,
-      total: totalHops,
-      label: hostname,
-      status: "shell",
-    });
-
-    transport.conn.shell(
-      {
-        term: "xterm-256color",
-        cols,
-        rows,
-      },
-      {
-        env: {
-          LANG: resolveLangFromCharset(options.charset),
-          COLORTERM: "truecolor",
-          ...(options.env || {}),
-        },
-      },
-      (err, stream) => {
-        if (err) {
-          if (transport.channelSessionIds.size === 0) {
-            closeTransportById(transport.id);
-          }
-          reject(err);
-          return;
-        }
-
-        safeSend(contents, "netcatty:chain:progress", {
-          sessionId,
-          hop: totalHops,
-          total: totalHops,
-          label: hostname,
-          status: "connected",
-        });
-
-        const session = {
-          conn: transport.conn,
-          stream,
-          chainConnections: transport.chainConnections,
-          webContentsId: transport.webContentsId,
-          hostname: transport.hostname,
-          username: transport.username,
-          label: transport.label,
-          remoteSshVersion: transport.remoteSshVersion,
-          transportId: transport.id,
-          channelId,
-          lastIdlePrompt: '',
-          lastIdlePromptAt: 0,
-          _promptTrackTail: '',
-        };
-        sessions.set(sessionId, session);
-        transport.channelSessionIds.add(sessionId);
-
-        if (options.sessionLog?.enabled && options.sessionLog?.directory) {
-          sessionLogStreamManager.startStream(sessionId, {
-            hostLabel: transport.label || hostname,
-            hostname: transport.hostname || hostname,
-            directory: options.sessionLog.directory,
-            format: options.sessionLog.format || 'txt',
-            startTime: Date.now(),
-          });
-        }
-
-        let dataBuffer = '';
-        let flushTimeout = null;
-        const FLUSH_INTERVAL = 8;
-        const MAX_BUFFER_SIZE = 16384;
-
-        const flushBuffer = () => {
-          if (dataBuffer.length > 0) {
-            safeSend(contents, "netcatty:data", { sessionId, data: dataBuffer });
-            dataBuffer = '';
-          }
-          flushTimeout = null;
-        };
-
-        const bufferData = (data) => {
-          dataBuffer += data;
-          if (dataBuffer.length >= MAX_BUFFER_SIZE) {
-            if (flushTimeout) {
-              clearTimeout(flushTimeout);
-              flushTimeout = null;
-            }
-            flushBuffer();
-          } else if (!flushTimeout) {
-            flushTimeout = setTimeout(flushBuffer, FLUSH_INTERVAL);
-          }
-        };
-
-        const sshZmodemSentry = createZmodemSentry({
-          sessionId,
-          onData(buf) {
-            const decoder = getSessionDecoder(sessionId, "stdout");
-            const decoded = decoder.write(buf);
-            trackSessionIdlePrompt(session, decoded);
-            bufferData(decoded);
-            sessionLogStreamManager.appendData(sessionId, decoded);
-          },
-          writeToRemote(buf) {
-            try { return stream.write(buf); } catch { return true; }
-          },
-          interruptRemote() {
-            try { stream.signal?.("INT"); } catch {}
-          },
-          getWebContents() {
-            return contents;
-          },
-          label: "SSH",
-        });
-        session.zmodemSentry = sshZmodemSentry;
-
-        stream.on("data", (data) => {
-          sshZmodemSentry.consume(data);
-        });
-
-        stream.stderr?.on("data", (data) => {
-          const decoder = getSessionDecoder(sessionId, "stderr");
-          const decoded = decoder.write(data);
-          bufferData(decoded);
-          sessionLogStreamManager.appendData(sessionId, decoded);
-        });
-
-        let streamExitCode = 0;
-        let streamExited = false;
-        stream.on("exit", (code, signal) => {
-          streamExitCode = typeof code === "number" ? code : 0;
-          streamExited = typeof code === "number" && !signal;
-        });
-
-        stream.on("close", () => {
-          if (flushTimeout) {
-            clearTimeout(flushTimeout);
-          }
-          flushBuffer();
-
-          const existingSession = sessions.get(sessionId);
-          const transportError = existingSession?._transportError || transport._transportError;
-          if (existingSession) {
-            safeSend(contents, "netcatty:exit", {
-              sessionId,
-              exitCode: transportError ? 1 : streamExitCode,
-              error: transportError,
-              reason: transportError ? "error" : (streamExited ? "exited" : "closed"),
-            });
-            stopSessionArtifacts(sessionId, existingSession);
-            sessions.delete(sessionId);
-          } else {
-            stopSessionArtifacts(sessionId, session);
-          }
-
-          detachSessionFromTransport(transport.id, sessionId);
-        });
-
-        if (options.charset && /^gb/i.test(String(options.charset).trim())) {
-          sessionEncodings.set(sessionId, "gb18030");
-        }
-
-        resolve({
-          sessionId,
-          channelId,
-          transportId: transport.id,
-        });
-      },
-    );
-  });
-}
-
-async function startSSHSession(event, options) {
-  const transport = await startSSHTransport(event, options);
-  return openSSHChannel(event, {
-    transportId: transport.transportId,
-    sessionId: options.sessionId,
-    cols: options.cols,
-    rows: options.rows,
-    charset: options.charset,
-    env: options.env,
-    sessionLog: options.sessionLog,
-  });
-}
-
-/**
- * Execute a one-off command via SSH
- */
-async function execCommand(event, payload) {
-  const enableKeyboardInteractive = !!payload.enableKeyboardInteractive;
-  const baseTimeoutMs = payload.timeout || 10000;
-  const timeoutMs = enableKeyboardInteractive ? Math.max(baseTimeoutMs, 120000) : baseTimeoutMs;
-  const sender = event.sender;
-  const sessionId = payload.sessionId || `exec-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const defaultKeys = enableKeyboardInteractive ? await findAllDefaultPrivateKeysFromHelper() : [];
-
-  return new Promise((resolve, reject) => {
-    const conn = new SSHClient();
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      conn.end();
-      reject(new Error("SSH exec timeout"));
-    }, timeoutMs);
-
-    conn
-      .once("ready", () => {
-        conn.exec(payload.command, (err, stream) => {
-          if (err) {
-            clearTimeout(timer);
-            settled = true;
-            conn.end();
-            return reject(err);
-          }
-          stream
-            .on("data", (data) => {
-              stdout += data.toString();
-            })
-            .stderr.on("data", (data) => {
-              stderr += data.toString();
-            })
-            .on("close", (code) => {
-              if (settled) return;
-              clearTimeout(timer);
-              settled = true;
-              conn.end();
-              resolve({ stdout, stderr, code: code ?? (stderr ? 1 : 0) });
-            });
-        });
-      })
-      .on("error", (err) => {
-        if (settled) return;
-        clearTimeout(timer);
-        settled = true;
-        conn.end();
-        reject(err);
-      })
-      .once("end", () => {
-        if (settled) return;
-        clearTimeout(timer);
-        settled = true;
-        if (stderr || stdout) {
-          resolve({ stdout, stderr, code: 0 });
-        } else {
-          reject(new Error("SSH connection closed unexpectedly"));
-        }
-      });
-
-    const hasCertificate = typeof payload.certificate === "string" && payload.certificate.trim().length > 0;
-
-    const connectOpts = {
-      host: payload.hostname,
-      port: payload.port || 22,
-      username: payload.username,
-      readyTimeout: enableKeyboardInteractive ? Math.max(timeoutMs, 120000) : timeoutMs,
-      keepaliveInterval: 0,
-    };
-
-    let authAgent = null;
-    if (hasCertificate) {
-      authAgent = new NetcattyAgent({
-        mode: "certificate",
-        webContents: event.sender,
-        meta: {
-          label: payload.keyId || payload.username || "",
-          certificate: payload.certificate,
-          privateKey: payload.privateKey,
-          passphrase: payload.passphrase,
-        },
-      });
-      connectOpts.agent = authAgent;
-    } else if (payload.privateKey) {
-      connectOpts.privateKey = payload.privateKey;
-      if (payload.passphrase) connectOpts.passphrase = payload.passphrase;
-    }
-
-    if (payload.password) connectOpts.password = payload.password;
-
-    if (enableKeyboardInteractive) {
-      connectOpts.tryKeyboard = true;
-
-      const authConfig = buildAuthHandler({
-        privateKey: connectOpts.privateKey,
-        password: connectOpts.password,
-        passphrase: connectOpts.passphrase,
-        agent: connectOpts.agent,
-        username: connectOpts.username,
-        logPrefix: "[SSH Exec]",
-        defaultKeys,
-      });
-
-      applyAuthToConnOpts(connectOpts, authConfig);
-
-      conn.on("keyboard-interactive", createKeyboardInteractiveHandler({
-        sender,
-        sessionId,
-        hostname: payload.hostname,
-        password: payload.password,
-        logPrefix: "[SSH Exec]",
-      }));
-    } else if (authAgent) {
-      const order = ["agent"];
-      if (connectOpts.password) order.push("password");
-      connectOpts.authHandler = order;
-    }
-
-    conn.connect(connectOpts);
-  });
-}
-
-function quoteShellValue(value) {
-  return `'${String(value ?? "").replace(/'/g, `'\\''`)}'`;
-}
-
-function normalizeDockerError(error, fallbackMessage) {
-  const raw = error instanceof Error ? error.message : String(error || "");
-  const lower = raw.toLowerCase();
-
-  if (lower.includes("session not found")) {
-    return {
-      supported: false,
-      reason: "session-unavailable",
-      error: "SSH 会话不可用",
-      message: "SSH 会话不可用",
-    };
-  }
-  if (lower.includes("__netcatty_docker_missing__") || lower.includes("command not found") || lower.includes("docker: not found")) {
-    return {
-      supported: false,
-      reason: "docker-missing",
-      error: "宿主机未安装 Docker CLI",
-      message: "宿主机未安装 Docker CLI",
-    };
-  }
-  if (lower.includes("permission denied")) {
-    return {
-      supported: false,
-      reason: "permission-denied",
-      error: "当前 SSH 用户无权访问 Docker",
-      message: "当前 SSH 用户无权访问 Docker",
-    };
-  }
-  if (lower.includes("is not running") || lower.includes("container") && lower.includes("not running")) {
-    return {
-      supported: false,
-      reason: "docker-unavailable",
-      error: "容器已停止",
-      message: "容器已停止",
-    };
-  }
-  if (lower.includes("executable file not found") || lower.includes("sh: not found") || lower.includes("shell")) {
-    return {
-      supported: false,
-      reason: "docker-unavailable",
-      error: "容器缺少必要的 shell 或命令",
-      message: "容器缺少必要的 shell 或命令",
-    };
-  }
-  if (lower.includes("__netcatty_path_not_found__") || lower.includes("no such file or directory")) {
-    return {
-      supported: false,
-      reason: "docker-unavailable",
-      error: "目标路径不存在",
-      message: "目标路径不存在",
-    };
-  }
-
-  return {
-    supported: false,
-    reason: "unknown",
-    error: raw || fallbackMessage,
-    message: raw || fallbackMessage,
-  };
-}
-
-function ensureExecSession(sessionId) {
-  const session = sessions?.get(sessionId);
-  if (!session || !session.conn) {
-    throw new Error("Session not found or not connected");
-  }
-  return session;
-}
-
-async function execOnExistingSession(sessionId, command, options = {}) {
-  const session = ensureExecSession(sessionId);
-  const {
-    timeoutMs = 15000,
-    stdin,
-    binaryStdout = false,
-  } = options;
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let streamRef = null;
-    const stdoutChunks = [];
-    const stderrChunks = [];
-    const finish = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      fn(value);
-    };
-
-    const timer = setTimeout(() => {
-      try {
-        streamRef?.close?.();
-        streamRef?.destroy?.();
-      } catch {
-        // ignore
-      }
-      finish(reject, new Error("SSH exec timeout"));
-    }, timeoutMs);
-
-    session.conn.exec(command, (err, stream) => {
-      if (err) {
-        finish(reject, err);
-        return;
-      }
-
-      streamRef = stream;
-      stream.on("data", (chunk) => {
-        stdoutChunks.push(Buffer.from(chunk));
-      });
-      stream.stderr?.on("data", (chunk) => {
-        stderrChunks.push(Buffer.from(chunk));
-      });
-      stream.on("error", (streamErr) => {
-        finish(reject, streamErr);
-      });
-      stream.on("close", (code) => {
-        const stdoutBuffer = Buffer.concat(stdoutChunks);
-        const stderr = Buffer.concat(stderrChunks).toString("utf8");
-        finish(resolve, {
-          code: typeof code === "number" ? code : 0,
-          stdout: binaryStdout ? stdoutBuffer : stdoutBuffer.toString("utf8"),
-          stderr,
-        });
-      });
-
-      if (stdin !== undefined) {
-        stream.end(Buffer.isBuffer(stdin) ? stdin : Buffer.from(String(stdin), "utf8"));
-      } else {
-        stream.end();
-      }
-    });
-  });
-}
-
-function buildDockerShellCommand(containerId, script, args = [], options = {}) {
-  const shellArgs = args.map((arg) => quoteShellValue(arg)).join(" ");
-  const interactiveFlag = options.interactive ? "-i " : "";
-  return [
-    "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }",
-    "docker ps >/dev/null || exit $?",
-    `docker exec ${interactiveFlag}${quoteShellValue(containerId)} sh -lc ${quoteShellValue(script)} sh${shellArgs ? ` ${shellArgs}` : ""}`,
-  ].join("; ");
-}
-
-function parseDockerEntries(rawOutput) {
-  return rawOutput
-    .split(/\r?\n/)
-    .filter((line) => line.length > 0)
-    .map((line) => {
-      const [name, type, linkTargetRaw, sizeRaw, lastModifiedRaw, permissions = ""] = line.split("\t");
-      return {
-        name,
-        type,
-        linkTarget: linkTargetRaw || undefined,
-        size: String(Number.parseInt(sizeRaw || "0", 10) || 0),
-        lastModified: new Date((Number.parseInt(lastModifiedRaw || "0", 10) || 0) * 1000).toISOString(),
-        permissions,
-      };
-    });
-}
-
-async function checkDockerSessionSupport(_event, { sessionId }) {
-  try {
-    const result = await execOnExistingSession(
-      sessionId,
-      "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }; docker ps >/dev/null",
-      { timeoutMs: 12000 },
-    );
-    if (result.code === 0) {
-      return { supported: true };
-    }
-    return normalizeDockerError(result.stderr || result.stdout, "Docker 不可用");
-  } catch (error) {
-    return normalizeDockerError(error, "Docker 不可用");
-  }
-}
-
-async function listDockerContainersForSession(_event, { sessionId }) {
-  const support = await checkDockerSessionSupport(_event, { sessionId });
-  if (!support.supported) {
-    throw new Error(support.error || "Docker 不可用");
-  }
-
-  const command = [
-    "ids=$(docker ps -q)",
-    '[ -n "$ids" ] || exit 0',
-    "docker inspect $ids --format '{{.Id}}\\t{{.Name}}\\t{{.State.Status}}\\t{{json .Config.WorkingDir}}'",
-  ].join("; ");
-
-  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
-  if (result.code !== 0) {
-    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法列出容器").message);
-  }
-
-  return String(result.stdout)
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const [id, rawName, status, workingDirJson] = line.split(/\\t|\t/);
-      let workingDir = "";
-      try {
-        workingDir = JSON.parse(workingDirJson || "\"\"");
-      } catch {
-        workingDir = "";
-      }
-      return {
-        id,
-        name: (rawName || "").replace(/^\//, ""),
-        status,
-        workingDir: workingDir || undefined,
-      };
-    });
-}
-
-async function listDockerFilesForSession(_event, { sessionId, containerId, path: targetPath }) {
-  const script = [
-    'target="$1"',
-    '[ -n "$target" ] || target="/"',
-    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
-    '[ -d "$target" ] || { echo "__NETCATTY_NOT_DIRECTORY__" >&2; exit 45; }',
-    'for p in "$target"/* "$target"/.[!.]* "$target"/..?*; do',
-    '  [ -e "$p" ] || [ -L "$p" ] || continue',
-    '  name=${p##*/}',
-    '  if [ -L "$p" ]; then',
-    '    type="symlink"',
-    '    if [ -d "$p" ]; then link="directory"; elif [ -e "$p" ]; then link="file"; else link=""; fi',
-    '  elif [ -d "$p" ]; then',
-    '    type="directory"',
-    '    link=""',
-    '  else',
-    '    type="file"',
-    '    link=""',
-    '  fi',
-    "  stat_out=$(stat -c '%s\t%Y\t%A' \"$p\" 2>/dev/null || printf '0\t0\t')",
-    '  printf "%s\t%s\t%s\t%s\n" "$name" "$type" "$link" "$stat_out"',
-    "done",
-  ].join("\n");
-
-  const command = buildDockerShellCommand(containerId, script, [targetPath || "/"]);
-  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
-  if (result.code !== 0) {
-    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法读取容器目录").message);
-  }
-  return parseDockerEntries(String(result.stdout));
-}
-
-async function getDockerContainerPwd(_event, { sessionId, containerId }) {
-  const script = 'pwd';
-  const command = buildDockerShellCommand(containerId, script, []);
-  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 8000 });
-  if (result.code !== 0) {
-    return { success: false, error: normalizeDockerError(result.stderr || result.stdout, "无法获取容器工作目录").message };
-  }
-  const cwd = String(result.stdout).trim();
-  if (!cwd || !cwd.startsWith("/")) {
-    return { success: false, error: "无法获取有效的容器工作目录" };
-  }
-  return { success: true, cwd };
-}
-
-async function readDockerTextFile(_event, { sessionId, containerId, path: targetPath }) {
-  const script = [
-    'target="$1"',
-    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
-    'cat -- "$target"',
-  ].join("; ");
-  const command = buildDockerShellCommand(containerId, script, [targetPath]);
-  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
-  if (result.code !== 0) {
-    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法读取容器文件").message);
-  }
-  return String(result.stdout);
-}
-
-async function writeSessionTempFile(sessionId, content) {
-  const command = [
-    'tmp=$(mktemp /tmp/netcatty-docker-write.XXXXXX 2>/dev/null || mktemp -t netcatty-docker-write.XXXXXX)',
-    '[ -n "$tmp" ] || exit 1',
-    'cat > "$tmp"',
-    'printf "%s" "$tmp"',
-  ].join("; ");
-  const result = await execOnExistingSession(sessionId, command, {
-    timeoutMs: 20000,
-    stdin: content ?? "",
-  });
-  if (result.code !== 0) {
-    throw new Error("无法创建远端临时文件");
-  }
-  const tempPath = String(result.stdout || "").trim();
-  if (!tempPath) {
-    throw new Error("无法创建远端临时文件");
-  }
-  return tempPath;
-}
-
-async function writeDockerTextFile(_event, { sessionId, containerId, path: targetPath, content }) {
-  const ensureParentScript = [
-    'target="$1"',
-    'parent=$(dirname "$target")',
-    '[ -d "$parent" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
-  ].join("; ");
-  const ensureParentCommand = buildDockerShellCommand(containerId, ensureParentScript, [targetPath]);
-  const ensureParentResult = await execOnExistingSession(sessionId, ensureParentCommand, { timeoutMs: 15000 });
-  if (ensureParentResult.code !== 0) {
-    throw new Error(normalizeDockerError(ensureParentResult.stderr || ensureParentResult.stdout, "无法保存容器文件").message);
-  }
-
-  let remoteTempPath = "";
-  try {
-    remoteTempPath = await writeSessionTempFile(sessionId, content);
-    const copyCommand = [
-      "command -v docker >/dev/null 2>&1 || { echo '__NETCATTY_DOCKER_MISSING__' >&2; exit 127; }",
-      "docker ps >/dev/null || exit $?",
-      `docker cp ${quoteShellValue(remoteTempPath)} ${quoteShellValue(`${containerId}:${targetPath}`)}`,
-    ].join("; ");
-    const copyResult = await execOnExistingSession(sessionId, copyCommand, { timeoutMs: 20000 });
-    if (copyResult.code !== 0) {
-      throw new Error(normalizeDockerError(copyResult.stderr || copyResult.stdout, "无法保存容器文件").message);
-    }
-
-    const verifyScript = [
-      'target="$1"',
-      '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
-      'cat -- "$target"',
-    ].join("; ");
-    const verifyCommand = buildDockerShellCommand(containerId, verifyScript, [targetPath]);
-    const verifyResult = await execOnExistingSession(sessionId, verifyCommand, { timeoutMs: 20000 });
-    if (verifyResult.code !== 0) {
-      throw new Error(normalizeDockerError(verifyResult.stderr || verifyResult.stdout, "无法校验容器文件内容").message);
-    }
-    if (String(verifyResult.stdout) !== String(content ?? "")) {
-      throw new Error("容器文件保存校验失败");
-    }
-  } finally {
-    if (remoteTempPath) {
-      await execOnExistingSession(
-        sessionId,
-        `rm -f -- ${quoteShellValue(remoteTempPath)}`,
-        { timeoutMs: 10000 },
-      ).catch(() => {});
-    }
-  }
-}
-
-async function downloadDockerFile(sessionId, containerId, remotePath, localPath) {
-  const script = [
-    'target="$1"',
-    '[ -e "$target" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
-    'cat -- "$target"',
-  ].join("; ");
-  const command = buildDockerShellCommand(containerId, script, [remotePath]);
-  const result = await execOnExistingSession(sessionId, command, {
-    timeoutMs: 20000,
-    binaryStdout: true,
-  });
-  if (result.code !== 0) {
-    throw new Error(normalizeDockerError(result.stderr || "", "无法下载容器文件").message);
-  }
-  await fs.promises.writeFile(localPath, result.stdout);
-  return { localPath };
-}
-
-async function downloadDockerFileHandler(_event, { sessionId, containerId, remotePath, localPath }) {
-  return downloadDockerFile(sessionId, containerId, remotePath, localPath);
-}
-
-async function downloadDockerFileToTemp(_event, { sessionId, containerId, remotePath, fileName }) {
-  const tempPath = tempDirBridge.getTempFilePath(fileName || path.basename(remotePath || "download"));
-  return downloadDockerFile(sessionId, containerId, remotePath, tempPath);
-}
-
-async function mkdirDockerPath(_event, { sessionId, containerId, path: targetPath }) {
-  const command = buildDockerShellCommand(containerId, 'mkdir -p -- "$1"', [targetPath]);
-  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
-  if (result.code !== 0) {
-    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法创建目录").message);
-  }
-}
-
-async function createDockerFile(_event, { sessionId, containerId, path: targetPath }) {
-  const script = [
-    'target="$1"',
-    'parent=$(dirname "$target")',
-    '[ -d "$parent" ] || { echo "__NETCATTY_PATH_NOT_FOUND__" >&2; exit 44; }',
-    ': > "$target"',
-  ].join("; ");
-  const command = buildDockerShellCommand(containerId, script, [targetPath]);
-  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
-  if (result.code !== 0) {
-    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法创建文件").message);
-  }
-}
-
-async function deleteDockerPath(_event, { sessionId, containerId, path: targetPath }) {
-  const command = buildDockerShellCommand(containerId, 'rm -rf -- "$1"', [targetPath]);
-  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
-  if (result.code !== 0) {
-    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法删除路径").message);
-  }
-}
-
-async function renameDockerPath(_event, { sessionId, containerId, oldPath, newPath }) {
-  const command = buildDockerShellCommand(containerId, 'mv -- "$1" "$2"', [oldPath, newPath]);
-  const result = await execOnExistingSession(sessionId, command, { timeoutMs: 15000 });
-  if (result.code !== 0) {
-    throw new Error(normalizeDockerError(result.stderr || result.stdout, "无法重命名路径").message);
-  }
-}
+const startSessionApi = createStartSessionApi({
+  get sessions() { return sessions; },
+  get electronModule() { return electronModule; },
+  SSHClient, sshUtils, NetcattyAgent, keyboardInteractiveHandler, passphraseHandler, hostKeyVerifier,
+  quoteShellArg,
+  fs, path, os, net, crypto, Buffer, process, console, setTimeout, clearTimeout,
+  createProxySocket, attachX11Forwarding, createPtyOutputBuffer, sessionLogStreamManager,
+  trackSessionIdlePrompt, looksLikeIdleAutoLogout, createZmodemSentry, waitForWritableDrain, enableSshNoDelay, enableTcpNoDelay,
+  iconv, getSessionDecoder, resetSessionDecoders, sessionEncodings, sessionDecoders, encodeTerminalInput,
+  normalizeTerminalEncoding,
+  connectThroughChain, getAvailableAgentSocket, getAvailableForwardingAgentSocket, getCachedAuthMethod, setCachedAuthMethod, clearCachedAuthMethod,
+  attachSshDebugLogger, logSshAlgorithms, safeSend, zmodemOverwritePending,
+  shouldLogSshDebugMessage, log, createSshDiagnosticLogger,
+  buildAlgorithms, randomUUID, findDefaultPrivateKey, findAllDefaultPrivateKeys,
+  openTerminalOutputSession, closeTerminalOutputSession,
+  get selectZmodemUploadFiles() { return selectZmodemUploadFiles; },
+  get selectZmodemDownloadDirectory() { return selectZmodemDownloadDirectory; },
+  preparePrivateKeyForAuth, loadFirstIdentityFileForAuth, prepareSystemSshAgentForAuth, hasUserConfiguredKey, isPasswordProvided, createKeyboardInteractiveHandler, createOrderedStringAuthHandler, createAuthPhase, markAuthPhasePartialSuccess, canRepeatKeyboardInteractive, shouldSkipKiPasswordAutoFill,
+  createConnectionRef, acquireConnectionRef, releaseConnectionRef, transferConnectionRef,
+  consumePendingShellReconnectRisk,
+  findReusableSession, findTransportByEndpoint, resolveTransportForReuse, discardAllTransports,
+  beginTransportDial, waitForTransportDial, completeTransportDial, failTransportDial,
+  buildConnectionReuseEndpoint,
+  resolveConnectionKeepalivePolicy,
+  normalizeEndpoint,
+  get probeReceiveConflicts() { return probeReceiveConflicts; },
+  get removeRemoteFiles() { return removeRemoteFiles; },
+  get restoreRemoteModes() { return restoreRemoteModes; },
+});
+const { startSSHSession } = startSessionApi;
+const { createExecCommandApi } = require("./sshBridge/execCommand.cjs");
+const execCommandApi = createExecCommandApi({
+  SSHClient, NetcattyAgent, randomUUID, console, setTimeout, clearTimeout, Error,
+  findAllDefaultPrivateKeysFromHelper, preparePrivateKeyForAuth, loadIdentityFileForAuth,
+  prepareSystemSshAgentForAuth, getAvailableAgentSocket,
+  isPassphraseCancelledError, buildAlgorithms, buildAuthHandler, applyAuthToConnOpts,
+  createKeyboardInteractiveHandler, shouldSkipKiPasswordAutoFill, resolveSshConnectionTimeouts,
+});
+const { execCommand } = execCommandApi;
 
 /**
  * Generate SSH key pair
@@ -2213,22 +1053,165 @@ async function generateKeyPair(event, options) {
  * Wrapper for SSH session handler to suppress noisy auth error stack traces
  * Auth failures are expected when fallback to password is available
  */
-async function startSSHSessionWrapper(event, options) {
+function isAuthFailureMessage(message) {
+  const normalized = message?.toLowerCase() || '';
+  return normalized.includes('all configured authentication methods failed') ||
+    normalized.includes('authentication failed') ||
+    normalized.includes('too many authentication failures') ||
+    /permission denied\s*\(/.test(normalized) ||
+    normalized.includes('no authentication methods available');
+}
+
+function isStartAuthError(err) {
+  return err?.level === 'client-authentication' ||
+    isAuthFailureMessage(err?.message);
+}
+
+function isChainAuthError(err) {
+  return err?.level === 'client-authentication' ||
+    isAuthFailureMessage(err?.message);
+}
+
+function canHopUseEncryptedDefaultKeys(hop) {
+  if (hop.authMethod === "password" || hop.authMethod === "key" || hop.authMethod === "certificate") {
+    return false;
+  }
+  return !(hop.useSshAgent === true && hop.identitiesOnly === true);
+}
+
+function canRetryWithEncryptedDefaultKeys(options) {
+  if (options._unlockedEncryptedKeys?.length) return false;
+  return canHopUseEncryptedDefaultKeys(options) || (options.jumpHosts || []).some(canHopUseEncryptedDefaultKeys);
+}
+
+function resolveFailedAuthHop(options, err) {
+  if (!err?.isJumpHostAuthError) return options;
+  const jumpHosts = options.jumpHosts || [];
+  if (Number.isInteger(err.jumpHostIndex) && err.jumpHostIndex >= 0) {
+    return jumpHosts[err.jumpHostIndex] || null;
+  }
+  const matchingJumps = jumpHosts.filter((jump) => (
+    (err.jumpHostHostname && jump.hostname === err.jumpHostHostname)
+    || (err.jumpHostLabel && jump.label === err.jumpHostLabel)
+  ));
+  return matchingJumps.length === 1 ? matchingJumps[0] : null;
+}
+
+function canFailedHopRetryWithEncryptedDefaultKeys(options, err) {
+  const failedHop = resolveFailedAuthHop(options, err);
+  return Boolean(failedHop && canHopUseEncryptedDefaultKeys(failedHop));
+}
+
+function isStrictAgentAuthFailure(options, err) {
+  if (!err?.isJumpHostAuthError) {
+    return options.useSshAgent === true && options.identitiesOnly === true;
+  }
+  const jumpHosts = options.jumpHosts || [];
+  if (Number.isInteger(err.jumpHostIndex) && err.jumpHostIndex >= 0) {
+    const failedJump = jumpHosts[err.jumpHostIndex];
+    return failedJump?.useSshAgent === true && failedJump.identitiesOnly === true;
+  }
+  const matchingJumps = jumpHosts.filter((jump) => (
+    (err.jumpHostHostname && jump.hostname === err.jumpHostHostname)
+    || (err.jumpHostLabel && jump.label === err.jumpHostLabel)
+  ));
+  const failedJump = matchingJumps.length === 1 ? matchingJumps[0] : undefined;
+  return failedJump?.useSshAgent === true && failedJump.identitiesOnly === true;
+}
+
+function canReuseExistingSession(options) {
+  if (options.reuseTransport === false || !options.sourceSessionId || options.x11Forwarding) return false;
+  return Boolean(findReusableSession(sessions, options.sourceSessionId, {
+    hostname: options.hostname,
+    port: options.port || 22,
+    username: options.username || "root",
+  }));
+}
+
+function sendFinalStartFailureExit(event, options, err) {
+  const sessionId = options.sessionId;
+  if (!sessionId || event.sender?.isDestroyed?.()) return;
+  safeSend(event.sender, "netcatty:exit", {
+    sessionId,
+    exitCode: 1,
+    error: err?.message || String(err),
+    reason: "error",
+  });
+}
+
+async function startSSHSessionWithRetries(event, options, pendingDialState) {
+  let retryableEncryptedKeys = [];
+  let loadedRetryableEncryptedKeys = false;
+  let shouldSuppressInitialAuthExit = false;
+  const canRetryEncryptedDefaults = canRetryWithEncryptedDefaultKeys(options);
+  const canRetryKeyboardInteractiveFirst = Boolean(options.password && !options._skipPasswordMethod);
+  const mayReuseExistingSession = canRetryEncryptedDefaults && canReuseExistingSession(options);
+  const loadRetryableEncryptedKeys = async () => {
+    const allKeysWithEncrypted = await findAllDefaultPrivateKeysFromHelper({ includeEncrypted: true });
+    retryableEncryptedKeys = allKeysWithEncrypted.filter(k => k.isEncrypted);
+    loadedRetryableEncryptedKeys = true;
+    return retryableEncryptedKeys;
+  };
+
+  if (canRetryEncryptedDefaults && !mayReuseExistingSession) {
+    await loadRetryableEncryptedKeys();
+    shouldSuppressInitialAuthExit = retryableEncryptedKeys.length > 0 || canRetryKeyboardInteractiveFirst;
+  } else if (mayReuseExistingSession) {
+    // Let Copy Tab reuse an authenticated transport without waiting on key
+    // discovery. If reuse falls back to a fresh connection and auth fails, the
+    // catch path below lazily loads encrypted keys before deciding final failure.
+    shouldSuppressInitialAuthExit = true;
+  } else if (canRetryKeyboardInteractiveFirst) {
+    shouldSuppressInitialAuthExit = true;
+  }
+
   try {
-    return await startSSHSession(event, options);
+    return await startSSHSession(event, {
+      ...options,
+      _suppressPreShellAuthExit: shouldSuppressInitialAuthExit,
+      _pendingDialState: pendingDialState,
+      _deferPendingDialFailure: true,
+    });
   } catch (err) {
-    const isAuthError = err.message?.toLowerCase().includes('authentication') ||
-      err.message?.toLowerCase().includes('auth') ||
-      err.level === 'client-authentication';
+    const isAuthError = isStartAuthError(err);
 
     if (isAuthError) {
+      let authErrorSource = err;
+
+      if (canRetryKeyboardInteractiveFirst && err.retryKeyboardInteractiveFirst) {
+        console.log('[SSH] Password auth removed keyboard-interactive; retrying with keyboard-interactive first...');
+        try {
+          return await startSSHSession(event, {
+            ...options,
+            _skipPasswordMethod: true,
+            _suppressPreShellAuthExit: shouldSuppressInitialAuthExit,
+            _pendingDialState: pendingDialState,
+            _deferPendingDialFailure: true,
+          });
+        } catch (retryErr) {
+          const isRetryAuthError = isStartAuthError(retryErr);
+          if (isRetryAuthError) {
+            authErrorSource = retryErr;
+            console.log('[SSH] Keyboard-interactive-first retry failed authentication; checking remaining auth fallbacks...');
+          } else {
+            const connError = new Error(retryErr.message);
+            connError.level = retryErr.level || 'client-socket';
+            connError.code = retryErr.code;
+            throw connError;
+          }
+        }
+      }
+
       // Check if there are encrypted default keys we haven't tried yet
       // Only offer retry if no unlocked keys were provided in this attempt
-      const hasJumpHosts = options.jumpHosts && options.jumpHosts.length > 0;
-      const isPasswordOnly = !hasJumpHosts && !options.agentForwarding && !!options.password && !options.privateKey && !options.certificate;
-      if (!isPasswordOnly && (!options._unlockedEncryptedKeys || options._unlockedEncryptedKeys.length === 0)) {
-        const allKeysWithEncrypted = await findAllDefaultPrivateKeysFromHelper({ includeEncrypted: true });
-        const encryptedKeys = allKeysWithEncrypted.filter(k => k.isEncrypted);
+      if (
+        canRetryEncryptedDefaults
+        && canFailedHopRetryWithEncryptedDefaultKeys(options, authErrorSource)
+        && !isStrictAgentAuthFailure(options, authErrorSource)
+      ) {
+        const encryptedKeys = loadedRetryableEncryptedKeys
+          ? retryableEncryptedKeys
+          : await loadRetryableEncryptedKeys();
 
         if (encryptedKeys.length > 0) {
           console.log('[SSH] Auth failed, found encrypted default keys. Requesting passphrases for retry...');
@@ -2236,7 +1219,12 @@ async function startSSHSessionWrapper(event, options) {
           // Request passphrases from user
           const passphraseResult = await requestPassphrasesForEncryptedKeys(
             event.sender,
-            options.hostname
+            options.hostname,
+            {
+              signal: options._passphraseSignal,
+              sessionId: options.sessionId,
+              bootEpoch: options.bootEpoch,
+            },
           );
 
           // If user cancelled, don't retry even if some keys were unlocked
@@ -2254,17 +1242,36 @@ async function startSSHSessionWrapper(event, options) {
               return await startSSHSession(event, {
                 ...options,
                 _unlockedEncryptedKeys: passphraseResult.keys,
+                _pendingDialState: pendingDialState,
+                _deferPendingDialFailure: true,
               });
             } catch (retryErr) {
+              // Only purge cached passphrases if the error is specifically
+              // a passphrase/key-parsing failure, not a generic auth rejection.
+              const retryMsg = (retryErr.message || '').toLowerCase();
+              const isPassphraseError = retryMsg.includes('bad passphrase') ||
+                retryMsg.includes('integrity check failed') ||
+                retryMsg.includes('cannot parse privatekey');
+              if (isPassphraseError) {
+                try {
+                  const failedKeyPaths = passphraseResult.keys.map(k => k.keyPath);
+                  event.sender.send('netcatty:passphrase-auth-failed', { keyPaths: failedKeyPaths });
+                } catch (_) { /* sender may be destroyed */ }
+              }
+
               // Re-wrap retry errors the same way as initial errors
-              const isRetryAuthError = retryErr.message?.toLowerCase().includes('authentication') ||
-                retryErr.message?.toLowerCase().includes('auth') ||
-                retryErr.level === 'client-authentication';
+              const isRetryAuthError = isStartAuthError(retryErr);
 
               if (isRetryAuthError) {
                 const authError = new Error(retryErr.message);
                 authError.level = 'client-authentication';
                 authError.isAuthError = true;
+                if (retryErr.isJumpHostAuthError) {
+                  authError.isJumpHostAuthError = true;
+                  authError.jumpHostIndex = retryErr.jumpHostIndex;
+                  authError.jumpHostLabel = retryErr.jumpHostLabel;
+                  authError.jumpHostHostname = retryErr.jumpHostHostname;
+                }
                 throw authError;
               }
               // Wrap non-auth retry errors as connection errors to prevent crash
@@ -2279,11 +1286,21 @@ async function startSSHSessionWrapper(event, options) {
         }
       }
 
+      if (shouldSuppressInitialAuthExit) {
+        sendFinalStartFailureExit(event, options, authErrorSource);
+      }
+
       // Re-throw with a clean error to avoid Electron printing full stack trace
       // The frontend will handle this as a normal auth failure for fallback
-      const authError = new Error(err.message);
+      const authError = new Error(authErrorSource.message);
       authError.level = 'client-authentication';
       authError.isAuthError = true;
+      if (authErrorSource.isJumpHostAuthError) {
+        authError.isJumpHostAuthError = true;
+        authError.jumpHostIndex = authErrorSource.jumpHostIndex;
+        authError.jumpHostLabel = authErrorSource.jumpHostLabel;
+        authError.jumpHostHostname = authErrorSource.jumpHostHostname;
+      }
       throw authError;
     }
 
@@ -2298,74 +1315,48 @@ async function startSSHSessionWrapper(event, options) {
   }
 }
 
-async function startSSHTransportWrapper(event, options) {
-  try {
-    return await startSSHTransport(event, options);
-  } catch (err) {
-    const isAuthError = err.message?.toLowerCase().includes('authentication') ||
-      err.message?.toLowerCase().includes('auth') ||
-      err.level === 'client-authentication';
-
-    if (isAuthError) {
-      const hasJumpHosts = options.jumpHosts && options.jumpHosts.length > 0;
-      const isPasswordOnly = !hasJumpHosts && !options.agentForwarding && !!options.password && !options.privateKey && !options.certificate;
-      if (!isPasswordOnly && (!options._unlockedEncryptedKeys || options._unlockedEncryptedKeys.length === 0)) {
-        const allKeysWithEncrypted = await findAllDefaultPrivateKeysFromHelper({ includeEncrypted: true });
-        const encryptedKeys = allKeysWithEncrypted.filter(k => k.isEncrypted);
-
-        if (encryptedKeys.length > 0) {
-          console.log('[SSH] Auth failed, found encrypted default keys. Requesting passphrases for retry...');
-
-          const passphraseResult = await requestPassphrasesForEncryptedKeys(
-            event.sender,
-            options.hostname
-          );
-
-          if (passphraseResult.cancelled) {
-            console.log('[SSH] User cancelled passphrase flow, not retrying');
-          } else if (passphraseResult.keys.length > 0) {
-            console.log('[SSH] User unlocked keys, retrying transport...', {
-              count: passphraseResult.keys.length,
-              keyNames: passphraseResult.keys.map(k => k.keyName)
-            });
-
-            try {
-              return await startSSHTransport(event, {
-                ...options,
-                _unlockedEncryptedKeys: passphraseResult.keys,
-              });
-            } catch (retryErr) {
-              const isRetryAuthError = retryErr.message?.toLowerCase().includes('authentication') ||
-                retryErr.message?.toLowerCase().includes('auth') ||
-                retryErr.level === 'client-authentication';
-
-              if (isRetryAuthError) {
-                const authError = new Error(retryErr.message);
-                authError.level = 'client-authentication';
-                authError.isAuthError = true;
-                throw authError;
-              }
-              const connError = new Error(retryErr.message);
-              connError.level = retryErr.level || 'client-socket';
-              connError.code = retryErr.code;
-              throw connError;
-            }
-          } else {
-            console.log('[SSH] User did not unlock any keys, not retrying');
-          }
-        }
-      }
-
-      const authError = new Error(err.message);
-      authError.level = 'client-authentication';
-      authError.isAuthError = true;
-      throw authError;
+async function startSSHSessionWrapper(event, options) {
+  const pendingDialState = { coordination: null };
+  let sourcePinHolder = null;
+  let sourceReuseState = options.sourceSessionId && options.reuseTransport !== false
+    ? { attempted: false, session: null }
+    : null;
+  const sessionId = options.sessionId || require("node:crypto").randomUUID();
+  const { registerPendingBootAbort, clearPendingBootAbort } = require("./sessionBootEpoch.cjs");
+  const passphraseAbortController = registerPendingBootAbort(sessionId, options.bootEpoch);
+  if (options.sourceSessionId && options.reuseTransport !== false) {
+    const sourceAtRequest = findReusableSession(sessions, options.sourceSessionId);
+    if (sourceAtRequest?.connRef) {
+      sourcePinHolder = {};
+      acquireConnectionRef(sourcePinHolder, sourceAtRequest.connRef);
+      sourceReuseState.session = {
+        conn: sourceAtRequest.conn,
+        connRef: sourceAtRequest.connRef,
+        stream: sourceAtRequest.stream,
+        _reuseEndpoint: sourceAtRequest._reuseEndpoint,
+      };
     }
-
-    const connError = new Error(err.message);
-    connError.level = err.level || 'client-socket';
-    connError.code = err.code;
-    throw connError;
+  }
+  try {
+    // Main-process UDP Local Network probe (TN3179 discard-port connect) so
+    // TCC attributes to Netcatty before the (possibly worker-hosted) SSH dial.
+    // See #2663 / #2673. Carry the resolved first-hop address so direct-start
+    // annotation (no terminal worker) still sees split-DNS LAN evidence.
+    const probeResult = await ensureMacLocalNetworkAccess(options);
+    return await startSSHSessionWithRetries(event, {
+      ...attachMacLocalNetworkProbeResult(options, probeResult),
+      sessionId,
+      _passphraseSignal: passphraseAbortController.signal,
+      ...(sourceReuseState ? { _sourceReuseState: sourceReuseState } : {}),
+    }, pendingDialState);
+  } catch (err) {
+    if (pendingDialState.coordination) {
+      failTransportDial(pendingDialState.coordination, err);
+    }
+    throw err;
+  } finally {
+    clearPendingBootAbort(sessionId, passphraseAbortController);
+    if (sourcePinHolder) releaseConnectionRef(sourcePinHolder);
   }
 }
 
@@ -2381,692 +1372,165 @@ async function startSSHTransportWrapper(event, options) {
  * classify network devices from the banner without running any additional
  * exec channels.
  */
-async function getSessionRemoteInfo(_event, payload) {
-  const { sessionId } = payload || {};
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return { success: false, error: 'Session not found' };
-  }
-  return {
-    success: true,
-    remoteSshVersion: session.remoteSshVersion || '',
-  };
-}
+// Companion stats connection for Mosh sessions (issue #1198). Mosh runs over
+// UDP and has no ssh2 connection, so getServerStats cannot open an exec
+// channel. This helper lazily establishes a best-effort, non-interactive
+// SSH connection reusing the handshake credentials and assigns it to
+// session.conn so the existing stats path works unchanged.
+const { createSystemKnownHostsApi } = require("./sshBridge/systemKnownHosts.cjs");
+// Lets the Mosh stats companion trust a host whose key is already recorded in
+// the user's system OpenSSH known_hosts (the trust source the Mosh handshake's
+// system `ssh` actually uses), in addition to Netcatty's in-app vault.
+const { isHostKeyTrustedBySystem } = createSystemKnownHostsApi({
+  fs, path, os, crypto, log,
+});
 
-/**
- * Run the distro-identification probe on an already-connected SSH
- * session's connection. Uses an exec channel on the existing conn —
- * which is still one extra channel (and therefore one extra AAA
- * session on vendor CLIs that don't multiplex channels cleanly), but
- * avoids the full auth round-trip that `execCommand` would do by
- * creating a brand new SSHClient. The renderer only falls through to
- * this when banner classification returned no vendor, so in practice
- * it never runs against Cisco/Huawei/HPE/etc. — only against
- * Linux-like hosts and OpenSSH-fronted network devices (JUNOS,
- * NX-OS, EOS) that are already handled by the useServerStats
- * failure-counter path downstream.
- */
-async function getSessionDistroInfo(_event, payload) {
-  const { sessionId } = payload || {};
-  const session = sessions.get(sessionId);
-  if (!session || !session.conn) {
-    return { success: false, error: 'Session not found or not connected' };
-  }
-  const command = "cat /etc/os-release 2>/dev/null || uname -a";
-  return new Promise((resolve) => {
-    let settled = false;
-    const settle = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    const timer = setTimeout(() => {
-      settle({ success: false, error: 'Timeout probing distro' });
-      // Clean up the exec channel so it doesn't linger.
-      try { if (activeStream) activeStream.close(); } catch { /* ignore */ }
-    }, 5000);
-    let activeStream = null;
-    try {
-      session.conn.exec(command, (err, stream) => {
-        if (err) {
-          settle({ success: false, error: err.message || String(err) });
-          return;
-        }
-        activeStream = stream;
-        let stdout = '';
-        let stderr = '';
-        stream.on('data', (chunk) => { stdout += chunk.toString(); });
-        stream.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-        stream.on('close', () => {
-          settle({ success: true, stdout, stderr });
-        });
-      });
-    } catch (err) {
-      settle({ success: false, error: err?.message || String(err) });
-    }
-  });
-}
+const { createMoshStatsConnectionApi } = require("./sshBridge/moshStatsConnection.cjs");
+const { ensureMoshStatsConnection, ensureEtStatsConnection } = createMoshStatsConnectionApi({
+  get sessions() { return sessions; },
+  SSHClient, sshUtils, NetcattyAgent, buildAlgorithms, getSshAgentSocket, prepareSystemSshAgentForAuth,
+  readFileNoFollow, expandIdentityFilePath, isAutoFillablePasswordChallenge,
+  hostKeyVerifier, isHostKeyTrustedBySystem, log,
+});
 
-async function getSessionPwd(event, payload) {
-  const { sessionId } = payload;
-  const session = sessions.get(sessionId);
-
-  if (!session || !session.conn) {
-    return { success: false, error: 'Session not found or not connected' };
-  }
-
-  // Completely silent: uses a separate exec channel, nothing is printed
-  // in the interactive terminal. The exec channel and the interactive
-  // shell are both children of the same per-connection sshd process,
-  // so we find the shell as a sibling via $PPID.
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      resolve({ success: false, error: 'Timeout getting pwd' });
-    }, 5000);
-
-    // Find the interactive shell's cwd silently via a separate exec channel.
-    // Both the exec channel and the interactive shell share the same sshd
-    // parent ($PPID). We exclude our own PID ($$) to avoid reading our own cwd.
-    const cmd = `p=$(ps --ppid $PPID -o pid=,comm= 2>/dev/null | awk -v self=$$ '$1!=self && $2~/^(ba|z|fi|k|da)?sh$/{pid=$1}END{print pid}'); [ -n "$p" ] && readlink /proc/$p/cwd 2>/dev/null && exit 0; p=$(ps -e -o pid=,ppid=,comm= 2>/dev/null | awk -v pp=$PPID -v self=$$ '$1!=self && $2==pp && $3~/^(ba|z|fi|k|da)?sh$/{pid=$1}END{print pid}'); [ -n "$p" ] && readlink /proc/$p/cwd 2>/dev/null && exit 0; eval echo "~"`;
-
-    session.conn.exec(cmd, (err, stream) => {
-      if (err) {
-        clearTimeout(timer);
-        log('[getSessionPwd] exec error:', err.message);
-        resolve({ success: false, error: err.message });
-        return;
-      }
-      let out = '';
-      let errOut = '';
-      stream.on('data', (d) => { out += d.toString(); });
-      stream.stderr?.on('data', (d) => { errOut += d.toString(); });
-      stream.on('close', (code) => {
-        clearTimeout(timer);
-        const path = out.trim();
-        log('[getSessionPwd]', { stdout: path, stderr: errOut.trim(), exitCode: code });
-        if (path && path.startsWith('/')) {
-          resolve({ success: true, cwd: path });
-        } else {
-          resolve({ success: false, error: 'Could not determine cwd' });
-        }
-      });
-    });
-  });
-}
-
-/**
- * List directory contents on remote machine for path autocomplete.
- * Uses a separate exec channel — does not touch the interactive shell.
- */
-async function listSessionDir(_event, payload) {
-  const {
-    sessionId,
-    path: dirPath,
-    foldersOnly,
-    filterPrefix = "",
-    limit = 100,
-  } = payload || {};
-  const session = sessions.get(sessionId);
-
-  if (!session || !session.conn) {
-    return { success: false, entries: [], error: 'Session not found' };
-  }
-
-  if (typeof dirPath !== "string" || dirPath.length === 0) {
-    return { success: false, entries: [], error: 'Invalid directory path' };
-  }
-
-  return new Promise((resolve) => {
-    let settled = false;
-    let streamRef = null;
-    const resolveOnce = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    const timer = setTimeout(() => {
-      try {
-        streamRef?.close?.();
-        streamRef?.destroy?.();
-      } catch {}
-      resolveOnce({ success: false, entries: [], error: 'Timeout listing directory' });
-    }, 3000);
-
-    // Emit a NUL-delimited stream from plain POSIX shell/find so we don't depend on
-    // Python/Perl, while still preserving whitespace and newline characters in filenames.
-    const safePath = dirPath.replace(/'/g, "'\\''");
-    const tildePathSuffix = dirPath.startsWith("~/")
-      ? dirPath.slice(2).replace(/(["\\$`])/g, "\\$1")
-      : "";
-    const normalizedPrefix = typeof filterPrefix === "string" ? filterPrefix.toLowerCase() : "";
-    const safePrefix = normalizedPrefix.replace(/'/g, "'\\''");
-    const maxEntries = Number.isFinite(limit) ? Math.min(Math.max(1, Math.floor(limit)), 200) : 100;
-    const pathExpr = dirPath === "~"
-      ? '"$HOME"'
-      : dirPath.startsWith("~/")
-        ? `"$HOME/${tildePathSuffix}"`
-        : `'${safePath}'`;
-    // When dirPath is relative (not absolute and not ~/...), exec channels default
-    // to the user's home directory. Resolve the interactive shell's actual cwd first
-    // so that relative paths like "." or "src" are resolved correctly.
-    const needsCwdResolve = !dirPath.startsWith('/') && dirPath !== '~' && !dirPath.startsWith('~/');
-    const cwdResolveCmd = needsCwdResolve
-      ? `_sc_p=$(ps --ppid $PPID -o pid=,comm= 2>/dev/null | awk -v self=$$ '$1!=self && $2~/^(ba|z|fi|k|da)?sh$/{pid=$1}END{print pid}'); [ -z "$_sc_p" ] && _sc_p=$(ps -e -o pid=,ppid=,comm= 2>/dev/null | awk -v pp=$PPID -v self=$$ '$1!=self && $2==pp && $3~/^(ba|z|fi|k|da)?sh$/{pid=$1}END{print pid}'); [ -n "$_sc_p" ] && { _sc_d=$(readlink /proc/$_sc_p/cwd 2>/dev/null); [ -n "$_sc_d" ] && cd "$_sc_d" 2>/dev/null; }; `
-      : '';
-    const cmd = `${cwdResolveCmd}find ${pathExpr} -mindepth 1 -maxdepth 1 -exec sh -c '
-      prefix="$1"
-      folders_only="$2"
-      limit="$3"
-      shift 3
-      count=0
-      for path do
-        name=\${path##*/}
-        lower_name=$(printf "%s" "$name" | tr "[:upper:]" "[:lower:]")
-        if [ -n "$prefix" ]; then
-          case "$lower_name" in
-            "$prefix"*) ;;
-            *) continue ;;
-          esac
-        fi
-        if [ "$folders_only" -eq 1 ] && [ ! -d "$path" ]; then
-          continue
-        fi
-        if [ -L "$path" ]; then
-          type="symlink"
-        elif [ -d "$path" ]; then
-          type="directory"
-        else
-          type="file"
-        fi
-        printf "%s\\0%s\\0" "$name" "$type"
-        count=$((count + 1))
-        if [ "$count" -ge "$limit" ]; then
-          break
-        fi
-      done
-    ' sh '${safePrefix}' ${foldersOnly ? 1 : 0} ${maxEntries} {} + 2>/dev/null`;
-
-    session.conn.exec(cmd, (err, stream) => {
-      if (err) {
-        resolveOnce({ success: false, entries: [], error: err.message });
-        return;
-      }
-      streamRef = stream;
-      const chunks = [];
-      let errOut = '';
-      stream.on('data', (d) => { chunks.push(Buffer.from(d)); });
-      stream.stderr?.on('data', (d) => { errOut += d.toString(); });
-      stream.on('close', () => {
-        if (settled) return;
-        try {
-          const output = Buffer.concat(chunks);
-          const entries = [];
-          let fieldStart = 0;
-          let pendingName = null;
-
-          for (let i = 0; i < output.length; i++) {
-            if (output[i] !== 0) continue;
-            const field = output.toString('utf8', fieldStart, i);
-            fieldStart = i + 1;
-            if (pendingName === null) {
-              pendingName = field;
-            } else {
-              entries.push({ name: pendingName, type: field });
-              pendingName = null;
-              if (entries.length >= maxEntries) break;
-            }
-          }
-
-          if (pendingName !== null) {
-            resolveOnce({ success: false, entries: [], error: 'Invalid directory listing response' });
-            return;
-          }
-
-          resolveOnce({ success: true, entries });
-        } catch {
-          resolveOnce({
-            success: false,
-            entries: [],
-            error: errOut.trim() || 'Failed to parse directory listing',
-          });
-        }
-      });
-    });
-  });
-}
-
-/**
- * Get server stats (CPU, Memory, Disk) from an active SSH session
- * Only works for Linux servers
- */
-async function getServerStats(event, payload) {
-  const { sessionId } = payload;
-  const session = sessions.get(sessionId);
-
-  if (!session || !session.conn) {
-    return { success: false, error: 'Session not found or not connected' };
-  }
-
-  const conn = session.conn;
-
-  // macOS stats command: uses sysctl, vm_stat, top, ps, df, netstat
-  // CPU reported as direct percentage (top computes delta internally)
-  // cpuPerCore not available on macOS without sudo
-  const macosStatsCommand = [
-    `cores=$(sysctl -n hw.logicalcpu 2>/dev/null || echo "1")`,
-    `pagesize=$(sysctl -n hw.pagesize 2>/dev/null || echo "4096")`,
-    `memsize=$(sysctl -n hw.memsize 2>/dev/null || echo "0")`,
-    // CPU usage: top -l 1 gives one logging sample, parse idle%
-    `cpuline=$(top -l 1 -s 0 -n 0 2>/dev/null | grep "CPU usage:" | head -1)`,
-    `cpupct=$(echo "$cpuline" | awk '{for(i=1;i<=NF;i++){if($(i+1)~/^idle/){v=$i;gsub(/%/,"",v);idle=v+0;found=1}};if(found)printf "%.0f",100-idle}')`,
-    // Memory: single vm_stat pipe → awk extracts all page counts (strip trailing dots with gsub)
-    // Outputs: "memfree memcached" in MB
-    `vmmem=$(vm_stat 2>/dev/null | awk -v ps="$pagesize" '/^Pages free:/{gsub(/[^0-9]/,"",$NF);free=$NF+0} /^Pages speculative:/{gsub(/[^0-9]/,"",$NF);spec=$NF+0} /^Pages inactive:/{gsub(/[^0-9]/,"",$NF);inact=$NF+0} /^Pages purgeable:/{gsub(/[^0-9]/,"",$NF);purg=$NF+0} END{mfree=int((free+spec)*ps/1024/1024);mcached=int((inact+purg)*ps/1024/1024);printf "%d %d",mfree,mcached}')`,
-    `memtotal=$(echo "$memsize" | awk '{printf "%d",$1/1024/1024}')`,
-    `memfree=$(echo "$vmmem" | awk '{print $1}')`,
-    `memcached=$(echo "$vmmem" | awk '{print $2}')`,
-    // Swap
-    `swapraw=$(sysctl vm.swapusage 2>/dev/null)`,
-    `swaptotal=$(echo "$swapraw" | awk '{for(i=1;i<=NF;i++){if($i=="total"&&$(i+1)=="="){v=$(i+2);m=1;if(v~/G/)m=1024;gsub(/[MmGg]/,"",v);st=v*m}};printf "%.0f",st+0}')`,
-    `swapused=$(echo "$swapraw" | awk '{for(i=1;i<=NF;i++){if($i=="used"&&$(i+1)=="="){v=$(i+2);m=1;if(v~/G/)m=1024;gsub(/[MmGg]/,"",v);su=v*m}};printf "%.0f",su+0}')`,
-    `swapfree=$(echo "$swaptotal $swapused" | awk '{printf "%.0f",$1-$2}')`,
-    // Top processes by memory%
-    `procs=$(ps -A -o pid=,%mem=,comm= 2>/dev/null | sort -k2 -rn | head -10 | awk '{gsub(/;/,"_",$3);printf "%s;%.1f;%s,",$1,$2,$3}' | sed 's/,$//')`,
-    // Disk: only show root "/" and external volumes "/Volumes/*", skip system APFS snapshots
-    `disks=$(df -k 2>/dev/null | awk 'NR>1&&index($1,"/dev/")==1&&NF>=9&&($NF=="/"||index($NF,"/Volumes/")==1){u=$3/1048576;t=$2/1048576;p=$5;gsub(/%/,"",p);printf "%s:%.0f:%.0f:%s,",$NF,u,t,p}' | sed 's/,$//')`,
-    // Network: Link# lines only, exclude loopback, detect column shift (no MAC addr → cols shift left)
-    `net=$(netstat -ib 2>/dev/null | awk '/^[a-z]/&&$3~/Link/&&$1!~/^lo/{if($4~/:/){rx=$7;tx=$10}else{rx=$6;tx=$9};if((rx+0)>0){gsub(/[*]/,"",$1);printf "%s:%s:%s,",$1,rx,tx}}' | sed 's/,$//')`,
-    `echo "CPU:$cpupct|CORES:$cores|MEMINFO:$memtotal $memfree 0 $memcached $swaptotal $swapfree|PROCS:$procs|DISKS:$disks|NET:$net"`,
-  ].join('; ');
-
-  // Command to get CPU (overall + per-core), Memory, Disk, and Network stats
-  // This command is designed to work across most Linux distributions
-  // Note: Using semicolons and avoiding comments for single-line execution
-  // CPU: Output raw values (total and idle) instead of percentage - we calculate delta on backend
-  const linuxStatsCommand = [
-    // Get number of CPU cores
-    `cores=$(nproc 2>/dev/null || grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "1")`,
-    // Get raw CPU values from /proc/stat: "total idle" for overall CPU
-    // We output raw values and calculate delta-based percentage on the backend
-    `cpuraw=$(awk '/^cpu / {total=0; for(i=2;i<=NF;i++) total+=$i; printf "%d %d", total, $5}' /proc/stat 2>/dev/null || echo "")`,
-    // Get raw per-core CPU values from /proc/stat: "total:idle,total:idle,..."
-    `percoreraw=$(awk '/^cpu[0-9]/ {total=0; for(i=2;i<=NF;i++) total+=$i; printf "%d:%d,", total, $5}' /proc/stat 2>/dev/null | sed 's/,$//' || echo "")`,
-    // Get memory details from /proc/meminfo (total, free, buffers, cached, swapTotal, swapFree in KB)
-    `meminfo=$(awk '/^MemTotal:/{t=$2} /^MemFree:/{f=$2} /^Buffers:/{b=$2} /^Cached:/{c=$2} /^SReclaimable:/{s=$2} /^SwapTotal:/{st=$2} /^SwapFree:/{sf=$2} END{printf "%d %d %d %d %d %d", t/1024, f/1024, b/1024, (c+s)/1024, st/1024, sf/1024}' /proc/meminfo 2>/dev/null || echo "")`,
-    // Get top 10 processes by memory - with BusyBox fallback
-    // GNU ps: ps -eo pid,%mem,comm --sort=-%mem
-    // BusyBox fallback: ps -o pid,vsz,comm and sort manually (BusyBox ps doesn't have %mem, use vsz instead)
-    `procs=$(ps -eo pid,%mem,comm --sort=-%mem 2>/dev/null | awk 'NR>1 && NR<=11 {gsub(/;/, "_", $3); printf "%s;%.1f;%s,", $1, $2, $3}' | sed 's/,$//' || ps -o pid,vsz,comm 2>/dev/null | awk 'NR>1 {gsub(/;/, "_", $3); print $2, $1, $3}' | sort -rn | head -10 | awk -v total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo) '{if(total>0) pct=$1*100/total; else pct=0; printf "%s;%.1f;%s,", $2, pct, $3}' | sed 's/,$//' || echo "")`,
-    // Get all mounted disk info - with BusyBox fallback
-    // GNU df: df -BG (block size in GB)
-    // BusyBox fallback: df and calculate from 1K blocks, or df -h and parse units
-    `disks=$(df -BG 2>/dev/null | awk 'NR>1 && $1 ~ /^\\/dev/ {gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/%/,"",$5); printf "%s:%s:%s:%s,", $6, $3, $2, $5}' | sed 's/,$//' || df 2>/dev/null | awk 'NR>1 && $1 ~ /^\\/dev/ {total=$2/1048576; used=$3/1048576; pct=$5; gsub(/%/,"",pct); printf "%s:%.0f:%.0f:%s,", $6, used, total, pct}' | sed 's/,$//' || echo "")`,
-    // Get network interface stats from /proc/net/dev (interface:rx_bytes:tx_bytes), excluding lo and virtual interfaces
-    `net=$(cat /proc/net/dev 2>/dev/null | awk 'NR>2 {gsub(/^[ \\t]+/, ""); split($0, a, ":"); iface=a[1]; if(iface != "lo" && iface !~ /^veth/ && iface !~ /^docker/ && iface !~ /^br-/) {split(a[2], b); printf "%s:%s:%s,", iface, b[1], b[9]}}' | sed 's/,$//' || echo "")`,
-    // Output all stats (using CPURAW and PERCORERAW instead of CPU and PERCORE)
-    `echo "CPURAW:$cpuraw|CORES:$cores|PERCORERAW:$percoreraw|MEMINFO:$meminfo|PROCS:$procs|DISKS:$disks|NET:$net"`
-  ].join('; ');
-
-  // Auto-detect OS via uname — only Linux and macOS are supported
-  const statsCommand = `ostype=$(uname -s 2>/dev/null || echo "Unknown"); if [ "$ostype" = "Darwin" ]; then ${macosStatsCommand}; elif [ "$ostype" = "Linux" ]; then ${linuxStatsCommand}; else echo "UNSUPPORTED_OS:$ostype"; fi`;
-  return new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      resolve({ success: false, error: 'Timeout getting server stats' });
-    }, 5000);
-
-    conn.exec(statsCommand, (err, stream) => {
-      if (err) {
-        clearTimeout(timeout);
-        resolve({ success: false, error: err.message });
-        return;
-      }
-
-      let stdout = '';
-      let stderr = '';
-
-      stream.on('data', (data) => {
-        stdout += data.toString();
-      });
-
-      stream.stderr.on('data', (data) => {
-        stderr += data.toString();
-      });
-
-      stream.on('close', () => {
-        clearTimeout(timeout);
-
-        // Parse the output
-        const output = stdout.trim();
-
-        // Unsupported OS — stop polling this session
-        if (output.startsWith('UNSUPPORTED_OS:')) {
-          resolve({ success: false, error: `Server stats not supported on this OS (${output.substring(15)})` });
-          return;
-        }
-
-        const parts = output.split('|');
-
-        let cpuDirect = null;    // macOS: direct CPU percentage from top
-        let cpuRawTotal = null;
-        let cpuRawIdle = null;
-        let cpuPerCoreRaw = [];  // Array of { total, idle }
-        let cpuCores = null;
-        let memTotal = null;
-        let memFree = null;
-        let memBuffers = null;
-        let memCached = null;
-        let memUsed = null;
-        let swapTotal = null;
-        let swapUsed = null;
-        let topProcesses = [];  // Array of { pid, memPercent, command }
-        let disks = [];  // Array of { mountPoint, used, total, percent }
-        let networkInterfaces = [];  // Array of { name, rxBytes, txBytes }
-
-        for (const part of parts) {
-          if (part.startsWith('CPU:')) {
-            // macOS: top reports CPU% directly (no delta needed)
-            const val = parseFloat(part.substring(4).trim());
-            if (!isNaN(val)) cpuDirect = Math.min(100, Math.max(0, Math.round(val)));
-          } else if (part.startsWith('CPURAW:')) {
-            const rawParts = part.substring(7).trim().split(/\s+/);
-            if (rawParts.length >= 2) {
-              cpuRawTotal = parseInt(rawParts[0], 10);
-              cpuRawIdle = parseInt(rawParts[1], 10);
-            }
-          } else if (part.startsWith('CORES:')) {
-            const coreStr = part.substring(6).trim();
-            const val = parseInt(coreStr, 10);
-            if (!isNaN(val) && val > 0) cpuCores = val;
-          } else if (part.startsWith('PERCORERAW:')) {
-            const coreStr = part.substring(11).trim();
-            if (coreStr && coreStr !== '') {
-              cpuPerCoreRaw = coreStr.split(',').map(v => {
-                const coreParts = v.trim().split(':');
-                if (coreParts.length >= 2) {
-                  const total = parseInt(coreParts[0], 10);
-                  const idle = parseInt(coreParts[1], 10);
-                  if (!isNaN(total) && !isNaN(idle)) {
-                    return { total, idle };
-                  }
-                }
-                return null;
-              }).filter(v => v !== null);
-            }
-          } else if (part.startsWith('MEMINFO:')) {
-            const memParts = part.substring(8).trim().split(/\s+/);
-            if (memParts.length >= 4) {
-              const total = parseInt(memParts[0], 10);
-              const free = parseInt(memParts[1], 10);
-              const buffers = parseInt(memParts[2], 10);
-              const cached = parseInt(memParts[3], 10);
-              if (!isNaN(total)) memTotal = total;
-              if (!isNaN(free)) memFree = free;
-              if (!isNaN(buffers)) memBuffers = buffers;
-              if (!isNaN(cached)) memCached = cached;
-              // Calculate used memory (excluding buffers/cache)
-              if (memTotal !== null && memFree !== null && memBuffers !== null && memCached !== null) {
-                memUsed = memTotal - memFree - memBuffers - memCached;
-                if (memUsed < 0) memUsed = 0;
-              }
-              // Parse swap info (fields 5 and 6)
-              if (memParts.length >= 6) {
-                const st = parseInt(memParts[4], 10);
-                const sf = parseInt(memParts[5], 10);
-                if (!isNaN(st)) swapTotal = st;
-                if (!isNaN(sf)) {
-                  swapUsed = (swapTotal !== null) ? swapTotal - sf : null;
-                  if (swapUsed !== null && swapUsed < 0) swapUsed = 0;
-                }
-              }
-            }
-          } else if (part.startsWith('PROCS:')) {
-            const procsStr = part.substring(6).trim();
-            if (procsStr && procsStr !== '') {
-              const procEntries = procsStr.split(',');
-              for (const entry of procEntries) {
-                const procParts = entry.split(';');  // Using ; as delimiter
-                if (procParts.length >= 3) {
-                  const pid = procParts[0];
-                  const memPercent = parseFloat(procParts[1]);
-                  const command = procParts.slice(2).join(';');  // Command might contain semicolons
-                  if (!isNaN(memPercent)) {
-                    topProcesses.push({ pid, memPercent, command });
-                  }
-                }
-              }
-            }
-          } else if (part.startsWith('DISKS:')) {
-            const disksStr = part.substring(6).trim();
-            if (disksStr && disksStr !== '') {
-              const diskEntries = disksStr.split(',');
-              for (const entry of diskEntries) {
-                const diskParts = entry.split(':');
-                if (diskParts.length >= 4) {
-                  const mountPoint = diskParts[0];
-                  const used = parseInt(diskParts[1], 10);
-                  const total = parseInt(diskParts[2], 10);
-                  const percent = parseInt(diskParts[3], 10);
-                  if (!isNaN(used) && !isNaN(total) && !isNaN(percent)) {
-                    disks.push({ mountPoint, used, total, percent });
-                  }
-                }
-              }
-            }
-          } else if (part.startsWith('NET:')) {
-            const netStr = part.substring(4).trim();
-            if (netStr && netStr !== '') {
-              const netEntries = netStr.split(',');
-              for (const entry of netEntries) {
-                const netParts = entry.split(':');
-                if (netParts.length >= 3) {
-                  const name = netParts[0];
-                  const rxBytes = parseInt(netParts[1], 10);
-                  const txBytes = parseInt(netParts[2], 10);
-                  if (!isNaN(rxBytes) && !isNaN(txBytes)) {
-                    networkInterfaces.push({ name, rxBytes, txBytes });
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        // Calculate network speed based on previous reading
-        const now = Date.now();
-        const prevNet = session.prevNetStats || { interfaces: [], timestamp: 0 };
-        const timeDelta = (now - prevNet.timestamp) / 1000; // seconds
-
-        let netRxSpeed = 0;  // bytes per second
-        let netTxSpeed = 0;  // bytes per second
-        const netInterfaces = [];
-
-        if (timeDelta > 0 && prevNet.interfaces.length > 0) {
-          for (const iface of networkInterfaces) {
-            const prevIface = prevNet.interfaces.find(p => p.name === iface.name);
-            if (prevIface) {
-              const rxDelta = iface.rxBytes - prevIface.rxBytes;
-              const txDelta = iface.txBytes - prevIface.txBytes;
-              // Only count positive deltas (handles counter reset)
-              const rxSpeed = rxDelta > 0 ? Math.round(rxDelta / timeDelta) : 0;
-              const txSpeed = txDelta > 0 ? Math.round(txDelta / timeDelta) : 0;
-              netRxSpeed += rxSpeed;
-              netTxSpeed += txSpeed;
-              netInterfaces.push({
-                name: iface.name,
-                rxBytes: iface.rxBytes,
-                txBytes: iface.txBytes,
-                rxSpeed,
-                txSpeed,
-              });
-            } else {
-              netInterfaces.push({
-                name: iface.name,
-                rxBytes: iface.rxBytes,
-                txBytes: iface.txBytes,
-                rxSpeed: 0,
-                txSpeed: 0,
-              });
-            }
-          }
-        } else {
-          // First reading - no speed data yet
-          for (const iface of networkInterfaces) {
-            netInterfaces.push({
-              name: iface.name,
-              rxBytes: iface.rxBytes,
-              txBytes: iface.txBytes,
-              rxSpeed: 0,
-              txSpeed: 0,
-            });
-          }
-        }
-
-        // Store current reading for next calculation
-        session.prevNetStats = {
-          interfaces: networkInterfaces,
-          timestamp: now,
-        };
-
-        // Calculate CPU usage based on delta from previous reading
-        const prevCpu = session.prevCpuStats || { total: 0, idle: 0, perCore: [], timestamp: 0 };
-        let cpu = null;
-        let cpuPerCore = [];
-
-        if (cpuRawTotal !== null && cpuRawIdle !== null && prevCpu.total > 0) {
-          const totalDelta = cpuRawTotal - prevCpu.total;
-          const idleDelta = cpuRawIdle - prevCpu.idle;
-          if (totalDelta > 0) {
-            // CPU% = 100 - (idleDelta / totalDelta * 100)
-            cpu = Math.round(100 - (idleDelta / totalDelta * 100));
-            // Clamp to valid range
-            if (cpu < 0) cpu = 0;
-            if (cpu > 100) cpu = 100;
-          }
-        }
-
-        // macOS: use direct percentage from top (no delta needed)
-        if (cpu === null && cpuDirect !== null) {
-          cpu = cpuDirect;
-        }
-
-        // Calculate per-core CPU usage from deltas
-        if (cpuPerCoreRaw.length > 0 && prevCpu.perCore.length > 0) {
-          cpuPerCore = cpuPerCoreRaw.map((core, index) => {
-            const prevCore = prevCpu.perCore[index];
-            if (prevCore) {
-              const totalDelta = core.total - prevCore.total;
-              const idleDelta = core.idle - prevCore.idle;
-              if (totalDelta > 0) {
-                let usage = Math.round(100 - (idleDelta / totalDelta * 100));
-                if (usage < 0) usage = 0;
-                if (usage > 100) usage = 100;
-                return usage;
-              }
-            }
-            return 0;
-          });
-        } else if (cpuPerCoreRaw.length > 0) {
-          // First reading - no delta data yet, return zeros
-          cpuPerCore = cpuPerCoreRaw.map(() => 0);
-        }
-
-        // Store current CPU reading for next calculation
-        session.prevCpuStats = {
-          total: cpuRawTotal || 0,
-          idle: cpuRawIdle || 0,
-          perCore: cpuPerCoreRaw,
-          timestamp: now,
-        };
-
-        // For backward compatibility, extract root disk info
-        const rootDisk = disks.find(d => d.mountPoint === '/');
-        const diskPercent = rootDisk ? rootDisk.percent : null;
-        const diskUsed = rootDisk ? rootDisk.used : null;
-        const diskTotal = rootDisk ? rootDisk.total : null;
-
-        // If no meaningful data was parsed, treat as failure to stop futile polling
-        if (cpu === null && memTotal === null && cpuCores === null) {
-          resolve({ success: false, error: 'Unable to parse server stats (unsupported OS or shell)' });
-          return;
-        }
-
-        resolve({
-          success: true,
-          stats: {
-            cpu,           // CPU usage percentage (0-100)
-            cpuCores,      // Number of CPU cores
-            cpuPerCore,    // Per-core CPU usage array
-            memTotal,      // Total memory in MB
-            memUsed,       // Used memory in MB (excluding buffers/cache)
-            memFree,       // Free memory in MB
-            memBuffers,    // Buffers in MB
-            memCached,     // Cached in MB
-            swapTotal,     // Swap total in MB
-            swapUsed,      // Swap used in MB
-            topProcesses,  // Top 10 processes by memory
-            diskPercent,   // Disk usage percentage for root partition (backward compat)
-            diskUsed,      // Disk used in GB for root partition (backward compat)
-            diskTotal,     // Total disk in GB for root partition (backward compat)
-            disks,         // Array of all mounted disks
-            netRxSpeed,    // Total network receive speed (bytes/sec)
-            netTxSpeed,    // Total network transmit speed (bytes/sec)
-            netInterfaces, // Per-interface network stats
-          },
-        });
-      });
-    });
-  });
-}
-
-/**
- * Set terminal encoding for an active SSH session
- */
-async function setSessionEncoding(_event, { sessionId, encoding }) {
-  const session = sessions?.get(sessionId);
-  if (!session || !session.stream) {
-    return { ok: false, encoding: encoding || "utf-8" };
-  }
-  const enc = String(encoding || "utf-8").toLowerCase();
-  if (!iconv.encodingExists(enc)) {
-    return { ok: false, encoding: enc };
-  }
-  sessionEncodings.set(sessionId, enc);
-  // Reset stateful decoders so new data uses the updated encoding
-  resetSessionDecoders(sessionId);
-  return { ok: true, encoding: enc };
-}
+const { createSessionOpsApi } = require("./sshBridge/sessionOps.cjs");
+const measureTcpConnectLatency = createTcpConnectLatencyProbe({ net });
+const sessionOpsApi = createSessionOpsApi({
+  get sessions() { return sessions; },
+  get electronModule() { return electronModule; },
+  fs, path, os, exec, randomUUID, iconv, Buffer, process, console, setTimeout, clearTimeout,
+  getSessionDecoder, resetSessionDecoders, sessionEncodings, normalizeTerminalEncoding,
+  safeSend,
+  quoteShellArg, log, ensureMoshStatsConnection, ensureEtStatsConnection,
+  measureTcpConnectLatency,
+  execOnEtSession: (...args) => require("./terminalBridge.cjs").execOnEtSession(...args),
+  getServerStats: undefined,
+});
+const {
+  getSessionRemoteInfo,
+  getSessionDistroInfo,
+  readRemoteHistory,
+  getSessionPwd,
+  probeReceiveConflicts,
+  removeRemoteFiles,
+  restoreRemoteModes,
+  listSessionDir,
+  getServerStats,
+  setSessionEncoding,
+} = sessionOpsApi;
 
 /**
  * Register IPC handlers for SSH operations
  */
-function registerHandlers(ipcMain) {
-  ipcMain.handle("netcatty:start", startSSHSessionWrapper);
-  ipcMain.handle("netcatty:ssh:transport:start", startSSHTransportWrapper);
-  ipcMain.handle("netcatty:ssh:channel:open", openSSHChannel);
-  ipcMain.handle("netcatty:ssh:exec", execCommand);
-  ipcMain.handle("netcatty:ssh:pwd", getSessionPwd);
-  ipcMain.handle("netcatty:ssh:remoteInfo", getSessionRemoteInfo);
-  ipcMain.handle("netcatty:ssh:distroInfo", getSessionDistroInfo);
-  ipcMain.handle("netcatty:ssh:listdir", listSessionDir);
-  ipcMain.handle("netcatty:ssh:docker:check", checkDockerSessionSupport);
-  ipcMain.handle("netcatty:ssh:docker:listContainers", listDockerContainersForSession);
-  ipcMain.handle("netcatty:ssh:docker:listFiles", listDockerFilesForSession);
-  ipcMain.handle("netcatty:ssh:docker:readText", readDockerTextFile);
-  ipcMain.handle("netcatty:ssh:docker:writeText", writeDockerTextFile);
-  ipcMain.handle("netcatty:ssh:docker:downloadFile", downloadDockerFileHandler);
-  ipcMain.handle("netcatty:ssh:docker:downloadFileToTemp", downloadDockerFileToTemp);
-  ipcMain.handle("netcatty:ssh:docker:mkdir", mkdirDockerPath);
-  ipcMain.handle("netcatty:ssh:docker:createFile", createDockerFile);
-  ipcMain.handle("netcatty:ssh:docker:delete", deleteDockerPath);
-  ipcMain.handle("netcatty:ssh:docker:rename", renameDockerPath);
-  ipcMain.handle("netcatty:ssh:docker:pwd", getDockerContainerPwd);
-  ipcMain.handle("netcatty:ssh:stats", getServerStats);
+function registerWorkerHandle(ipcMain, terminalWorkerManager, channel) {
+  ipcMain.handle(channel, async (event, payload) => {
+    // SSH sessions run in utilityProcess; UDP-probe LAN access from the main
+    // process first so macOS can show the Local Network privacy alert for
+    // the Netcatty app bundle instead of silently denying the helper
+    // (#2663 / #2673 / TN3179). Mark the payload so the worker skips a
+    // second hold / probe in its own process.
+    let workerPayload = payload;
+    if (channel === "netcatty:start") {
+      const probeResult = await ensureMacLocalNetworkAccess(payload);
+      workerPayload = {
+        ...attachMacLocalNetworkProbeResult(
+          payload && typeof payload === "object" ? payload : {},
+          probeResult,
+        ),
+        _macLocalNetworkMainProbed: true,
+      };
+    }
+    return terminalWorkerManager.request(channel, workerPayload, {
+      webContentsId: event?.sender?.id,
+    });
+  });
+}
+
+function registerOwnedAuthResponseHandler(ipcMain, terminalWorkerManager, channel, mainProcessHandler) {
+  ipcMain.handle(channel, (event, payload) => {
+    if (mainProcessHandler.getRequests().has(payload?.requestId)) {
+      return mainProcessHandler.handleResponse(event, payload);
+    }
+    return terminalWorkerManager.request(channel, payload, {
+      webContentsId: event?.sender?.id,
+    });
+  });
+}
+
+function registerHandlers(ipcMain, options = {}) {
+  const terminalWorkerManager = options.terminalWorkerManager || null;
+  if (terminalWorkerManager) {
+    [
+      "netcatty:start",
+      "netcatty:ssh:exec",
+      "netcatty:ssh:pwd",
+      "netcatty:ssh:remoteInfo",
+      "netcatty:ssh:distroInfo",
+      "netcatty:ssh:readRemoteHistory",
+      "netcatty:ssh:listdir",
+      "netcatty:ssh:stats",
+      "netcatty:ssh:setEncoding",
+    ].forEach((channel) => registerWorkerHandle(ipcMain, terminalWorkerManager, channel));
+    registerOwnedAuthResponseHandler(
+      ipcMain,
+      terminalWorkerManager,
+      "netcatty:keyboard-interactive:respond",
+      keyboardInteractiveHandler,
+    );
+    registerOwnedAuthResponseHandler(
+      ipcMain,
+      terminalWorkerManager,
+      "netcatty:passphrase:respond",
+      passphraseHandler,
+    );
+    registerOwnedAuthResponseHandler(
+      ipcMain,
+      terminalWorkerManager,
+      "netcatty:host-key:respond",
+      hostKeyVerifier,
+    );
+    ipcMain.on("netcatty:zmodem:overwrite-response", (event, payload) => {
+      terminalWorkerManager.send("netcatty:zmodem:overwrite-response", payload, {
+        webContentsId: event?.sender?.id,
+      });
+    });
+  } else {
+    ipcMain.handle("netcatty:start", startSSHSessionWrapper);
+    ipcMain.handle("netcatty:ssh:exec", execCommand);
+    ipcMain.handle("netcatty:ssh:pwd", getSessionPwd);
+    ipcMain.handle("netcatty:ssh:remoteInfo", getSessionRemoteInfo);
+    ipcMain.handle("netcatty:ssh:distroInfo", getSessionDistroInfo);
+    ipcMain.handle("netcatty:ssh:readRemoteHistory", readRemoteHistory);
+    ipcMain.handle("netcatty:ssh:listdir", listSessionDir);
+    ipcMain.handle("netcatty:ssh:stats", getServerStats);
+    ipcMain.handle("netcatty:ssh:setEncoding", setSessionEncoding);
+    ipcMain.on("netcatty:zmodem:overwrite-response", (_event, payload) => {
+      const resolve = zmodemOverwritePending.get(payload?.requestId);
+      if (resolve) { zmodemOverwritePending.delete(payload.requestId); resolve(payload); }
+    });
+    // Register the shared keyboard-interactive response handler
+    keyboardInteractiveHandler.registerHandler(ipcMain);
+    // Register the passphrase response handler
+    passphraseHandler.registerHandler(ipcMain);
+    // Register the SSH host key verification response handler
+    hostKeyVerifier.registerHandler(ipcMain);
+  }
   ipcMain.handle("netcatty:key:generate", generateKeyPair);
-  ipcMain.handle("netcatty:ssh:setEncoding", setSessionEncoding);
-  ipcMain.handle("netcatty:ssh:check-agent", async () => {
-    return await checkWindowsSshAgent();
+  ipcMain.handle("netcatty:sshDebugLog:info", getSshDebugLogInfo);
+  ipcMain.handle("netcatty:sshDebugLog:openDir", openSshDebugLogDir);
+  ipcMain.handle("netcatty:ssh:check-agent", async (_event, options = {}) => {
+    const identityAgent = typeof options === "string" ? options : options.identityAgent;
+    if (process.platform === "win32" && !identityAgent) {
+      return await checkWindowsSshAgent();
+    }
+    const socketPath = options?.agentForwarding
+      ? await getAvailableForwardingAgentSocket(identityAgent, typeof options === "string" ? {} : options)
+      : await getAvailableSystemAgentSocket(identityAgent, typeof options === "string" ? {} : options);
+    return {
+      running: Boolean(socketPath),
+      startupType: socketPath ? "running" : "stopped",
+      error: socketPath ? null : "SSH Agent socket not connectable",
+    };
   });
   ipcMain.handle("netcatty:ssh:get-default-keys", async () => {
     const sshDir = path.join(os.homedir(), ".ssh");
@@ -3085,10 +1549,6 @@ function registerHandlers(ipcMain) {
     }
     return keys;
   });
-  // Register the shared keyboard-interactive response handler
-  keyboardInteractiveHandler.registerHandler(ipcMain);
-  // Register the passphrase response handler
-  passphraseHandler.registerHandler(ipcMain);
 }
 
 module.exports = {
@@ -3096,6 +1556,18 @@ module.exports = {
   registerHandlers,
   connectThroughChain,
   buildAlgorithms,
-  startSSHTransport,
-  openSSHChannel,
+  _resetAlgorithmSupportCacheForTests,
+  _appendSshDiagnosticLog: appendSshDiagnosticLog,
+  _createSshDiagnosticLogger: createSshDiagnosticLogger,
+  _getSshDebugLogFilePath: getSshDebugLogFilePath,
+  _setSshDebugLoggingEnabled: setSshDebugLoggingEnabled,
+  _shouldLogSshDebugMessage: shouldLogSshDebugMessage,
+  // Exposed for the default-key dedupe characterization test (the connect path
+  // derives the preferred default key from findAllDefaultPrivateKeys()[0]).
+  _findDefaultPrivateKey: findDefaultPrivateKey,
+  _findAllDefaultPrivateKeys: findAllDefaultPrivateKeys,
+  _isStrictAgentAuthFailure: isStrictAgentAuthFailure,
+  _canRetryWithEncryptedDefaultKeys: canRetryWithEncryptedDefaultKeys,
+  _canFailedHopRetryWithEncryptedDefaultKeys: canFailedHopRetryWithEncryptedDefaultKeys,
+  ensureMoshStatsConnection,
 };

@@ -1,11 +1,11 @@
-import type {
-  DockerContainerSummary,
-  DockerSessionSupportResult,
-  RemoteFile,
-  SftpFilenameEncoding,
-} from "./types";
-import type { S3Config, SyncedFile, WebDAVConfig } from "./domain/sync";
-
+/// <reference path="./types/global/netcatty-bridge-session.d.ts" />
+/// <reference path="./types/global/netcatty-bridge-sftp.d.ts" />
+/// <reference path="./types/global/netcatty-bridge-sync.d.ts" />
+/// <reference path="./types/global/netcatty-bridge-files.d.ts" />
+/// <reference path="./types/global/netcatty-bridge-ai.d.ts" />
+/// <reference path="./types/global/netcatty-bridge-app.d.ts" />
+/// <reference path="./types/global/netcatty-bridge-system.d.ts" />
+/// <reference path="./types/global/netcatty-bridge-script.d.ts" />
 declare module "*.cjs" {
   const value: Record<string, unknown>;
   export = value;
@@ -20,9 +20,10 @@ declare module 'react' {
 declare global {
   // Proxy configuration for SSH connections
   interface NetcattyProxyConfig {
-    type: 'http' | 'socks5';
+    type: 'http' | 'socks5' | 'command';
     host: string;
     port: number;
+    command?: string;
     username?: string;
     password?: string;
   }
@@ -40,18 +41,45 @@ declare global {
   // Jump host configuration for SSH tunneling
   interface NetcattyJumpHost {
     hostname: string;
+    hostId?: string;
     port: number;
     username: string;
+    authMethod?: import("./domain/models").HostAuthMethod;
+    requiresMfa?: boolean;
     password?: string;
     privateKey?: string;
     certificate?: string;
     passphrase?: string;
     publicKey?: string;
     keyId?: string;
-    keySource?: 'generated' | 'imported';
+    keySource?: 'generated' | 'imported' | 'reference';
     label?: string; // Display label for UI
     proxy?: NetcattyProxyConfig;
     identityFilePaths?: string[];
+    useSshAgent?: boolean;
+    agentPublicKeys?: string[];
+    identityAgent?: string;
+    identitiesOnly?: boolean;
+    addKeysToAgent?: string;
+    useKeychain?: boolean;
+    // ET server port on this hop, used only when ET tunnels through it as a
+    // jump host (--jport). Defaults to 2022 in the bridge when omitted.
+    etPort?: number;
+    // Resolved keepalive for THIS hop (caller has already applied host
+    // override / global fallback). interval in seconds, 0 = disabled.
+    keepaliveInterval?: number;
+    keepaliveCountMax?: number;
+    // Per-hop SSH connection timeouts, resolved from the saved host.
+    sshTcpConnectTimeoutMs?: number;
+    sshAuthReadyTimeoutMs?: number;
+    verifyHostKeys?: boolean;
+    // Per-hop algorithm settings, mirroring the target-host fields. When
+    // omitted the bridge falls back to the target host's settings so a
+    // single setting on the leaf still covers the chain (matches the
+    // pre-existing behavior of `legacyAlgorithms`).
+    legacyAlgorithms?: boolean;
+    skipEcdsaHostKey?: boolean;
+    algorithmOverrides?: import("./domain/models").HostAlgorithmOverrides;
   }
 
   // Host key information for verification
@@ -66,9 +94,12 @@ declare global {
 
   interface NetcattySSHOptions {
     sessionId?: string;
+    hostId?: string;
     hostLabel?: string;
     hostname: string;
     username: string;
+    authMethod?: import("./domain/models").HostAuthMethod;
+    requiresMfa?: boolean;
     port?: number;
     password?: string;
     privateKey?: string;
@@ -76,14 +107,18 @@ declare global {
     certificate?: string;
     publicKey?: string; // OpenSSH public key line
     keyId?: string;
-    keySource?: 'generated' | 'imported';
+    keySource?: 'generated' | 'imported' | 'reference';
     agentForwarding?: boolean;
+    x11Forwarding?: boolean;
+    x11Display?: string;
     cols?: number;
     rows?: number;
     charset?: string;
     extraArgs?: string[];
     startupCommand?: string;
     passphrase?: string;
+    knownHosts?: import("./domain/models").KnownHost[];
+    verifyHostKeys?: boolean;
     // Environment variables to set in the remote shell
     env?: Record<string, string>;
     // Proxy configuration
@@ -92,26 +127,52 @@ declare global {
     jumpHosts?: NetcattyJumpHost[];
     // SSH-level keepalive interval in seconds (0 = disabled)
     keepaliveInterval?: number;
+    // Unanswered keepalives before ssh2 declares the connection dead
+    keepaliveCountMax?: number;
+    // Maximum time to establish the TCP connection
+    sshTcpConnectTimeoutMs?: number;
+    // Maximum time for SSH handshake and authentication
+    sshAuthReadyTimeoutMs?: number;
     // Enable legacy SSH algorithms for older network equipment
     legacyAlgorithms?: boolean;
+    // Drop ecdsa-sha2-* from offered host-key algorithms (#1027)
+    skipEcdsaHostKey?: boolean;
+    // Per-category algorithm override lists (advanced, see HostAlgorithmOverrides)
+    algorithmOverrides?: import("./domain/models").HostAlgorithmOverrides;
     // Use sudo for SFTP server
     sudo?: boolean;
+    // Remote file protocol: auto (SFTP then SCP fallback) | sftp | scp
+    fileProtocol?: 'auto' | 'sftp' | 'scp';
+    // Saved host password used by background system tools when they need sudo.
+    sudoAutofillPassword?: string;
     // Session log configuration for real-time streaming
-    sessionLog?: { enabled: boolean; directory: string; format: string };
+    sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
+    // SSH connection diagnostics. Does not capture terminal output.
+    sshDebugLogEnabled?: boolean;
+    // Boot generation for correlating host-key prompts with a terminal start.
+    bootEpoch?: number;
     // Local SSH key file paths (from SSH config IdentityFile)
     identityFilePaths?: string[];
-  }
-
-  interface NetcattySSHChannelOptions {
-    transportId: string;
-    sessionId?: string;
-    channelId?: string;
-    cols?: number;
-    rows?: number;
-    charset?: string;
-    startupCommand?: string;
-    env?: Record<string, string>;
-    sessionLog?: { enabled: boolean; directory: string; format: string };
+    useSshAgent?: boolean;
+    agentPublicKeys?: string[];
+    identityAgent?: string;
+    identitiesOnly?: boolean;
+    addKeysToAgent?: string;
+    useKeychain?: boolean;
+    // When set, reuse the already-authenticated SSH connection of this existing
+    // session by opening a new shell channel on it, instead of dialing a fresh
+    // connection. Lets a duplicated tab skip a second MFA prompt (issue #1204).
+    // The bridge falls back to a fresh connection if the source is gone.
+    sourceSessionId?: string;
+    // Skip POSIX process discovery when copying a network-device session.
+    skipShellPidDiscovery?: boolean;
+    /**
+     * When false, terminal/SFTP opens must dial a fresh SSH connection and
+     * must not borrow a live, parked, or in-flight registry transport. Used by
+     * connect-time terminal automation and dedicated bulk transfers.
+     * Default true (normal terminal, browse, and MFA-skip reuse).
+     */
+    reuseTransport?: boolean;
   }
 
   interface SftpStatResult {
@@ -133,6 +194,7 @@ declare global {
 
   // Port Forwarding Types
   interface PortForwardOptions {
+    ruleId?: string;
     tunnelId: string;
     type: 'local' | 'remote' | 'dynamic';
     localPort: number;
@@ -141,23 +203,45 @@ declare global {
     remotePort?: number;
     // SSH connection details
     hostname: string;
+    hostId?: string;
     port?: number;
     username: string;
+    authMethod?: import("./domain/models").HostAuthMethod;
+    requiresMfa?: boolean;
     password?: string;
     privateKey?: string;
     certificate?: string;
     keyId?: string;
     passphrase?: string;
+    knownHosts?: import("./domain/models").KnownHost[];
+    verifyHostKeys?: boolean;
     proxy?: NetcattyProxyConfig;
     jumpHosts?: NetcattyJumpHost[];
     identityFilePaths?: string[];
+    useSshAgent?: boolean;
+    agentPublicKeys?: string[];
+    identityAgent?: string;
+    identitiesOnly?: boolean;
+    addKeysToAgent?: string;
+    useKeychain?: boolean;
     legacyAlgorithms?: boolean;
+    skipEcdsaHostKey?: boolean;
+    algorithmOverrides?: import("./domain/models").HostAlgorithmOverrides;
+    // Resolved keepalive for the target connection (caller has already
+    // applied host override / global fallback). interval in seconds.
+    keepaliveInterval?: number;
+    keepaliveCountMax?: number;
+    sshTcpConnectTimeoutMs?: number;
+    sshAuthReadyTimeoutMs?: number;
   }
 
   interface PortForwardResult {
     tunnelId: string;
     success: boolean;
     cancelled?: boolean;
+    blockedByCleanup?: boolean;
+    reused?: boolean;
+    status?: 'inactive' | 'connecting' | 'active' | 'error';
     error?: string;
   }
 
@@ -168,889 +252,466 @@ declare global {
     error?: string;
   }
 
+  type PortForwardRuntimePhase =
+    | 'connecting'
+    | 'active'
+    | 'stopping'
+    | 'error'
+    | 'inactive';
+
+  interface PortForwardRuntimeRecord {
+    ruleId?: string;
+    tunnelId: string;
+    phase: PortForwardRuntimePhase | string;
+    error?: string;
+    cleanupRequired?: boolean;
+    revision: number;
+    updatedAt: number;
+  }
+
+  interface PortForwardRuntimeSnapshot {
+    epoch: string;
+    revision: number;
+    records: PortForwardRuntimeRecord[];
+  }
+
+  type PortForwardRuntimeEvent =
+    | {
+        epoch: string;
+        revision: number;
+        kind: 'upsert';
+        record: PortForwardRuntimeRecord;
+      }
+    | {
+        epoch: string;
+        revision: number;
+        kind: 'remove';
+        tunnelId: string;
+        ruleId?: string;
+      };
+
   interface NetcattyWindowsPtyInfo {
     backend: 'conpty' | 'winpty';
     buildNumber?: number;
   }
 
   type PortForwardStatusCallback = (status: 'inactive' | 'connecting' | 'active' | 'error', error?: string) => void;
+  type PortForwardRuntimeEventCallback = (event: PortForwardRuntimeEvent) => void;
+
+  interface NetcattyPluginRuntimeStatus {
+    available: boolean;
+    experimental: true;
+  }
+
+  interface NetcattyInstalledPlugin {
+    id: string;
+    enabled: boolean;
+    activeVersion: string | null;
+    manifest: unknown;
+    runtime: {
+      status: string;
+      kind: 'browser' | 'utility' | null;
+      lastError: string | null;
+      quarantinedAt: number | null;
+    };
+  }
+
+  interface NetcattyExtensionProviderContribution {
+    pluginId: string;
+    pluginVersion: string;
+    pluginDisplayName?: string;
+    provider: import("@netcatty/plugin-contract").ProviderContribution;
+  }
+
+  interface NetcattyExtensionProviderRequest {
+    providerId: string;
+    kind: 'connection' | 'authentication' | 'importer';
+    operation: string;
+    requestId?: string;
+    payload?: import("@netcatty/plugin-contract").JsonValue;
+    deadlineMs?: number;
+  }
+
+  interface NetcattyPluginConnectionStartRequest {
+    requestId?: string;
+    sessionId: string;
+    protocol?: string;
+    hostLabel?: string;
+    hostname?: string;
+    providerId: string;
+    configuration: import("@netcatty/plugin-contract").JsonValue;
+    columns: number;
+    rows: number;
+    credential?: import("@netcatty/plugin-contract").CredentialRef | import("@netcatty/plugin-contract").SecretRef;
+    authenticationProviderId?: string;
+    sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
+    deadlineMs?: number;
+  }
+
+  interface NetcattyPluginImporterPreview {
+    providerId: string;
+    result: import("@netcatty/plugin-contract").ImporterParseResult;
+    records: ReadonlyArray<import("@netcatty/plugin-contract").ImporterRecord>;
+  }
+
+  interface NetcattyPluginImporterProgressEvent {
+    requestId: string;
+    providerId: string;
+    progress: Extract<import("@netcatty/plugin-contract").ImporterRecord, { type: "progress" }>;
+  }
+
+  interface NetcattyPluginAuthenticationChallengeOpenEvent {
+    requestId: string;
+    challengeRequestId: string;
+    challenge: import("@netcatty/plugin-contract").AuthenticationChallenge;
+  }
+
+  interface NetcattyPluginAuthenticationChallengeCancelEvent {
+    requestId: string;
+    challengeRequestId: string;
+    challengeId?: string;
+    cancelled: true;
+  }
+
+  type NetcattyPluginAuthenticationChallengeEvent =
+    | NetcattyPluginAuthenticationChallengeOpenEvent
+    | NetcattyPluginAuthenticationChallengeCancelEvent;
 
   interface NetcattyBridge {
-    getWindowsPtyInfo?(): NetcattyWindowsPtyInfo | null;
-    startSSHSession(options: NetcattySSHOptions): Promise<string>;
-    startSSHTransport?(options: NetcattySSHOptions): Promise<{
-      transportId: string;
-      remoteSshVersion?: string;
+    getPluginRuntimeStatus?(): Promise<NetcattyPluginRuntimeStatus>;
+    listPlugins?(): Promise<NetcattyInstalledPlugin[]>;
+    installPluginPackage?(archivePath: string, options?: { enable?: boolean }): Promise<NetcattyInstalledPlugin>;
+    setPluginEnabled?(pluginId: string, enabled: boolean): Promise<NetcattyInstalledPlugin>;
+    restartPlugin?(pluginId: string): Promise<NetcattyInstalledPlugin>;
+    uninstallPlugin?(pluginId: string): Promise<boolean>;
+    getPluginContributions?(options?: NetcattyPluginContributionQuery): Promise<NetcattyPluginContributionSnapshot>;
+    getPluginContributionIcon?(pluginId: string, icon: Extract<NetcattyPluginIconReference, { kind: 'package' }>): Promise<{ light: string; dark?: string }>;
+    executePluginCommand?(command: string, args?: unknown, context?: Record<string, unknown>): Promise<unknown>;
+    updatePluginSetting?(pluginId: string, settingId: string, value: unknown, scopeId?: string): Promise<{ restartRequired: boolean }>;
+    resetPluginSetting?(pluginId: string, settingId: string, scopeId?: string): Promise<{ restartRequired: boolean }>;
+    setPluginEnvironment?(environment: NetcattyPluginEnvironment): Promise<void>;
+    listPluginTerminalProviders?(options: NetcattyTerminalProviderQuery): Promise<ReadonlyArray<NetcattyTerminalProviderContribution>>;
+    providePluginTerminal?(request: NetcattyTerminalProviderRequest): Promise<ReadonlyArray<NetcattyTerminalProviderResult>>;
+    cancelPluginTerminalRequest?(requestId: string): Promise<boolean>;
+    publishPluginTerminalSessionEvent?(event: NetcattyTerminalSessionEvent): Promise<ReadonlyArray<{ pluginId: string; delivered: boolean }>>;
+    listPluginExtensionProviders?(options: { kind: 'connection' | 'authentication' | 'importer' | 'sync'; locale?: string }): Promise<ReadonlyArray<NetcattyExtensionProviderContribution>>;
+    updatePluginCredentialCatalog?(entries: ReadonlyArray<{ id: string; ciphertext: string }>): Promise<number>;
+    invokePluginExtensionProvider?(request: NetcattyExtensionProviderRequest): Promise<import("@netcatty/plugin-contract").JsonValue>;
+    cancelPluginExtensionRequest?(requestId: string): Promise<boolean>;
+    pluginSyncConnect?(request: {
+      requestId?: string;
+      providerId: string;
+      configuration?: unknown;
+      credential?: unknown;
+      deadlineMs?: number;
+    }): Promise<{ account: { id: string; email?: string; name?: string; avatarUrl?: string } }>;
+    pluginSyncDisconnect?(request: { requestId?: string; providerId: string; deadlineMs?: number }): Promise<null>;
+    pluginSyncGetAccount?(request: { requestId?: string; providerId: string; deadlineMs?: number }): Promise<{
+      account: { id: string; email?: string; name?: string; avatarUrl?: string } | null;
     }>;
-    openSSHChannel?(options: NetcattySSHChannelOptions): Promise<{
-      sessionId: string;
-      channelId: string;
-      transportId: string;
+    pluginSyncGetCapabilities?(request: { requestId?: string; providerId: string; deadlineMs?: number }): Promise<{
+      revisions: boolean;
+      conditionalWrites: boolean;
+      atomicReplacement: boolean;
+      maxObjectBytes?: number;
+      maxObjects?: number;
     }>;
-    startTelnetSession?(options: {
-      sessionId?: string;
-      hostname: string;
-      port?: number;
-      cols?: number;
-      rows?: number;
-      charset?: string;
-      env?: Record<string, string>;
-      sessionLog?: { enabled: boolean; directory: string; format: string };
-    }): Promise<string>;
-    startMoshSession?(options: {
-      sessionId?: string;
-      hostname: string;
-      username?: string;
-      port?: number;
-      moshServerPath?: string;
-      agentForwarding?: boolean;
-      cols?: number;
-      rows?: number;
-      charset?: string;
-      env?: Record<string, string>;
-      sessionLog?: { enabled: boolean; directory: string; format: string };
-    }): Promise<string>;
-    startLocalSession?(options: { sessionId?: string; cols?: number; rows?: number; shell?: string; shellArgs?: string[]; cwd?: string; env?: Record<string, string>; sessionLog?: { enabled: boolean; directory: string; format: string } }): Promise<string>;
-    startSerialSession?(options: {
-      sessionId?: string;
-      path: string;
-      baudRate?: number;
-      dataBits?: 5 | 6 | 7 | 8;
-      stopBits?: 1 | 1.5 | 2;
-      parity?: 'none' | 'even' | 'odd' | 'mark' | 'space';
-      flowControl?: 'none' | 'xon/xoff' | 'rts/cts';
-      charset?: string;
-      sessionLog?: { enabled: boolean; directory: string; format: string };
-    }): Promise<string>;
-    listSerialPorts?(): Promise<Array<{
-      path: string;
-      manufacturer: string;
-      serialNumber: string;
-      vendorId: string;
-      productId: string;
-      pnpId: string;
-    }>>;
-    getDefaultShell?(): Promise<string>;
-    discoverShells?(): Promise<DiscoveredShell[]>;
-    validatePath?(path: string, type?: 'file' | 'directory' | 'any'): Promise<{ exists: boolean; isFile: boolean; isDirectory: boolean }>;
-    generateKeyPair?(options: {
-      type: 'RSA' | 'ECDSA' | 'ED25519';
-      bits?: number;
-      comment?: string;
-    }): Promise<{ success: boolean; privateKey?: string; publicKey?: string; error?: string }>;
-    checkSshAgent?(): Promise<{ running: boolean; startupType: string | null; error: string | null }>;
-    getDefaultKeys?(): Promise<Array<{ name: string; path: string }>>;
-    execCommand(options: {
-      hostname: string;
-      username: string;
-      port?: number;
-      password?: string;
-      privateKey?: string;
-      passphrase?: string;
-      command: string;
-      timeout?: number;
-      enableKeyboardInteractive?: boolean;
-      sessionId?: string;
-    }): Promise<{ stdout: string; stderr: string; code: number | null }>;
-    /** Get current working directory from an active SSH session */
-    getSessionPwd?(sessionId: string): Promise<{ success: boolean; cwd?: string; error?: string }>;
-    /**
-     * Get metadata about an already-connected SSH session — currently the
-     * SSH server identification string (the `software` part of the
-     * SSH-2.0 banner). Used to classify network-device vendors from the
-     * banner without opening any additional exec channel.
-     */
-    getSessionRemoteInfo?(sessionId: string): Promise<{
-      success: boolean;
-      remoteSshVersion?: string;
-      error?: string;
-    }>;
-    /**
-     * Probe the remote distro by running
-     * `cat /etc/os-release 2>/dev/null || uname -a` on the existing SSH
-     * connection's exec channel (not a brand-new connection). Used as a
-     * fallback when banner classification could not identify a network
-     * device vendor and we still want a distro-specific icon.
-     */
-    getSessionDistroInfo?(sessionId: string): Promise<{
-      success: boolean;
-      stdout?: string;
-      stderr?: string;
-      error?: string;
-    }>;
-    /** Get server stats (CPU, Memory, Disk, Network) from an active SSH session */
-    getServerStats?(sessionId: string): Promise<{
-      success: boolean;
-      error?: string;
-      stats?: {
-        cpu: number | null;           // CPU usage percentage (0-100)
-        cpuCores: number | null;      // Number of CPU cores
-        cpuPerCore: number[];         // Per-core CPU usage array
-        memTotal: number | null;      // Total memory in MB
-        memUsed: number | null;       // Used memory in MB (excluding buffers/cache)
-        memFree: number | null;       // Free memory in MB
-        memBuffers: number | null;    // Buffers in MB
-        memCached: number | null;     // Cached in MB
-        swapTotal: number | null;     // Total swap in MB
-        swapUsed: number | null;      // Used swap in MB
-        topProcesses: Array<{         // Top 10 processes by memory
-          pid: string;
-          memPercent: number;
-          command: string;
-        }>;
-        diskPercent: number | null;   // Disk usage percentage for root partition
-        diskUsed: number | null;      // Disk used in GB
-        diskTotal: number | null;     // Total disk in GB
-        disks: Array<{                // All mounted disks
-          mountPoint: string;
-          used: number;               // Used in GB
-          total: number;              // Total in GB
-          percent: number;            // Usage percentage
-        }>;
-        netRxSpeed: number;           // Total network receive speed (bytes/sec)
-        netTxSpeed: number;           // Total network transmit speed (bytes/sec)
-        netInterfaces: Array<{        // Per-interface network stats
-          name: string;               // Interface name (e.g., eth0, ens33)
-          rxBytes: number;            // Total received bytes
-          txBytes: number;            // Total transmitted bytes
-          rxSpeed: number;            // Receive speed (bytes/sec)
-          txSpeed: number;            // Transmit speed (bytes/sec)
-        }>;
-      };
-    }>;
-    setSessionEncoding?(sessionId: string, encoding: string): Promise<{ ok: boolean; encoding: string }>;
-    writeToSession(sessionId: string, data: string): void;
-    resizeSession(sessionId: string, cols: number, rows: number): void;
-    closeSession(sessionId: string): void;
-    // ZMODEM file transfer
-    onZmodemEvent?(
-      sessionId: string,
-      cb: (event: {
-        type: 'detect' | 'progress' | 'complete' | 'error';
-        sessionId: string;
-        transferType?: 'upload' | 'download';
-        filename?: string;
-        transferred?: number;
-        total?: number;
-        fileIndex?: number;
-        fileCount?: number;
-        finalizing?: boolean;
-        error?: string;
-      }) => void
-    ): () => void;
-    cancelZmodem?(sessionId: string): void;
-    onSessionData(sessionId: string, cb: (data: string) => void): () => void;
-    onSessionExit(
-      sessionId: string,
-      cb: (evt: { exitCode?: number; signal?: number; error?: string; reason?: "exited" | "error" | "timeout" | "closed" }) => void
-    ): () => void;
-    onAuthFailed?(
-      sessionId: string,
-      cb: (evt: { sessionId: string; error: string; hostname: string }) => void
-    ): () => void;
-
-    // Keyboard-interactive authentication (2FA/MFA)
-    onKeyboardInteractive?(
-      cb: (request: {
-        requestId: string;
-        sessionId: string;
-        name: string;
-        instructions: string;
-        prompts: Array<{ prompt: string; echo: boolean }>;
-        hostname: string;
-        savedPassword?: string | null;
-      }) => void
-    ): () => void;
-    respondKeyboardInteractive?(
-      requestId: string,
-      responses: string[],
-      cancelled?: boolean
-    ): Promise<{ success: boolean; error?: string }>;
-
-    // Passphrase request for encrypted SSH keys
-    onPassphraseRequest?(
-      cb: (request: {
-        requestId: string;
-        keyPath: string;
-        keyName: string;
-        hostname?: string;
-      }) => void
-    ): () => void;
-    respondPassphrase?(
-      requestId: string,
-      passphrase: string,
-      cancelled?: boolean
-    ): Promise<{ success: boolean; error?: string }>;
-    respondPassphraseSkip?(
-      requestId: string
-    ): Promise<{ success: boolean; error?: string }>;
-    onPassphraseTimeout?(
-      cb: (event: { requestId: string }) => void
-    ): () => void;
-
-    // SFTP operations
-    openSftp(options: NetcattySSHOptions): Promise<string>;
-    openSftpForSession?(sessionId: string, options?: { timeoutMs?: number }): Promise<string>;
-    dockerCheckSessionSupport?(sessionId: string): Promise<DockerSessionSupportResult>;
-    dockerListContainersForSession?(sessionId: string): Promise<DockerContainerSummary[]>;
-    dockerListFilesForSession?(sessionId: string, containerId: string, path: string): Promise<RemoteFile[]>;
-    dockerReadTextFile?(sessionId: string, containerId: string, path: string): Promise<string>;
-    dockerWriteTextFile?(sessionId: string, containerId: string, path: string, content: string): Promise<void>;
-    dockerDownloadFile?(sessionId: string, containerId: string, remotePath: string, localPath: string): Promise<{ localPath: string }>;
-    dockerDownloadFileToTemp?(sessionId: string, containerId: string, remotePath: string, fileName: string): Promise<{ localPath: string }>;
-    dockerCreateDirectory?(sessionId: string, containerId: string, path: string): Promise<void>;
-    dockerCreateFile?(sessionId: string, containerId: string, path: string): Promise<void>;
-    dockerDeletePath?(sessionId: string, containerId: string, path: string): Promise<void>;
-    dockerRenamePath?(sessionId: string, containerId: string, oldPath: string, newPath: string): Promise<void>;
-    dockerGetContainerPwd?(sessionId: string, containerId: string): Promise<{ success: boolean; cwd?: string; error?: string }>;
-    listSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<RemoteFile[]>;
-    readSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<string>;
-    readSftpBinary?(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<ArrayBuffer>;
-    writeSftp(sftpId: string, path: string, content: string, encoding?: SftpFilenameEncoding): Promise<void>;
-    writeSftpBinary?(sftpId: string, path: string, content: ArrayBuffer, encoding?: SftpFilenameEncoding): Promise<void>;
-    closeSftp(sftpId: string): Promise<void>;
-    mkdirSftp(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<void>;
-    deleteSftp?(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<void>;
-    renameSftp?(sftpId: string, oldPath: string, newPath: string, encoding?: SftpFilenameEncoding): Promise<void>;
-    statSftp?(sftpId: string, path: string, encoding?: SftpFilenameEncoding): Promise<SftpStatResult>;
-    chmodSftp?(sftpId: string, path: string, mode: string, encoding?: SftpFilenameEncoding): Promise<void>;
-    getSftpHomeDir?(sftpId: string): Promise<{ success: boolean; homeDir?: string; error?: string }>;
-
-    // Write binary with real-time progress callback
-    writeSftpBinaryWithProgress?(
-      sftpId: string,
-      path: string,
-      content: ArrayBuffer,
-      transferId: string,
-      encoding?: SftpFilenameEncoding,
-      onProgress?: (transferred: number, total: number, speed: number) => void,
-      onComplete?: () => void,
-      onError?: (error: string) => void
-    ): Promise<{ success: boolean; transferId: string; cancelled?: boolean }>;
-
-    // Cancel an in-progress SFTP upload
-    cancelSftpUpload?(transferId: string): Promise<{ success: boolean }>;
-
-    // Transfer with progress
-    uploadFile?(sftpId: string, localPath: string, remotePath: string, transferId: string): Promise<void>;
-    downloadFile?(sftpId: string, remotePath: string, localPath: string, transferId: string): Promise<void>;
-    cancelTransfer?(transferId: string): Promise<void>;
-    sameHostCopyDirectory?(sftpId: string, sourcePath: string, targetPath: string, encoding?: SftpFilenameEncoding, transferId?: string): Promise<{ success: boolean }>;
-
-    // Compressed folder upload
-    startCompressedUpload?(
-      options: {
-        compressionId: string;
-        folderPath: string;
-        targetPath: string;
-        sftpId: string;
-        folderName: string;
-      },
-      onProgress?: (phase: string, transferred: number, total: number) => void,
-      onComplete?: () => void,
-      onError?: (error: string) => void
-    ): Promise<{ compressionId: string; success?: boolean; error?: string }>;
-    cancelCompressedUpload?(compressionId: string): Promise<{ success: boolean }>;
-    checkCompressedUploadSupport?(sftpId: string): Promise<{
-      supported: boolean;
-      localTar: boolean;
-      remoteTar: boolean;
-      error?: string;
-    }>;
-
-    onTransferProgress?(transferId: string, cb: (progress: SftpTransferProgress) => void): () => void;
-
-    // Streaming transfer with real progress and cancellation
-    startStreamTransfer?(
-      options: {
-        transferId: string;
-        sourcePath: string;
-        targetPath: string;
-        sourceType: 'local' | 'sftp';
-        targetType: 'local' | 'sftp';
-        sourceSftpId?: string;
-        targetSftpId?: string;
-        totalBytes?: number;
-        sourceEncoding?: SftpFilenameEncoding;
-        targetEncoding?: SftpFilenameEncoding;
-        sameHost?: boolean;
-      },
-      onProgress?: (transferred: number, total: number, speed: number) => void,
-      onComplete?: () => void,
-      onError?: (error: string) => void
-    ): Promise<{ transferId: string; totalBytes?: number; error?: string }>;
-
-    // Local filesystem operations
-    listLocalDir?(path: string): Promise<RemoteFile[]>;
-    readLocalFile?(path: string): Promise<ArrayBuffer>;
-    writeLocalFile?(path: string, content: ArrayBuffer): Promise<void>;
-    deleteLocalFile?(path: string): Promise<void>;
-    renameLocalFile?(oldPath: string, newPath: string): Promise<void>;
-    mkdirLocal?(path: string): Promise<void>;
-    statLocal?(path: string): Promise<SftpStatResult>;
-    getHomeDir?(): Promise<string>;
-    getSystemInfo?(): Promise<{ username: string; hostname: string }>;
-
-    setTheme?(theme: 'light' | 'dark' | 'system'): Promise<boolean>;
-    setBackgroundColor?(color: string): Promise<boolean>;
-    setLanguage?(language: string): Promise<boolean>;
-    // Window controls for custom title bar (Windows/Linux)
-    windowMinimize?(): Promise<void>;
-    windowMaximize?(): Promise<boolean>;
-    windowClose?(): Promise<void>;
-    windowIsMaximized?(): Promise<boolean>;
-    windowIsFullscreen?(): Promise<boolean>;
-    onWindowFullScreenChanged?(cb: (isFullscreen: boolean) => void): () => void;
-
-    // Settings window
-    openSettingsWindow?(): Promise<boolean>;
-    closeSettingsWindow?(): Promise<void>;
-
-    // Cross-window settings sync
-    notifySettingsChanged?(payload: { key: string; value: unknown }): void;
-    onSettingsChanged?(cb: (payload: { key: string; value: unknown }) => void): () => void;
-
-    // Cloud sync master password (stored in-memory + persisted via Electron safeStorage)
-    cloudSyncSetSessionPassword?(password: string): Promise<boolean>;
-    cloudSyncGetSessionPassword?(): Promise<string | null>;
-    cloudSyncClearSessionPassword?(): Promise<boolean>;
-
-    // Cloud sync network operations (proxied via main process)
-    cloudSyncWebdavInitialize?(config: WebDAVConfig): Promise<{ resourceId: string | null }>;
-    cloudSyncWebdavUpload?(
-      config: WebDAVConfig,
-      syncedFile: SyncedFile
-    ): Promise<{ resourceId: string }>;
-    cloudSyncWebdavDownload?(config: WebDAVConfig): Promise<{ syncedFile: SyncedFile | null }>;
-    cloudSyncWebdavDelete?(config: WebDAVConfig): Promise<{ ok: true }>;
-
-    cloudSyncS3Initialize?(config: S3Config): Promise<{ resourceId: string | null }>;
-    cloudSyncS3Upload?(
-      config: S3Config,
-      syncedFile: SyncedFile
-    ): Promise<{ resourceId: string }>;
-    cloudSyncS3Download?(config: S3Config): Promise<{ syncedFile: SyncedFile | null }>;
-    cloudSyncS3Delete?(config: S3Config): Promise<{ ok: true }>;
-
-    // Port Forwarding
-    startPortForward?(options: PortForwardOptions): Promise<PortForwardResult>;
-    stopPortForward?(tunnelId: string): Promise<PortForwardResult>;
-    getPortForwardStatus?(tunnelId: string): Promise<PortForwardStatusResult>;
-    listPortForwards?(): Promise<{ tunnelId: string; type: string; status: string }[]>;
-    stopAllPortForwards?(): Promise<void>;
-    stopPortForwardByRuleId?(ruleId: string): Promise<{ stopped: number }>;
-    onPortForwardStatus?(tunnelId: string, cb: PortForwardStatusCallback): () => void;
-
-    // Known Hosts
-    readKnownHosts?(): Promise<string | null>;
-
-    // Open URL in default browser. Resolves when the URL is handled by
-    // either the system browser or the in-app fallback BrowserWindow.
-    // Rejects only in the rare case where both paths fail.
-    openExternal?(url: string): Promise<void>;
-
-    // App info (name/version/platform) for About screens
-    getAppInfo?(): Promise<{ name: string; version: string; platform: string }>;
-    ptyGetChildProcesses?(sessionId: string): Promise<Array<{ pid: number; command: string }>>;
-    confirmCloseBusy?(payload: {
-      command: string;
-      title?: string;
-      message?: string;
-      cancelLabel?: string;
-      closeLabel?: string;
-    }): Promise<boolean>;
-    getVaultBackupCapabilities?(): Promise<{ encryptionAvailable: boolean }>;
-    createVaultBackup?(payload: {
-      payload: import('./domain/sync').SyncPayload;
-      reason: 'app_version_change' | 'before_restore';
-      sourceAppVersion?: string;
-      targetAppVersion?: string;
-      maxCount?: number;
+    pluginSyncReadObject?(request: {
+      requestId?: string;
+      providerId: string;
+      key: string;
+      preferStream?: boolean;
+      deadlineMs?: number;
     }): Promise<{
-      created: boolean;
-      backup: {
-        id: string;
-        createdAt: number;
-        reason: 'app_version_change' | 'before_restore';
-        sourceAppVersion?: string;
-        targetAppVersion?: string;
-        fingerprint: string;
-        preview: {
-          hostCount: number;
-          keyCount: number;
-          snippetCount: number;
-          identityCount: number;
-          portForwardingRuleCount: number;
-        };
-      } | null;
+      found: boolean;
+      key: string;
+      data?: Uint8Array | null;
+      streamed?: boolean;
+      transferId?: string;
+      byteLength?: number;
+      revision?: string;
+      contentType?: string;
     }>;
-    listVaultBackups?(): Promise<Array<{
-      id: string;
-      createdAt: number;
-      reason: 'app_version_change' | 'before_restore';
-      sourceAppVersion?: string;
-      targetAppVersion?: string;
-      fingerprint: string;
-      preview: {
-        hostCount: number;
-        keyCount: number;
-        snippetCount: number;
-        identityCount: number;
-        portForwardingRuleCount: number;
-      };
-    }>>;
-    readVaultBackup?(payload: { id: string }): Promise<{
-      backup: {
-        id: string;
-        createdAt: number;
-        reason: 'app_version_change' | 'before_restore';
-        sourceAppVersion?: string;
-        targetAppVersion?: string;
-        fingerprint: string;
-        preview: {
-          hostCount: number;
-          keyCount: number;
-          snippetCount: number;
-          identityCount: number;
-          portForwardingRuleCount: number;
-        };
-      };
-      payload: import('./domain/sync').SyncPayload;
-    }>;
-    trimVaultBackups?(payload: { maxCount: number }): Promise<{ deletedCount: number; keptCount: number }>;
-    openVaultBackupDir?(): Promise<{ success: boolean; path: string }>;
-    // Subscribe to main-process-driven "vault backups changed" events.
-    // Returns an unsubscribe callback. Undefined in non-Electron builds.
-    onVaultBackupsChanged?(handler: () => void): () => void;
-
-    // Notify main process the renderer has mounted/painted (used to avoid initial blank screen).
-    rendererReady?(): void;
-
-    onLanguageChanged?(cb: (language: string) => void): () => void;
-
-    // Chain progress listener for jump host connections
-    // Callback receives: (sessionId: string, currentHop: number, totalHops: number, hostLabel: string, status: string, error?: string)
-    onChainProgress?(cb: (sessionId: string, hop: number, total: number, label: string, status: string, error?: string) => void): () => void;
-
-    // SFTP connection progress listener (auth method logs)
-    onSftpConnectionProgress?(cb: (sessionId: string, label: string, status: string, detail?: string) => void): () => void;
-
-    // OAuth callback server for cloud sync
-    startOAuthCallback?(expectedState?: string): Promise<{ code: string; state?: string }>;
-    cancelOAuthCallback?(): Promise<void>;
-
-    // GitHub Device Flow (cloud sync)
-    githubStartDeviceFlow?(options?: { clientId?: string; scope?: string }): Promise<{
-      deviceCode: string;
-      userCode: string;
-      verificationUri: string;
-      expiresAt: number;
-      interval: number;
-    }>;
-    githubPollDeviceFlowToken?(options: { clientId?: string; deviceCode: string }): Promise<{
-      access_token?: string;
-      token_type?: string;
-      scope?: string;
-      error?: string;
-      error_description?: string;
-    }>;
-
-    // Google OAuth (cloud sync) - proxied via main process to avoid CORS
-    googleExchangeCodeForTokens?(options: {
-      clientId: string;
-      clientSecret?: string;
-      code: string;
-      codeVerifier: string;
-      redirectUri: string;
-    }): Promise<{
-      accessToken: string;
-      refreshToken?: string;
-      expiresAt?: number;
-      tokenType: string;
-      scope?: string;
-    }>;
-    googleRefreshAccessToken?(options: {
-      clientId: string;
-      clientSecret?: string;
-      refreshToken: string;
-    }): Promise<{
-      accessToken: string;
-      refreshToken: string;
-      expiresAt?: number;
-      tokenType: string;
-      scope?: string;
-    }>;
-    googleGetUserInfo?(options: { accessToken: string }): Promise<{
-      id: string;
-      email: string;
-      name: string;
-      picture?: string;
-    }>;
-
-    // Google Drive API (cloud sync) - proxied via main process to avoid CORS/COEP issues
-    googleDriveFindSyncFile?(options: { accessToken: string; fileName?: string }): Promise<{ fileId: string | null }>;
-    googleDriveCreateSyncFile?(options: { accessToken: string; fileName?: string; syncedFile: unknown }): Promise<{ fileId: string }>;
-    googleDriveUpdateSyncFile?(options: { accessToken: string; fileId: string; syncedFile: unknown }): Promise<{ ok: true }>;
-    googleDriveDownloadSyncFile?(options: { accessToken: string; fileId: string }): Promise<{ syncedFile: unknown | null }>;
-    googleDriveDeleteSyncFile?(options: { accessToken: string; fileId: string }): Promise<{ ok: true }>;
-
-    // OneDrive OAuth + Graph (cloud sync) - proxied via main process to avoid CORS
-    onedriveExchangeCodeForTokens?(options: {
-      clientId: string;
-      code: string;
-      codeVerifier: string;
-      redirectUri: string;
-      scope?: string;
-    }): Promise<{
-      accessToken: string;
-      refreshToken?: string;
-      expiresAt?: number;
-      tokenType: string;
-      scope?: string;
-    }>;
-    onedriveRefreshAccessToken?(options: {
-      clientId: string;
-      refreshToken: string;
-      scope?: string;
-    }): Promise<{
-      accessToken: string;
-      refreshToken: string;
-      expiresAt?: number;
-      tokenType: string;
-      scope?: string;
-    }>;
-    onedriveGetUserInfo?(options: { accessToken: string }): Promise<{
-      id: string;
-      email: string;
-      name: string;
-      avatarDataUrl?: string;
-    }>;
-    onedriveFindSyncFile?(options: { accessToken: string; fileName?: string }): Promise<{ fileId: string | null }>;
-    onedriveUploadSyncFile?(options: { accessToken: string; fileName?: string; syncedFile: unknown }): Promise<{ fileId: string | null }>;
-    onedriveDownloadSyncFile?(options: { accessToken: string; fileId?: string; fileName?: string }): Promise<{ syncedFile: unknown | null }>;
-    onedriveDeleteSyncFile?(options: { accessToken: string; fileId: string }): Promise<{ ok: true }>;
-
-    // File opener helpers (for "Open With" feature)
-    selectApplication?(): Promise<{ path: string; name: string } | null>;
-    openWithApplication?(filePath: string, appPath: string): Promise<boolean>;
-    downloadSftpToTemp?(sftpId: string, remotePath: string, fileName: string, encoding?: SftpFilenameEncoding): Promise<string>;
-    downloadSftpToTempWithProgress?(
-      sftpId: string,
-      remotePath: string,
-      fileName: string,
-      encoding: SftpFilenameEncoding | undefined,
-      transferId: string,
-      onProgress?: (transferred: number, total: number, speed: number) => void,
-      onComplete?: () => void,
-      onError?: (error: string) => void,
-      onCancelled?: () => void
-    ): Promise<{ localPath: string; cancelled: boolean }>;
-
-    // Save dialog for file downloads
-    showSaveDialog?(defaultPath: string, filters?: Array<{ name: string; extensions: string[] }>): Promise<string | null>;
-    selectDirectory?(title?: string, defaultPath?: string): Promise<string | null>;
-    selectFile?(title?: string, defaultPath?: string, filters?: Array<{ name: string; extensions: string[] }>): Promise<string | null>;
-
-    // File watcher for auto-sync feature
-    startFileWatch?(localPath: string, remotePath: string, sftpId: string, encoding?: SftpFilenameEncoding): Promise<{ watchId: string }>;
-    stopFileWatch?(watchId: string, cleanupTempFile?: boolean): Promise<{ success: boolean }>;
-    listFileWatches?(): Promise<Array<{ watchId: string; localPath: string; remotePath: string; sftpId: string }>>;
-    registerTempFile?(sftpId: string, localPath: string): Promise<{ success: boolean }>;
-    onFileWatchSynced?(cb: (payload: { watchId: string; localPath: string; remotePath: string; bytesWritten: number }) => void): () => void;
-    onFileWatchError?(cb: (payload: { watchId: string; localPath: string; remotePath: string; error: string }) => void): () => void;
-
-    // Temp file cleanup
-    deleteTempFile?(filePath: string): Promise<{ success: boolean }>;
-
-    // Crash Logs
-    getCrashLogs?(): Promise<Array<{ fileName: string; date: string; size: number; entryCount: number }>>;
-    readCrashLog?(fileName: string): Promise<Array<{
-      timestamp: string;
-      source: string;
-      message: string;
-      stack?: string;
-      errorMeta?: Record<string, unknown>;
-      extra?: Record<string, unknown>;
-      pid?: number;
-      platform?: string;
-      arch?: string;
-      version?: string;
-      electronVersion?: string;
-      osVersion?: string;
-      memoryMB?: { rss: number; heapUsed: number; heapTotal: number };
-      activeSessionCount?: number;
-      uptimeSeconds?: number;
-    }>>;
-    clearCrashLogs?(): Promise<{ deletedCount: number }>;
-    openCrashLogsDir?(): Promise<{ success: boolean }>;
-
-    // Temp directory management
-    getTempDirInfo?(): Promise<{ path: string; fileCount: number; totalSize: number }>;
-    clearTempDir?(): Promise<{ deletedCount: number; failedCount: number; error?: string }>;
-    getTempDirPath?(): Promise<string>;
-    openTempDir?(): Promise<{ success: boolean }>;
-
-    // Session Logs
-    exportSessionLog?(payload: {
-      terminalData: string;
-      hostLabel: string;
-      hostname: string;
-      startTime: number;
-      format: 'txt' | 'raw' | 'html';
-    }): Promise<{ success: boolean; canceled?: boolean; filePath?: string }>;
-    selectSessionLogsDir?(): Promise<{ success: boolean; canceled?: boolean; directory?: string }>;
-    autoSaveSessionLog?(payload: {
-      terminalData: string;
-      hostLabel: string;
-      hostname: string;
-      hostId: string;
-      startTime: number;
-      format: 'txt' | 'raw' | 'html';
-      directory: string;
-    }): Promise<{ success: boolean; error?: string; filePath?: string }>;
-    openSessionLogsDir?(directory: string): Promise<{ success: boolean; error?: string }>;
-
-    // Get file path from File object (for drag-and-drop, uses Electron's webUtils)
-    getPathForFile?(file: File): string | undefined;
-    readClipboardText?(): Promise<string>;
-
-    // Credential encryption (field-level safeStorage for sensitive data at rest)
-    credentialsAvailable?(): Promise<boolean>;
-    credentialsEncrypt?(plaintext: string): Promise<string>;
-    credentialsDecrypt?(value: string): Promise<string>;
-
-    // AI / external agents
-    aiSyncProviders?(providers: Array<{ id: string; providerId: string; apiKey?: string; baseURL?: string; enabled: boolean }>): Promise<{ ok: boolean }>;
-    aiChatStream?(requestId: string, url: string, headers?: Record<string, string>, body?: string, providerId?: string): Promise<{ ok: boolean; statusCode?: number; statusText?: string; error?: string }>;
-    aiChatCancel?(requestId: string): Promise<boolean>;
-    aiFetch?(url: string, method?: string, headers?: Record<string, string>, body?: string, providerId?: string): Promise<{ ok: boolean; status: number; data: string; error?: string }>;
-    aiAllowlistAddHost?(baseURL: string): Promise<{ ok: boolean; error?: string }>;
-    aiExec?(sessionId: string, command: string, chatSessionId?: string): Promise<{ ok: boolean; stdout?: string; stderr?: string; exitCode?: number | null; error?: string }>;
-    aiCattyCancelExec?(chatSessionId: string): Promise<{ ok: boolean; error?: string }>;
-    aiDiscoverAgents?(): Promise<Array<{
-      command: string;
-      name: string;
-      icon: string;
-      description: string;
-      args: string[];
-      path: string;
-      version: string;
-      available: boolean;
-      acpCommand?: string;
-      acpArgs?: string[];
-    }>>;
-    aiCodexGetIntegration?(options?: { refreshShellEnv?: boolean }): Promise<{
-      state: 'connected_chatgpt' | 'connected_api_key' | 'connected_custom_config' | 'not_logged_in' | 'unknown';
-      isConnected: boolean;
-      rawOutput: string;
-      exitCode: number | null;
-      customConfig?: {
-        providerName: string;
-        displayName: string;
-        baseUrl: string | null;
-        envKey: string | null;
-        envKeyPresent: boolean;
-        hasHardcodedApiKey: boolean;
-        model: string | null;
-        authHash: string | null;
-      } | null;
-    }>;
-    aiCodexStartLogin?(): Promise<{
-      ok: boolean;
-      session?: {
-        sessionId: string;
-        state: 'running' | 'success' | 'error' | 'cancelled';
-        url: string | null;
-        output: string;
-        error: string | null;
-        exitCode: number | null;
-      };
-      error?: string;
-    }>;
-    aiCodexGetLoginSession?(sessionId: string): Promise<{
-      ok: boolean;
-      session?: {
-        sessionId: string;
-        state: 'running' | 'success' | 'error' | 'cancelled';
-        url: string | null;
-        output: string;
-        error: string | null;
-        exitCode: number | null;
-      };
-      error?: string;
-    }>;
-    aiCodexCancelLogin?(sessionId: string): Promise<{
-      ok: boolean;
-      found?: boolean;
-      session?: {
-        sessionId: string;
-        state: 'running' | 'success' | 'error' | 'cancelled';
-        url: string | null;
-        output: string;
-        error: string | null;
-        exitCode: number | null;
-      };
-      error?: string;
-    }>;
-    aiCodexLogout?(): Promise<{
-      ok: boolean;
-      state?: 'connected_chatgpt' | 'connected_api_key' | 'not_logged_in' | 'unknown';
-      isConnected?: boolean;
-      rawOutput?: string;
-      logoutOutput?: string;
-      error?: string;
-    }>;
-    aiMcpUpdateSessions?(sessions: Array<{
-      sessionId: string;
-      hostname: string;
-      label: string;
-      os?: string;
-      username?: string;
-      protocol?: string;
-      shellType?: string;
-      deviceType?: string;
-      connected: boolean;
-    }>, chatSessionId?: string): Promise<{ ok: boolean }>;
-    aiMcpSetToolIntegrationMode?(mode: 'mcp' | 'skills'): Promise<{ ok: boolean; error?: string }>;
-    aiUserSkillsGetStatus?(): Promise<{
-      ok: boolean;
-      directoryPath?: string;
-      readyCount?: number;
-      warningCount?: number;
-      skills?: Array<{
-        id: string;
-        slug: string;
-        directoryName: string;
-        directoryPath: string;
-        skillPath: string;
-        name: string;
-        description: string;
-        status: 'ready' | 'warning';
-        warnings: string[];
-      }>;
-      warnings?: string[];
-      error?: string;
-    }>;
-    aiUserSkillsOpenFolder?(): Promise<{
-      ok: boolean;
-      directoryPath?: string;
-      readyCount?: number;
-      warningCount?: number;
-      skills?: Array<{
-        id: string;
-        slug: string;
-        directoryName: string;
-        directoryPath: string;
-        skillPath: string;
-        name: string;
-        description: string;
-        status: 'ready' | 'warning';
-        warnings: string[];
-      }>;
-      warnings?: string[];
-      error?: string;
-    }>;
-    aiUserSkillsBuildContext?(prompt: string, selectedSkillSlugs?: string[]): Promise<{
-      ok: boolean;
-      context?: string;
-      error?: string;
-    }>;
-    aiSpawnAgent?(agentId: string, command: string, args?: string[], env?: Record<string, string>, options?: { closeStdin?: boolean }): Promise<{ ok: boolean; pid?: number; error?: string }>;
-    aiWriteToAgent?(agentId: string, data: string): Promise<{ ok: boolean; error?: string }>;
-    aiCloseAgentStdin?(agentId: string): Promise<{ ok: boolean; error?: string }>;
-    aiKillAgent?(agentId: string): Promise<{ ok: boolean; error?: string }>;
-    aiAcpStream?(requestId: string, chatSessionId: string, acpCommand: string, acpArgs: string[], prompt: string, cwd?: string, providerId?: string, model?: string, existingSessionId?: string, historyMessages?: Array<{ role: 'user' | 'assistant'; content: string }>, images?: Array<{ base64Data: string; mediaType: string; filename?: string }>, toolIntegrationMode?: 'mcp' | 'skills', defaultTargetSession?: { sessionId: string; hostname: string; label: string; os?: string; username?: string; protocol?: string; shellType?: string; deviceType?: string; connected: boolean; source: 'scope-target' | 'only-connected-in-scope' }, userSkillsContext?: string): Promise<{ ok: boolean; error?: string }>;
-    aiAcpCancel?(requestId: string, chatSessionId?: string): Promise<{ ok: boolean; error?: string }>;
-    aiAcpCleanup?(chatSessionId: string): Promise<{ ok: boolean }>;
-    onAiAcpEvent?(requestId: string, cb: (event: Record<string, unknown>) => void): () => void;
-    onAiAcpDone?(requestId: string, cb: () => void): () => void;
-    onAiAcpError?(requestId: string, cb: (error: string) => void): () => void;
-    onAiStreamData?(requestId: string, cb: (data: string) => void): () => void;
-    onAiStreamEnd?(requestId: string, cb: () => void): () => void;
-    onAiAgentStdout?(agentId: string, cb: (data: string) => void): () => void;
-    onAiAgentStderr?(agentId: string, cb: (data: string) => void): () => void;
-    onAiAgentExit?(agentId: string, cb: (code: number | null) => void): () => void;
-
-    // Auto-update
-    checkForUpdate?(): Promise<{
-      available: boolean;
-      supported?: boolean;
-      checking?: boolean;
-      version?: string;
-      releaseNotes?: string;
-      releaseDate?: string | null;
-      error?: string;
-    }>;
-    downloadUpdate?(): Promise<{ success: boolean; error?: string }>;
-    installUpdate?(): void;
-    getUpdateStatus?(): Promise<{ status: 'idle' | 'available' | 'downloading' | 'ready' | 'error'; percent: number; error: string | null; version: string | null; isChecking?: boolean }>;
-
-    onUpdateDownloadProgress?(cb: (progress: {
-      percent: number;
-      bytesPerSecond: number;
-      transferred: number;
-      total: number;
-    }) => void): () => void;
-    onUpdateAvailable?(cb: (info: {
-      version: string;
-      releaseNotes: string;
-      releaseDate: string | null;
-    }) => void): () => void;
-    onUpdateNotAvailable?(cb: () => void): () => void;
-    onUpdateDownloaded?(cb: () => void): () => void;
-    onUpdateError?(cb: (payload: { error: string }) => void): () => void;
-
-    // Global Toggle Hotkey (Quake Mode)
-    registerGlobalHotkey?(hotkey: string): Promise<{ success: boolean; enabled?: boolean; error?: string; accelerator?: string }>;
-    unregisterGlobalHotkey?(): Promise<{ success: boolean }>;
-    getGlobalHotkeyStatus?(): Promise<{ enabled: boolean; hotkey: string | null }>;
-
-    // Auto-Update toggle
-    getAutoUpdate?(): Promise<{ enabled: boolean }>;
-    setAutoUpdate?(enabled: boolean): Promise<{ success: boolean }>;
-
-    // System Tray / Close to Tray
-    setCloseToTray?(enabled: boolean): Promise<{ success: boolean; enabled: boolean }>;
-    isCloseToTray?(): Promise<{ enabled: boolean }>;
-    updateTrayMenuData?(data: {
-      sessions?: Array<{ id: string; label: string; hostLabel: string; status: "connecting" | "connected" | "disconnected"; workspaceId?: string; workspaceTitle?: string }>;
-      portForwardRules?: Array<{
-        id: string;
-        label: string;
-        type: "local" | "remote" | "dynamic";
-        localPort: number;
-        remoteHost?: string;
-        remotePort?: number;
-        status: "inactive" | "connecting" | "active" | "error";
-      }>;
-    }): Promise<{ success: boolean }>;
-    onTrayFocusSession?(callback: (sessionId: string) => void): () => void;
-    onTrayTogglePortForward?(callback: (ruleId: string, start: boolean) => void): () => void;
-
-    onTrayPanelJumpToSession?(callback: (sessionId: string) => void): () => void;
-    onTrayPanelConnectToHost?(callback: (hostId: string) => void): () => void;
-
-    hideTrayPanel?(): Promise<{ success: boolean }>;
-    openMainWindow?(): Promise<{ success: boolean }>;
-    quitApp?(): Promise<{ success: boolean }>;
-    jumpToSessionFromTrayPanel?(sessionId: string): Promise<{ success: boolean }>;
-    connectToHostFromTrayPanel?(hostId: string): Promise<{ success: boolean }>;
-    onTrayPanelCloseRequest?(callback: () => void): () => void;
-    onTrayPanelRefresh?(callback: () => void): () => void;
-    onTrayPanelMenuData?(callback: (data: {
-      sessions?: Array<{ id: string; label: string; hostLabel: string; status: "connecting" | "connected" | "disconnected"; workspaceId?: string; workspaceTitle?: string }>;
-      portForwardRules?: Array<{
-        id: string;
-        label: string;
-        type: "local" | "remote" | "dynamic";
-        localPort: number;
-        remoteHost?: string;
-        remotePort?: number;
-        status: "inactive" | "connecting" | "active" | "error";
-        hostId?: string;
-      }>;
-    }) => void): () => void;
+    pluginSyncReadChunk?(request: {
+      requestId: string;
+      transferId: string;
+      maxBytes?: number;
+    }): Promise<{ chunk: Uint8Array; done: boolean }>;
+    pluginSyncWriteObject?(request: {
+      requestId?: string;
+      providerId: string;
+      key: string;
+      data: Uint8Array;
+      expectedRevision?: string | null;
+      preferStream?: boolean;
+      deadlineMs?: number;
+    }): Promise<{ created: boolean; revision?: string }>;
+    pluginSyncWriteBegin?(request: {
+      requestId?: string;
+      providerId: string;
+      key: string;
+      byteLength: number;
+      expectedRevision?: string | null;
+      deadlineMs?: number;
+    }): Promise<{ transferId: string; windowBytes: number }>;
+    pluginSyncWriteChunk?(request: {
+      requestId: string;
+      transferId: string;
+      sequence: number;
+      chunk: Uint8Array;
+    }): Promise<{ accepted: number }>;
+    pluginSyncWriteCommit?(request: {
+      requestId: string;
+      transferId: string;
+    }): Promise<{ created: boolean; revision?: string }>;
+    pluginSyncDeleteObject?(request: {
+      requestId?: string;
+      providerId: string;
+      key: string;
+      expectedRevision?: string;
+      deadlineMs?: number;
+    }): Promise<{ deleted: boolean }>;
+    pluginSyncPutSecret?(request: {
+      providerId: string;
+      key: string;
+      value: string;
+    }): Promise<{ kind: 'secret'; id: string; key: string; created?: boolean }>;
+    pluginSyncDeleteSecrets?(request: {
+      providerId: string;
+      keys?: string[];
+    }): Promise<{ deleted: number }>;
+    pluginSyncRestoreSecrets?(request: {
+      providerId: string;
+      keys: string[];
+      discard?: boolean;
+    }): Promise<{ restored: number; discarded?: number }>;
+    collectPluginSyncSidecars?(): Promise<unknown>;
+    applyPluginSyncSidecars?(bundle: unknown): Promise<{ applied: boolean; count?: number; entries?: unknown }>;
+    pluginHostReady?(): boolean;
+    startPluginConnection?(request: NetcattyPluginConnectionStartRequest): Promise<{ sessionId: string; providerId: string; status: 'connecting' | 'connected'; diagnostics: ReadonlyArray<import("@netcatty/plugin-contract").ProviderValidationIssue> }>;
+    writePluginConnection?(sessionId: string, data: Uint8Array): Promise<void>;
+    controlPluginConnection?(sessionId: string, operation: 'resize' | 'signal' | 'reconnect' | 'close' | 'getStatus', payload?: Record<string, unknown>): Promise<unknown>;
+    detectPluginImporter?(request: { providerId: string; sample: Uint8Array; fileName?: string; mediaType?: string; deadlineMs?: number }): Promise<import("@netcatty/plugin-contract").ImporterDetectResult>;
+    selectPluginImporterFile?(): Promise<{ selectionToken: string; fileName: string; sample: Uint8Array } | null>;
+    releasePluginImporterFile?(selectionToken: string): Promise<boolean>;
+    parsePluginImporterFile?(request: { requestId?: string; providerId: string; selectionToken: string; mediaType?: string; options?: import("@netcatty/plugin-contract").JsonValue; deadlineMs?: number }): Promise<NetcattyPluginImporterPreview>;
+    onPluginImporterProgress?(callback: (event: NetcattyPluginImporterProgressEvent) => void): () => void;
+    respondPluginAuthenticationChallenge?(response: {
+      requestId: string;
+      challengeRequestId: string;
+      challengeId: string;
+      response?: string | boolean | ReadonlyArray<string>;
+      cancelled?: boolean;
+    }): Promise<void>;
+    onPluginAuthenticationChallenge?(callback: (event: NetcattyPluginAuthenticationChallengeEvent) => void): () => void;
+    onPluginConnectionData?(callback: (event: { sessionId: string; data: Uint8Array }) => void): () => void;
+    onPluginConnectionClosed?(callback: (event: { sessionId: string; reason: string }) => void): () => void;
+    openPluginView?(payload: NetcattyPluginViewOpenRequest): Promise<{ instanceId: string }>;
+    closePluginView?(instanceId: string): Promise<void>;
+    setPluginViewBounds?(instanceId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>;
+    setPluginViewVisibility?(instanceId: string, visible: boolean): Promise<void>;
+    postPluginViewMessage?(instanceId: string, message: unknown): Promise<void>;
+    onPluginContributionsChanged?(callback: (event: { reason: string; pluginId: string | null; revision: number }) => void): () => void;
+    onPluginViewMessage?(callback: (event: { pluginId: string; viewId: string; message: unknown }) => void): () => void;
+    onPluginViewClosed?(callback: (event: NetcattyPluginViewClosedEvent) => void): () => void;
+    getPluginScopeCatalog?(): Promise<NetcattyPluginScopeCatalog>;
+    setPluginScopeCatalog?(catalog: NetcattyPluginScopeCatalog): Promise<void>;
+    onPluginScopeCatalogChanged?(callback: (catalog: NetcattyPluginScopeCatalog) => void): () => void;
   }
+
+  interface NetcattyPluginContributionQuery {
+    locale?: string;
+    context?: Record<string, unknown>;
+    menuContexts?: Partial<Record<string, Record<string, unknown>>>;
+    scopeIds?: Partial<Record<'workspace' | 'host' | 'session' | 'device', string>>;
+  }
+
+  interface NetcattyPluginSettingContribution {
+    id: string;
+    label: string;
+    description?: string;
+    placeholder?: string;
+    control: string;
+    scope: string;
+    scopeId: string | null;
+    value?: unknown;
+    secret?: boolean;
+    configured: boolean;
+    visible: boolean;
+    restartRequired?: boolean;
+    required?: boolean;
+    options?: ReadonlyArray<{ value: string; label: string; description?: string }>;
+    minimum?: number;
+    maximum?: number;
+    step?: number;
+    sortable?: boolean;
+    valueSchema?: unknown;
+  }
+
+  type NetcattyPluginIconReference =
+    | { kind: 'theme'; name: string }
+    | { kind: 'package'; light: string; dark?: string };
+
+  interface NetcattyPluginContributionSnapshot {
+    locale: string;
+    plugins: ReadonlyArray<{
+      id: string;
+      version: string;
+      displayName: string;
+      description: string;
+      commands: ReadonlyArray<{ id: string; title: string; category?: string; description?: string; icon?: NetcattyPluginIconReference; enabled: boolean }>;
+      keybindings: ReadonlyArray<{ command: string; key: string; mac?: string; linux?: string; windows?: string; args?: unknown; enabled: boolean }>;
+      menus: ReadonlyArray<{
+        id: string;
+        command: string;
+        alt?: string;
+        location: string;
+        title: string;
+        visible: boolean;
+        enabled: boolean;
+        checked?: boolean;
+        order?: number;
+        group?: string;
+        shortcut?: string;
+        showKeybinding?: boolean;
+        icon?: NetcattyPluginIconReference;
+      }>;
+      settings: ReadonlyArray<NetcattyPluginSettingContribution>;
+      views: ReadonlyArray<{ id: string; title: string; location: string; entry: string; icon?: NetcattyPluginIconReference; order?: number; visible: boolean; retainContextWhenHidden?: boolean }>;
+    }>;
+  }
+
+  interface NetcattyPluginEnvironment {
+    locale: string;
+    theme: string;
+    reducedMotion: boolean;
+    highContrast: boolean;
+    themeTokens?: Record<string, string>;
+  }
+
+  type NetcattyTerminalProviderKind =
+    | 'terminal.completion'
+    | 'terminal.decoration'
+    | 'terminal.link'
+    | 'terminal.hover'
+    | 'terminal.matcher'
+    | 'terminal.semantic'
+    | 'terminal.prompt'
+    | 'terminal.background'
+    | 'terminal.theme';
+
+  interface NetcattyTerminalProviderContribution {
+    pluginId: string;
+    pluginVersion: string;
+    runtimeId?: string;
+    pluginDisplayName: string;
+    provider: {
+      id: string;
+      label: string;
+      description?: string;
+      kind: NetcattyTerminalProviderKind;
+      capabilities?: ReadonlyArray<string>;
+      configurationSchema?: unknown;
+    };
+  }
+
+  interface NetcattyTerminalProviderQuery {
+    kind: NetcattyTerminalProviderKind;
+    locale?: string;
+    preferredProviderIds?: ReadonlyArray<string>;
+  }
+
+  interface NetcattyTerminalSessionSnapshot {
+    sessionId: string;
+    hostId?: string;
+    workspaceId?: string;
+    protocol: string;
+    status: 'connecting' | 'connected' | 'disconnected';
+    cwd?: string;
+    title?: string;
+    shellType?: 'posix' | 'fish' | 'powershell' | 'cmd' | 'unknown';
+    cols?: number;
+    rows?: number;
+    alternateScreen?: boolean;
+  }
+
+  interface NetcattyTerminalSessionEvent {
+    type:
+      | 'snapshot'
+      | 'created'
+      | 'connected'
+      | 'reconnected'
+      | 'cwdChanged'
+      | 'titleChanged'
+      | 'resized'
+      | 'alternateScreenChanged'
+      | 'commandSubmitted'
+      | 'commandCompleted'
+      | 'disconnected'
+      | 'disposed';
+    session: NetcattyTerminalSessionSnapshot;
+    exitCode?: number;
+  }
+
+  interface NetcattyTerminalProviderRequest {
+    requestId: string;
+    kind: NetcattyTerminalProviderKind;
+    operation: string;
+    session: NetcattyTerminalSessionSnapshot;
+    payload?: unknown;
+    locale?: string;
+    preferredProviderIds?: ReadonlyArray<string>;
+    deadlineMs?: number;
+  }
+
+  type NetcattyTerminalProviderResult = {
+    pluginId: string;
+    pluginVersion: string;
+    runtimeId?: string;
+    providerId: string;
+    kind: NetcattyTerminalProviderKind;
+    requestId: string;
+    status: 'ok';
+    result: unknown;
+  } | {
+    pluginId: string;
+    pluginVersion: string;
+    runtimeId?: string;
+    providerId: string;
+    kind: NetcattyTerminalProviderKind;
+    requestId: string;
+    status: 'cancelled';
+  } | {
+    pluginId: string;
+    pluginVersion: string;
+    providerId: string;
+    kind: NetcattyTerminalProviderKind;
+    requestId: string;
+    status: 'failed';
+    error: { code: number; message: string; data?: unknown };
+  };
+
+  interface NetcattyPluginViewOpenRequest {
+    viewId: string;
+    instanceId?: string;
+    scopeId: string;
+    bounds?: { x: number; y: number; width: number; height: number };
+    context?: Record<string, unknown>;
+  }
+
+  interface NetcattyPluginViewClosedEvent {
+    instanceId: string;
+    pluginId: string;
+    viewId: string;
+    reason: string;
+  }
+
+  type NetcattyPluginSettingScopeKind = 'workspace' | 'host' | 'session' | 'device';
+
+  type NetcattyPluginScopeCatalog = Record<
+    NetcattyPluginSettingScopeKind,
+    ReadonlyArray<{ id: string; label: string }>
+  >;
 
   interface Window {
     netcatty?: NetcattyBridge;

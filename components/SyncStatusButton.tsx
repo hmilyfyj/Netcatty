@@ -2,7 +2,7 @@
  * SyncStatusButton - Cloud Sync Status Indicator for Top Bar
  *
  * Shows current sync state with cloud icon and colored indicators:
- * - Green dot: All synced
+ * - Green dot: Local changes pending upload
  * - Blue dot + spin: Syncing in progress
  * - Red dot: Error
  * - Gray dot: No providers connected
@@ -16,6 +16,7 @@ import {
     CloudOff,
     Github,
     Loader2,
+    Plug,
     RefreshCw,
     Settings,
     X,
@@ -25,7 +26,8 @@ import {
     Server,
 } from 'lucide-react';
 import { useCloudSync } from '../application/state/useCloudSync';
-import { isProviderReadyForSync, type CloudProvider } from '../domain/sync';
+import { isProviderReadyForSync, type CloudProvider, formatSyncDateTime } from '../domain/sync';
+import { isPluginCloudProviderId } from '../domain/cloudProviderIds';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { cn } from '../lib/utils';
 import { Button } from './ui/button';
@@ -35,6 +37,7 @@ import {
     PopoverTrigger,
 } from './ui/popover';
 import { toast } from './ui/toast';
+import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
 
 // ============================================================================
 // Provider Icons
@@ -52,7 +55,7 @@ const OneDriveIcon: React.FC<{ className?: string }> = ({ className }) => (
     </svg>
 );
 
-const providerIcons: Record<CloudProvider, React.ReactNode> = {
+const providerIcons: Partial<Record<CloudProvider, React.ReactNode>> = {
     github: <Github size={16} />,
     google: <GoogleDriveIcon className="w-4 h-4" />,
     onedrive: <OneDriveIcon className="w-4 h-4" />,
@@ -60,13 +63,19 @@ const providerIcons: Record<CloudProvider, React.ReactNode> = {
     s3: <Database size={16} />,
 };
 
-const providerNames: Record<CloudProvider, string> = {
+const providerNames: Partial<Record<CloudProvider, string>> = {
     github: 'GitHub Gist',
     google: 'Google Drive',
     onedrive: 'OneDrive',
     webdav: 'WebDAV',
     s3: 'S3 Compatible',
 };
+
+const resolveProviderIcon = (provider: CloudProvider): React.ReactNode =>
+    providerIcons[provider] ?? <Plug size={16} />;
+
+const resolveProviderName = (provider: CloudProvider): string =>
+    providerNames[provider] ?? provider;
 
 // ============================================================================
 // Status Dot Component
@@ -106,12 +115,14 @@ interface SyncStatusButtonProps {
     onOpenSettings?: () => void;
     onSyncNow?: () => Promise<void>; // Callback to trigger sync with current data
     className?: string;
+    style?: React.CSSProperties;
 }
 
 export const SyncStatusButton: React.FC<SyncStatusButtonProps> = ({
     onOpenSettings,
     onSyncNow,
     className,
+    style,
 }) => {
     const { t } = useI18n();
     const [isOpen, setIsOpen] = useState(false);
@@ -120,18 +131,27 @@ export const SyncStatusButton: React.FC<SyncStatusButtonProps> = ({
 
     // State is now automatically synced via useSyncExternalStore - no manual refresh needed
 
-    // Get connected provider (include syncing status as it's still connected)
+    // Get connected provider (built-ins first, then any namespaced plugin provider).
     const getConnectedProvider = (): CloudProvider | null => {
-        if (isProviderReadyForSync(sync.providers.github)) return 'github';
-        if (isProviderReadyForSync(sync.providers.google)) return 'google';
-        if (isProviderReadyForSync(sync.providers.onedrive)) return 'onedrive';
-        if (isProviderReadyForSync(sync.providers.webdav)) return 'webdav';
-        if (isProviderReadyForSync(sync.providers.s3)) return 's3';
+        const preferred: CloudProvider[] = ['github', 'google', 'onedrive', 'webdav', 's3'];
+        for (const id of preferred) {
+            const conn = sync.providers[id];
+            if (conn && isProviderReadyForSync(conn)) return id;
+        }
+        for (const [id, conn] of Object.entries(sync.providers)) {
+            if (preferred.includes(id as CloudProvider)) continue;
+            if (conn && isProviderReadyForSync(conn)) return id as CloudProvider;
+        }
         return null;
     };
 
     const connectedProvider = getConnectedProvider();
     const providerConnection = connectedProvider ? sync.providers[connectedProvider] : null;
+
+    const hasVersionMismatch = sync.hasAnyConnectedProvider
+        && sync.localVersion !== sync.remoteVersion;
+
+    const hasPendingSync = sync.pendingLocalSync || hasVersionMismatch;
 
     // Determine overall status for the button indicator
     const getOverallStatus = (): StatusIndicatorProps['status'] => {
@@ -143,7 +163,7 @@ export const SyncStatusButton: React.FC<SyncStatusButtonProps> = ({
         ) {
             return 'error';
         }
-        if (sync.overallSyncStatus === 'synced') return 'synced';
+        if (hasPendingSync) return 'synced';
         return 'none';
     };
 
@@ -161,7 +181,7 @@ export const SyncStatusButton: React.FC<SyncStatusButtonProps> = ({
         const diff = Date.now() - timestamp;
         if (diff < 60000) return t('time.justNow');
         if (diff < 3600000) return t('time.minutesAgo', { minutes: Math.floor(diff / 60000) });
-        return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        return formatSyncDateTime(timestamp);
     };
 
     // Create a unique key based on sync state to force re-render
@@ -169,26 +189,32 @@ export const SyncStatusButton: React.FC<SyncStatusButtonProps> = ({
 
     return (
         <Popover open={isOpen} onOpenChange={setIsOpen}>
-            <PopoverTrigger asChild>
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    className={cn(
-                        "h-8 w-8 relative text-muted-foreground hover:text-foreground app-no-drag",
-                        className
-                    )}
-                    title={t('sync.cloudSync')}
-                >
-                    {getButtonIcon()}
+            <Tooltip>
+                <TooltipTrigger asChild>
+                    <PopoverTrigger asChild>
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            className={cn(
+                                "h-7 w-7 relative app-no-drag top-tab-utility-btn",
+                                className
+                            )}
+                            style={style}
+                        >
+                            {getButtonIcon()}
 
-                    {/* Status indicator dot */}
-                    <StatusIndicator
-                        status={overallStatus}
-                        size="sm"
-                        className="absolute top-0.5 right-0.5 ring-2 ring-background"
-                    />
-                </Button>
-            </PopoverTrigger>
+                            {overallStatus !== 'none' && (
+                                <StatusIndicator
+                                    status={overallStatus}
+                                    size="sm"
+                                    className="absolute top-0.5 right-0.5 ring-2 ring-background"
+                                />
+                            )}
+                        </Button>
+                    </PopoverTrigger>
+                </TooltipTrigger>
+                <TooltipContent>{t('sync.cloudSync')}</TooltipContent>
+            </Tooltip>
 
             <PopoverContent
                 key={syncStateKey}
@@ -200,7 +226,7 @@ export const SyncStatusButton: React.FC<SyncStatusButtonProps> = ({
                 <div className="px-3 py-2.5 border-b border-border/60">
                     <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
-                            {overallStatus === 'synced' && (
+                            {overallStatus === 'synced' && hasPendingSync && (
                                 <Cloud size={16} className="text-green-500" />
                             )}
                             {overallStatus === 'syncing' && (
@@ -209,29 +235,37 @@ export const SyncStatusButton: React.FC<SyncStatusButtonProps> = ({
                             {overallStatus === 'error' && (
                                 <Cloud size={16} className="text-red-500" />
                             )}
-                            {overallStatus === 'none' && (
+                            {overallStatus === 'none' && sync.hasAnyConnectedProvider && (
+                                <Cloud size={16} className="text-muted-foreground" />
+                            )}
+                            {overallStatus === 'none' && !sync.hasAnyConnectedProvider && (
                                 <CloudOff size={16} className="text-muted-foreground" />
                             )}
 
                             <span className="text-sm font-medium">
-                                {overallStatus === 'synced' && t('sync.active')}
+                                {overallStatus === 'synced' && hasPendingSync && t('sync.pending')}
                                 {overallStatus === 'syncing' && t('sync.syncing')}
                                 {overallStatus === 'error' && t('sync.error')}
-                                {overallStatus === 'none' && t('sync.notConfigured')}
+                                {overallStatus === 'none' && sync.hasAnyConnectedProvider && t('sync.active')}
+                                {overallStatus === 'none' && !sync.hasAnyConnectedProvider && t('sync.notConfigured')}
                             </span>
                         </div>
 
                         {onOpenSettings && (
-                            <button
-                                onClick={() => {
-                                    setIsOpen(false);
-                                    onOpenSettings();
-                                }}
-                                className="p-1 rounded hover:bg-muted transition-colors"
-                                title={t('sync.settings')}
-                            >
-                                <Settings size={14} className="text-muted-foreground" />
-                            </button>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <button
+                                        onClick={() => {
+                                            setIsOpen(false);
+                                            onOpenSettings();
+                                        }}
+                                        className="p-1 rounded hover:bg-muted transition-colors"
+                                    >
+                                        <Settings size={14} className="text-muted-foreground" />
+                                    </button>
+                                </TooltipTrigger>
+                                <TooltipContent>{t('sync.settings')}</TooltipContent>
+                            </Tooltip>
                         )}
                     </div>
                 </div>
@@ -264,15 +298,17 @@ export const SyncStatusButton: React.FC<SyncStatusButtonProps> = ({
                             {connectedProvider && providerConnection && (
                                 <div className="flex items-center gap-3 p-2 rounded-lg bg-muted/30">
                                     <div className="w-10 h-10 rounded-lg bg-primary/10 text-primary flex items-center justify-center">
-                                        {providerIcons[connectedProvider]}
+                                        {resolveProviderIcon(connectedProvider)}
                                     </div>
                                     <div className="flex-1 min-w-0">
                                         <div className="flex items-center gap-2">
-                                            <span className="text-sm font-medium">{providerNames[connectedProvider]}</span>
+                                            <span className="text-sm font-medium">{resolveProviderName(connectedProvider)}</span>
                                             <StatusIndicator status={overallStatus} />
                                         </div>
                                         <div className="flex items-center gap-2 mt-0.5">
-                                            {providerConnection.account?.avatarUrl && (
+                                            {providerConnection.account?.avatarUrl
+                                              && connectedProvider
+                                              && !isPluginCloudProviderId(connectedProvider) && (
                                                 <img
                                                     src={providerConnection.account.avatarUrl}
                                                     alt=""

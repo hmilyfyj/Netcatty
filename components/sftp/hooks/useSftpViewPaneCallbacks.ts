@@ -10,7 +10,6 @@ import type { FileOpenerType, SystemAppInfo } from "../../../lib/sftpFileUtils";
 import { formatFileSize, formatDate } from '../../../application/state/sftp/utils';
 import { isSessionError } from "../../../application/state/sftp/errors";
 import { filterHiddenFiles } from "../utils";
-import { isDockerSftpConnection, isLocalSftpConnection } from "../../../application/state/sftp/backend";
 
 interface UseSftpViewPaneCallbacksParams {
   sftpRef: MutableRefObject<SftpStateApi>;
@@ -28,27 +27,11 @@ interface UseSftpViewPaneCallbacksParams {
   listSftp?: (sftpId: string, path: string, encoding?: SftpFilenameEncoding) => Promise<RemoteFile[]>;
   showSaveDialog?: (defaultPath: string, filters?: Array<{ name: string; extensions: string[] }>) => Promise<string | null>;
   selectDirectory?: (title?: string, defaultPath?: string) => Promise<string | null>;
-  startStreamTransfer?: (
-    options: {
-      transferId: string;
-      sourcePath: string;
-      targetPath: string;
-      sourceType: 'local' | 'sftp';
-      targetType: 'local' | 'sftp';
-      sourceSftpId?: string;
-      targetSftpId?: string;
-      totalBytes?: number;
-      sourceEncoding?: SftpFilenameEncoding;
-      targetEncoding?: SftpFilenameEncoding;
-    },
-    onProgress?: (transferred: number, total: number, speed: number) => void,
-    onComplete?: () => void,
-    onError?: (error: string) => void
-  ) => Promise<{ transferId: string; totalBytes?: number; error?: string }>;
   getSftpIdForConnection?: (connectionId: string) => string | undefined;
   listLocalFiles: (path: string) => Promise<RemoteFile[]>;
   mkdirLocal?: (path: string) => Promise<void>;
   deleteLocalFile?: (path: string) => Promise<void>;
+  listDrives: () => Promise<string[]>;
 }
 
 export const useSftpViewPaneCallbacks = ({
@@ -61,11 +44,11 @@ export const useSftpViewPaneCallbacks = ({
   listSftp,
   showSaveDialog,
   selectDirectory,
-  startStreamTransfer,
   getSftpIdForConnection,
   listLocalFiles,
+  listDrives,
 }: UseSftpViewPaneCallbacksParams) => {
-  const paneActions = useSftpViewPaneActions({ sftpRef });
+  const paneActions = useSftpViewPaneActions({ sftpRef, t });
   const fileOps = useSftpViewFileOps({
     sftpRef,
     behaviorRef,
@@ -75,7 +58,6 @@ export const useSftpViewPaneCallbacks = ({
     t,
     showSaveDialog,
     selectDirectory,
-    startStreamTransfer,
     getSftpIdForConnection,
   });
 
@@ -114,19 +96,8 @@ export const useSftpViewPaneCallbacks = ({
           }),
           pane.showHiddenFiles,
         );
-      if (isLocalSftpConnection(pane.connection)) {
+      if (pane.connection.isLocal) {
         return normalizeEntries(await listLocalFilesRef.current(path));
-      }
-      if (isDockerSftpConnection(pane.connection)) {
-        if (!pane.connection.sourceSessionId || !pane.connection.containerId) {
-          throw new Error("容器会话不可用");
-        }
-        const rawFiles = await sftpRef.current.listDockerFiles(
-          pane.connection.sourceSessionId,
-          pane.connection.containerId,
-          path,
-        );
-        return filterHiddenFiles(rawFiles, pane.showHiddenFiles);
       }
       const sftpId = getSftpIdForConnectionRef.current?.(pane.connection.id);
       if (!sftpId) {
@@ -179,10 +150,15 @@ export const useSftpViewPaneCallbacks = ({
       onEditPermissions: fileOps.onEditPermissionsLeft,
       onEditFile: fileOps.onEditFileLeft,
       onOpenFile: fileOps.onOpenFileLeft,
+      onOpenFileWithSystemDefault: fileOps.onOpenFileWithSystemDefaultLeft,
       onOpenFileWith: fileOps.onOpenFileWithLeft,
       onDownloadFile: fileOps.onDownloadFileLeft,
+      onDownloadFiles: fileOps.onDownloadFilesLeft,
       onUploadExternalFiles: fileOps.onUploadExternalFilesLeft,
+      onUploadExternalFileList: fileOps.onUploadExternalFileListLeft,
+      onUploadExternalFolder: fileOps.onUploadExternalFolderLeft,
       onListDirectory: makeListDirectory("left", () => sftpRef.current.leftPane),
+      onListDrives: listDrives,
     }),
     [],
   );
@@ -216,10 +192,15 @@ export const useSftpViewPaneCallbacks = ({
       onEditPermissions: fileOps.onEditPermissionsRight,
       onEditFile: fileOps.onEditFileRight,
       onOpenFile: fileOps.onOpenFileRight,
+      onOpenFileWithSystemDefault: fileOps.onOpenFileWithSystemDefaultRight,
       onOpenFileWith: fileOps.onOpenFileWithRight,
       onDownloadFile: fileOps.onDownloadFileRight,
+      onDownloadFiles: fileOps.onDownloadFilesRight,
       onUploadExternalFiles: fileOps.onUploadExternalFilesRight,
+      onUploadExternalFileList: fileOps.onUploadExternalFileListRight,
+      onUploadExternalFolder: fileOps.onUploadExternalFolderRight,
       onListDirectory: makeListDirectory("right", () => sftpRef.current.rightPane),
+      onListDrives: listDrives,
     }),
     [],
   );
@@ -244,6 +225,7 @@ export const useSftpViewPaneCallbacks = ({
     fileOpenerTarget: fileOps.fileOpenerTarget,
     setFileOpenerTarget: fileOps.setFileOpenerTarget,
     handleSaveTextFile: fileOps.handleSaveTextFile,
+    onPromoteToTab: fileOps.onPromoteToTab,
     handleFileOpenerSelect: fileOps.handleFileOpenerSelect,
     handleSelectSystemApp: fileOps.handleSelectSystemApp,
   };

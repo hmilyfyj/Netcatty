@@ -40,7 +40,7 @@
 
 ---
 
-[![Netcatty Main Interface](screenshots/main-window-dark.png)](screenshots/main-window-dark.png)
+<img width="3142" height="1764" alt="Screenshot 2026-07-02 at 22 51 24" src="https://github.com/user-attachments/assets/3116165d-623a-4d3a-a28a-914befb9b72d" />
 
 ---
 
@@ -48,11 +48,6 @@
 # 🔥 Catty Agent — Your IT Ops AI Partner
 
 > 🚀 **Boost your IT ops daily work with AI power.** Catty Agent is the built-in AI assistant that understands your servers, executes commands, and handles complex multi-host operations — all through natural conversation.
-
-<p align="center">
-  <img src="screenshots/ai-feature.png" alt="Catty Agent Interface" width="800">
-</p>
-
 ### 🔥 What can Catty Agent do?
 
 - 🚀 **Natural language server management** — just tell it what you need, no more memorizing commands
@@ -67,21 +62,13 @@
 
 Ask Catty Agent to check a server's health, and it runs the right commands, analyzes the output, and gives you a clear summary — all in seconds.
 
-
-https://github.com/user-attachments/assets/eecf08f1-80bd-49db-886d-b36e93388865
-
-
-
+<img width="1510" height="870" alt="ai-single" src="https://github.com/user-attachments/assets/d3f34e53-8476-4fab-8634-394b931d1ff1" />
 
 #### 🚀 Multi-Host — Docker Swarm Cluster Setup
 
 Watch Catty Agent orchestrate a Docker Swarm cluster across two servers in one conversation. It handles the init, token exchange, and node joining — you just tell it what you want.
 
-
-
-https://github.com/user-attachments/assets/282027aa-5c9e-4bb1-b2c3-5eea9df2b203
-
-
+<img width="1515" height="870" alt="ai-muti" src="https://github.com/user-attachments/assets/ca166fc5-65d9-4d7b-951a-962c2ef230d8" />
 
 ---
 
@@ -91,7 +78,6 @@ https://github.com/user-attachments/assets/282027aa-5c9e-4bb1-b2c3-5eea9df2b203
 - [What is Netcatty](#what-is-netcatty)
 - [Why Netcatty](#why-netcatty)
 - [Features](#features)
-- [Demos](#demos)
 - [Screenshots](#screenshots)
   - [Main Window](#main-window)
   - [Vault Views](#vault-views)
@@ -141,6 +127,7 @@ If you regularly work with a fleet of servers, Netcatty is built for speed and f
 ### 🖥️ Terminal Workspaces
 - **Split panes** — horizontal and vertical splits for multi-tasking
 - **Session management** — run multiple connections side-by-side
+- **Inline images** — render Kitty graphics, SIXEL and iTerm inline images from remote programs
 
 ### 📁 SFTP + Built-in Editor
 - **File workflows** — drag & drop uploads/downloads
@@ -152,59 +139,6 @@ If you regularly work with a fleet of servers, Netcatty is built for speed and f
 
 ---
 
-<a name="demos"></a>
-# Demos
-
-Video previews (stored in `screenshots/gifs/`), rendered inline on GitHub:
-
-### Vault views: grid / list / tree
-Switch between different Vault views to match your workflow: overview in grid, dense scanning in list, and hierarchical navigation in tree.
-
-https://github.com/user-attachments/assets/e2742987-3131-404d-bd4b-06423e5bfd99
-
-
-### Split terminals + session management
-Work in multiple sessions at once with split panes. Keep related tasks side-by-side and reduce context switching.
-
-https://github.com/user-attachments/assets/377d0c46-cc5a-4382-aa31-5acfd412ce62
-
-
-
-### SFTP: drag & drop + built-in editor
-Move files with drag & drop, then edit quickly using the built-in editor without leaving the app.
-
-https://github.com/user-attachments/assets/c6e06af4-b0d5-461c-b0c7-9d6f655af6c7
-
-
-
-
-
-### Drag file upload
-Drop files into the app to kick off uploads without hunting through dialogs.
-
-https://github.com/user-attachments/assets/c8e0c4ff-f020-4e18-9b09-681ec97b003f
-
-
-
-
-### Custom themes
-Make Netcatty yours: customize themes and UI appearance.
-
-https://github.com/user-attachments/assets/77e2a693-4ef2-4823-8ca1-9bcbf14ed98b
-
-
-
-
-### Keyword highlighting
-Highlight important terminal output so errors, warnings, and key events stand out at a glance.
-
-https://github.com/user-attachments/assets/e6516993-ad66-4594-8c28-57426082339b
-
-
-
-
----
-
 <a name="screenshots"></a>
 # Screenshots
 
@@ -213,29 +147,27 @@ https://github.com/user-attachments/assets/e6516993-ad66-4594-8c28-57426082339b
 
 The main window is designed for long-running SSH workflows: quick access to sessions, navigation, and core tools in one place.
 
-![Main Window (Dark)](screenshots/main-window-dark.png)
+<img width="1531" height="875" alt="black-grid" src="https://github.com/user-attachments/assets/004b80f6-5bbb-4f14-b8cd-33a0a5913b8c" />
 
-![Main Window (Light)](screenshots/main-window-light.png)
+<img width="1550" height="876" alt="light" src="https://github.com/user-attachments/assets/2b59a999-a25e-4217-944c-9aef0a09f272" />
+
 
 <a name="vault-views"></a>
 ## Vault Views
 
 Organize and navigate your hosts using the view that best fits the moment: grid for overview, list for scanning, tree for structure.
 
-![Vault Grid View](screenshots/vault_grid_view.png)
+<img width="1554" height="882" alt="list" src="https://github.com/user-attachments/assets/03249f15-b5f8-4770-a3c3-d5001636ea00" />
 
-![Vault List View](screenshots/vault_list_view.png)
+<img width="1561" height="878" alt="tree" src="https://github.com/user-attachments/assets/739f7b66-3898-43d0-8dd3-b9b97fd8e8de" />
 
-![Vault Tree View (Dark)](screenshots/treeview-dark.png)
-
-![Vault Tree View (Light)](screenshots/treeview-light.png)
 
 <a name="split-terminals"></a>
 ## Split Terminals
 
 Split panes help you monitor multiple servers/services at the same time (deploy + logs + metrics) without juggling windows.
 
-![Split Windows](screenshots/split-window.png)
+<img width="1560" height="871" alt="split" src="https://github.com/user-attachments/assets/c93a8523-6256-4bb3-8b6e-d599831f2f9f" />
 
 ---
 
@@ -275,7 +207,29 @@ Download the latest release for your platform from [GitHub Releases](https://git
 
 Or browse all releases at [GitHub Releases](https://github.com/binaricat/Netcatty/releases).
 
+### Code signing and privacy
+
+Netcatty is applying to the SignPath Foundation open-source program. Once
+approved, covered Windows release artifacts will use **Free code signing provided by SignPath.io, certificate by SignPath Foundation**.
+See the [code signing policy](CODE_SIGNING_POLICY.md) and
+[privacy policy](PRIVACY.md). Windows releases may remain unsigned until the
+application and integration are complete.
+
+> **Windows portable data:** Exit Netcatty, then create a folder named `data` beside `Netcatty.exe` (zip build) or beside the portable launcher. Netcatty will store its profile there on the next launch. Saved passwords and private keys remain protected by the Windows user account that created them, so they must be re-entered after moving the folder to another computer or Windows account.
+
+> **Open folders in Netcatty on Windows:** The installed version adds **Open in Netcatty** to Explorer's folder context menu and folder-background context menu. It opens a local terminal in that folder. On Windows 11, choose **Show more options** first. Turn the menu off or on in **Settings → System → Windows Explorer**. ZIP and portable versions do not add this menu by default.
+
 > **macOS Users:** Current releases are expected to be code-signed and notarized. If Gatekeeper still warns, make sure you downloaded the latest official build from GitHub Releases.
+
+### Nix / NixOS
+
+Netcatty provides a flake that wraps the official Linux AppImage release for Nix and NixOS users:
+
+```bash
+nix run github:binaricat/Netcatty
+```
+
+For declarative installs, add the Netcatty flake as an input and use `inputs.netcatty.packages.${pkgs.system}.default` in your NixOS or Home Manager package list.
 
 ### Prerequisites
 - Node.js 18+ and npm
@@ -293,25 +247,6 @@ npm install
 
 # Start development mode (Vite + Electron)
 npm run dev
-```
-
-### Project Structure
-
-```
-├── App.tsx                 # Main React application
-├── components/             # React components
-│   ├── Terminal.tsx        # Terminal component
-│   ├── SftpView.tsx        # SFTP browser
-│   ├── VaultView.tsx       # Host management
-│   ├── KeyManager.tsx      # SSH key management
-│   └── ...
-├── application/            # State management & i18n
-├── domain/                 # Domain models & logic
-├── infrastructure/         # Services & adapters
-├── electron/               # Electron main process
-│   ├── main.cjs            # Main entry
-│   └── bridges/            # IPC bridges
-└── public/                 # Static assets & icons
 ```
 
 ---
@@ -386,11 +321,11 @@ This project is licensed under the **GPL-3.0 License** - see the [LICENSE](LICEN
 <a name="star-history"></a>
 # Star History
 
-<a href="https://star-history.com/#binaricat/Netcatty&Date">
+<a href="https://www.star-history.com/#binaricat/Netcatty&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=binaricat/Netcatty&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=binaricat/Netcatty&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=binaricat/Netcatty&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/star-history/star-history-dark.svg" />
+   <source media="(prefers-color-scheme: light)" srcset="docs/assets/star-history/star-history-light.svg" />
+   <img alt="Star History Chart" src="docs/assets/star-history/star-history-light.svg" />
  </picture>
 </a>
 

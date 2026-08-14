@@ -9,14 +9,21 @@ import { Host,PortForwardingRule,PortForwardingType } from '../../domain/models'
 import { cn } from '../../lib/utils';
 import { DistroAvatar } from '../DistroAvatar';
 import { TrafficDiagram } from '../TrafficDiagram';
-import { AsidePanel,AsidePanelContent,AsidePanelFooter } from '../ui/aside-panel';
+import {
+    AsidePanel,
+    AsidePanelContent,
+    AsidePanelFooter,
+    type AsidePanelLayout,
+    type AsidePanelResizeProps,
+} from '../ui/aside-panel';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { Label } from '../ui/label';
 import { Switch } from '../ui/switch';
 import { getTypeLabel } from './utils';
 
-export interface NewFormPanelProps {
+export interface NewFormPanelProps extends AsidePanelResizeProps {
     draft: Partial<PortForwardingRule>;
     hosts: Host[];
     onDraftChange: (updates: Partial<PortForwardingRule>) => void;
@@ -25,6 +32,7 @@ export interface NewFormPanelProps {
     onOpenHostSelector: () => void;
     onOpenWizard: () => void;
     isValid: boolean;
+    layout?: AsidePanelLayout;
 }
 
 export const NewFormPanel: React.FC<NewFormPanelProps> = ({
@@ -36,6 +44,10 @@ export const NewFormPanel: React.FC<NewFormPanelProps> = ({
     onOpenHostSelector,
     onOpenWizard,
     isValid,
+    layout = 'inline',
+    resizable = false,
+    persistWidthStorageKey,
+    resizeAriaLabel,
 }) => {
     const { t } = useI18n();
     const selectedHost = hosts.find(h => h.id === draft.hostId);
@@ -46,6 +58,10 @@ export const NewFormPanel: React.FC<NewFormPanelProps> = ({
             onClose={onClose}
             title={t('pf.wizard.newTitle')}
             width="w-[360px]"
+            layout={layout}
+            resizable={resizable}
+            persistWidthStorageKey={persistWidthStorageKey}
+            resizeAriaLabel={resizeAriaLabel}
         >
             <AsidePanelContent>
                 {/* Type Selector */}
@@ -118,7 +134,7 @@ export const NewFormPanel: React.FC<NewFormPanelProps> = ({
                                 <DistroAvatar
                                     host={selectedHost}
                                     fallback={selectedHost.os[0].toUpperCase()}
-                                    className="h-6 w-6"
+                                    size="tree"
                                 />
                                 <span>{selectedHost.label}</span>
                             </div>
@@ -183,14 +199,18 @@ export const NewFormPanel: React.FC<NewFormPanelProps> = ({
                     >
                         {t('common.cancel')}
                     </Button>
-                    <button
-                        className="text-xs text-muted-foreground hover:text-foreground/80 flex items-center gap-1 px-2 py-1 rounded hover:bg-foreground/5 transition-colors"
-                        onClick={onOpenWizard}
-                        title={t('pf.form.openWizardTitle')}
-                    >
-                        <Zap size={12} />
-                        {t('pf.form.openWizard')}
-                    </button>
+                    <Tooltip>
+                        <TooltipTrigger asChild>
+                            <button
+                                className="text-xs text-muted-foreground hover:text-foreground/80 flex items-center gap-1 px-2 py-1 rounded hover:bg-foreground/5 transition-colors"
+                                onClick={onOpenWizard}
+                            >
+                                <Zap size={12} />
+                                {t('pf.form.openWizard')}
+                            </button>
+                        </TooltipTrigger>
+                        <TooltipContent>{t('pf.form.openWizardTitle')}</TooltipContent>
+                    </Tooltip>
                 </div>
             </AsidePanelFooter>
         </AsidePanel>

@@ -7,13 +7,54 @@ const safeParse = <T>(value: string | null): T | null => {
   }
 };
 
+export const LOCAL_STORAGE_ADAPTER_CHANGED_EVENT = 'netcatty:local-storage-adapter-changed';
+
+const pendingChangedKeys = new Set<string>();
+let emitChangedKeysTimer: ReturnType<typeof setTimeout> | null = null;
+
+function dispatchLocalStorageAdapterChanged(key: string): void {
+  try {
+    const target = globalThis as typeof globalThis & {
+      dispatchEvent?: (event: Event) => boolean;
+      CustomEvent?: typeof CustomEvent;
+    };
+    if (typeof target.dispatchEvent !== 'function' || typeof target.CustomEvent !== 'function') return;
+    target.dispatchEvent(new target.CustomEvent<{ key: string }>(
+      LOCAL_STORAGE_ADAPTER_CHANGED_EVENT,
+      { detail: { key } },
+    ));
+  } catch {
+    // ignore
+  }
+}
+
+function emitLocalStorageAdapterChanged(key: string): void {
+  pendingChangedKeys.add(key);
+  if (emitChangedKeysTimer) return;
+
+  // Defer same-window storage notifications so React render-phase writes do
+  // not synchronously trigger state updates in unrelated components.
+  emitChangedKeysTimer = setTimeout(() => {
+    emitChangedKeysTimer = null;
+    const keys = Array.from(pendingChangedKeys);
+    pendingChangedKeys.clear();
+    for (const changedKey of keys) {
+      dispatchLocalStorageAdapterChanged(changedKey);
+    }
+  }, 0);
+}
+
 /**
  * Safely write to localStorage, catching QuotaExceededError.
  * Returns true if the write succeeded, false if storage quota was exceeded.
  */
 function safeSetItem(key: string, value: string): boolean {
   try {
+    if (localStorage.getItem(key) === value) {
+      return true;
+    }
     localStorage.setItem(key, value);
+    emitLocalStorageAdapterChanged(key);
     return true;
   } catch (err) {
     if (
@@ -34,7 +75,8 @@ export const localStorageAdapter = {
     return safeParse<T>(localStorage.getItem(key));
   },
   write<T>(key: string, value: T): boolean {
-    return safeSetItem(key, JSON.stringify(value));
+    const json = JSON.stringify(value);
+    return safeSetItem(key, json);
   },
   readString(key: string): string | null {
     return localStorage.getItem(key);
@@ -62,6 +104,8 @@ export const localStorageAdapter = {
     return safeSetItem(key, String(value));
   },
   remove(key: string) {
+    if (localStorage.getItem(key) === null) return;
     localStorage.removeItem(key);
+    emitLocalStorageAdapterChanged(key);
   },
 };

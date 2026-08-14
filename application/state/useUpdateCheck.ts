@@ -53,12 +53,20 @@ export interface UseUpdateCheckResult {
  * - Respects dismissed version to avoid nagging
  * - Provides manual check capability
  */
-export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUpdateCheckResult {
+export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean; enabled?: boolean; onNeedsSave?: () => void }): UseUpdateCheckResult {
+  const enabled = options?.enabled !== false;
   // Accept auto-update toggle from the caller (e.g. useSettingsState) so it
   // reacts immediately in the same window. Falls back to reading localStorage
   // when no caller provides the value (e.g. in non-settings contexts).
   const autoUpdateEnabled = options?.autoUpdateEnabled ??
     (localStorageAdapter.readString(STORAGE_KEY_AUTO_UPDATE_ENABLED) !== 'false');
+
+  // Latest "install blocked by unsaved editors" callback (#1215). Kept in a ref
+  // so the listener effect (empty deps) always calls the current one without
+  // re-subscribing on every render. The consuming component shows the toast;
+  // this hook only owns the bridge subscription (toasts live in the view layer).
+  const onNeedsSaveRef = useRef(options?.onNeedsSave);
+  onNeedsSaveRef.current = options?.onNeedsSave;
 
   const [updateState, setUpdateState] = useState<UpdateState>({
     isChecking: false,
@@ -108,6 +116,7 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
 
   // Get current app version
   useEffect(() => {
+    if (!enabled) return;
     const loadVersion = async () => {
       try {
         const bridge = netcattyBridge.get();
@@ -120,12 +129,13 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
       }
     };
     void loadVersion();
-  }, []);
+  }, [enabled]);
 
   // Hydrate auto-download status from the main process so windows opened
   // after the download started (e.g. Settings) immediately reflect the
   // current state instead of showing stale 'idle'.
   useEffect(() => {
+    if (!enabled) return;
     const bridge = netcattyBridge.get();
     void bridge?.getUpdateStatus?.().then((snapshot) => {
       if (!snapshot || snapshot.status === 'idle') return;
@@ -166,11 +176,12 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
         };
       });
     });
-  }, []);
+  }, [enabled]);
 
   // Subscribe to electron-updater auto-download IPC events.
   // These fire automatically when autoDownload=true in the main process.
   useEffect(() => {
+    if (!enabled) return;
     const bridge = netcattyBridge.get();
 
     // When electron-updater confirms no update in its feed, don't write
@@ -252,14 +263,24 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
       }));
     });
 
+    // Install was requested but blocked by unsaved editors (#1215). The main
+    // process broadcasts this to every window so whichever one the user clicked
+    // "Restart Now" from gets feedback. Delegate to the caller's handler (which
+    // shows the toast) — registered here because bridge subscriptions belong in
+    // the state layer, not in components.
+    const cleanupNeedsSave = bridge?.onUpdateNeedsSave?.(() => {
+      onNeedsSaveRef.current?.();
+    });
+
     return () => {
       cleanupNotAvailable?.();
       cleanupAvailable?.();
       cleanupProgress?.();
       cleanupDownloaded?.();
       cleanupError?.();
+      cleanupNeedsSave?.();
     };
-  }, []);
+  }, [enabled]);
 
   const performCheck = useCallback(async (currentVersion: string): Promise<UpdateCheckResult | null> => {
     debugLog('performCheck called', { currentVersion, IS_UPDATE_DEMO_MODE });
@@ -355,6 +376,8 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
   }, []);
 
   const checkNow = useCallback(async (): Promise<UpdateCheckResult | null> => {
+    if (!enabled) return null;
+
     // Prevent concurrent checks (performCheck owns isCheckingRef)
     if (isCheckingRef.current) {
       debugLog('checkNow: already checking, skipping');
@@ -482,7 +505,7 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
     }
 
     return result;
-  }, [performCheck]);
+  }, [enabled, performCheck]);
 
   const dismissUpdate = useCallback(() => {
     if (updateState.latestRelease?.version) {
@@ -512,10 +535,12 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
   }, [updateState.latestRelease]);
 
   const installUpdate = useCallback(() => {
+    if (!enabled) return;
     netcattyBridge.get()?.installUpdate?.();
-  }, []);
+  }, [enabled]);
 
   const startDownload = useCallback(async () => {
+    if (!enabled) return;
     if (autoDownloadStatusRef.current === 'downloading' || autoDownloadStatusRef.current === 'ready') return;
     const bridge = netcattyBridge.get();
     try {
@@ -553,10 +578,11 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
         downloadError: 'Download failed',
       }));
     });
-  }, [openReleasePage]);
+  }, [enabled, openReleasePage]);
 
   // Startup check with delay - runs once on mount
   useEffect(() => {
+    if (!enabled) return;
     debugLog('Startup check effect mounted, IS_UPDATE_DEMO_MODE:', IS_UPDATE_DEMO_MODE);
     
     // In demo mode, trigger check immediately after a short delay
@@ -577,10 +603,11 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
     
     // Normal mode: wait for version to be loaded, then check
     // This is handled by the version-dependent effect below
-  }, [performCheck]);
+  }, [enabled, performCheck]);
 
   // Normal mode startup check - depends on currentVersion
   useEffect(() => {
+    if (!enabled) return;
     // Skip in demo mode (handled above)
     if (IS_UPDATE_DEMO_MODE) {
       return;
@@ -640,7 +667,9 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
     hasCheckedOnStartupRef.current = true;
     debugLog('Starting delayed update check for version:', updateState.currentVersion);
 
+    let checkArmed = true;
     startupCheckTimeoutRef.current = setTimeout(async () => {
+      checkArmed = false;
       // Re-check the toggle at fire time — the user may have toggled it
       // after the timer was scheduled.
       const stillEnabled = localStorageAdapter.readString(STORAGE_KEY_AUTO_UPDATE_ENABLED);
@@ -684,9 +713,15 @@ export function useUpdateCheck(options?: { autoUpdateEnabled?: boolean }): UseUp
     return () => {
       if (startupCheckTimeoutRef.current) {
         clearTimeout(startupCheckTimeoutRef.current);
+        startupCheckTimeoutRef.current = null;
+      }
+      // A remount clears the timer before it fires — allow the next effect to
+      // schedule again instead of permanently skipping the check.
+      if (checkArmed) {
+        hasCheckedOnStartupRef.current = false;
       }
     };
-  }, [updateState.currentVersion, autoUpdateEnabled, performCheck]);
+  }, [enabled, updateState.currentVersion, autoUpdateEnabled, performCheck]);
 
   return {
     updateState,

@@ -7,6 +7,9 @@ const path = require("node:path");
 const fs = require("node:fs");
 
 let electronModule = null;
+let ensureMainWindow = null;
+let sendWhenRendererReady = null;
+let getSystemMenuMainWindow = null;
 let tray = null;
 let closeToTray = false;
 let currentHotkey = null;
@@ -28,11 +31,14 @@ const STATUS_TEXT = {
 // Dynamic tray menu data (synced from renderer)
 let trayMenuData = {
   sessions: [],        // { id, label, hostLabel, status }
-  portForwardRules: [], // { id, label, type, localPort, remoteHost, remotePort, status, hostId }
+  portForwardRules: [], // { id, label, type, localPort, remoteHost, remotePort, status, hostId, canStop }
+  hosts: [],           // { id, label, hostname, group, pinned, lastConnectedAt }
 };
 
 let trayPanelWindow = null;
-
+/** True after the tray panel renderer finishes its first load. */
+let trayPanelReady = false;
+let trayPanelShowWhenReady = false;
 let trayPanelRefreshTimer = null;
 // Watchdog: if `leave-full-screen` never arrives (edge case / stuck transition)
 // we eventually give up and force a hide attempt. Better a visible window than
@@ -87,6 +93,8 @@ function performPendingFullscreenHide(win) {
   clearPendingFullscreenHide(win);
 
   try {
+    const windowManager = require("./windowManager.cjs");
+    windowManager.notifyWindowWillHide?.(win);
     win.hide();
     return "hidden";
   } catch (err) {
@@ -161,26 +169,85 @@ function startPendingFullscreenHideWatchdog(win) {
   }, FULLSCREEN_LEAVE_WATCHDOG_MS);
 }
 
+function bringMainWindowToForeground(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  clearPendingFullscreenHide(win);
+  const windowManager = require("./windowManager.cjs");
+  const focused = windowManager.showAndFocusMainWindow?.(win) ?? false;
+  try {
+    electronModule?.app?.focus?.({ steal: true });
+  } catch {
+    // ignore
+  }
+  return focused;
+}
+
 function openMainWindow() {
-  const { app } = electronModule;
-  const { BrowserWindow } = electronModule;
+  bringMainWindowToForeground(getMainWindow());
+}
+
+function getTrackedMainWindow() {
+  if (typeof getSystemMenuMainWindow === "function") {
+    const win = getSystemMenuMainWindow();
+    if (win && !win.isDestroyed?.()) return win;
+  }
   try {
-    for (const candidate of BrowserWindow.getAllWindows()) {
-      clearPendingFullscreenHide(candidate);
+    const windowManager = require("./windowManager.cjs");
+    const tracked = windowManager.getMainWindow?.();
+    if (tracked && !tracked.isDestroyed?.()) return tracked;
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+async function getOrCreateMainWindow() {
+  const tracked = getTrackedMainWindow();
+  if (tracked) {
+    return { win: tracked, created: false };
+  }
+  if (typeof ensureMainWindow === "function") {
+    const win = await ensureMainWindow();
+    return { win, created: true };
+  }
+  return { win: null, created: false };
+}
+
+async function openMainWindowReady() {
+  const { win } = await getOrCreateMainWindow();
+  bringMainWindowToForeground(win);
+  return win;
+}
+
+async function sendToMainWindow(channel, payload, { focus = true, createIfMissing = true } = {}) {
+  const { win } = createIfMissing
+    ? await getOrCreateMainWindow()
+    : { win: getTrackedMainWindow() };
+  if (!win) return false;
+  if (focus) {
+    bringMainWindowToForeground(win);
+  }
+  try {
+    if (typeof sendWhenRendererReady === "function") {
+      const result = await sendWhenRendererReady(win, channel, payload, { timeoutMs: 8000 });
+      if (!result?.success) {
+        console.warn(
+          `[GlobalShortcut] Failed to deliver ${channel} to main window:`,
+          result?.error || result?.reason || "unknown",
+        );
+      }
+      return result?.success === true;
     }
+    win.webContents?.send(channel, payload);
+    return true;
   } catch {
-    // ignore
+    return false;
   }
-  const win = getMainWindow();
-  if (!win) return;
-  if (win.isMinimized()) win.restore();
-  win.show();
-  win.focus();
-  try {
-    app.focus({ steal: true });
-  } catch {
-    // ignore
-  }
+}
+
+async function connectToHostFromSystemMenu(hostId) {
+  if (!hostId) return;
+  await sendToMainWindow("netcatty:trayPanel:connectToHost", hostId);
 }
 
 function getTrayPanelUrl() {
@@ -191,9 +258,25 @@ function getTrayPanelUrl() {
   return "app://netcatty/index.html#/tray";
 }
 
+function pushTrayMenuDataToPanel() {
+  if (!trayPanelWindow || trayPanelWindow.isDestroyed()) return;
+  try {
+    trayPanelWindow.webContents?.send("netcatty:trayPanel:setMenuData", trayMenuData);
+  } catch {
+    // ignore
+  }
+}
+
 function ensureTrayPanelWindow() {
   const { BrowserWindow } = electronModule;
   if (trayPanelWindow && !trayPanelWindow.isDestroyed()) return trayPanelWindow;
+
+  const {
+    windowsCssRoundedOverlayChromeOptions,
+  } = require("./windowManager/windowsWindowChrome.cjs");
+
+  trayPanelReady = false;
+  trayPanelShowWhenReady = false;
 
   trayPanelWindow = new BrowserWindow({
     width: 360,
@@ -207,13 +290,17 @@ function ensureTrayPanelWindow() {
     maximizable: false,
     skipTaskbar: true,
     alwaysOnTop: true,
-    transparent: true,
     hasShadow: true,
+    // Transparent host + clear backdrop so CSS rounded-lg corners are truly
+    // see-through. On Windows, disable OS rounding so it does not stack under
+    // the CSS radius (#2505 / Electron #46468).
+    ...windowsCssRoundedOverlayChromeOptions(),
     webPreferences: {
       preload: path.join(__dirname, "../preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+          spellcheck: false,
     },
   });
 
@@ -235,10 +322,16 @@ function ensureTrayPanelWindow() {
   void trayPanelWindow.loadURL(url);
 
   trayPanelWindow.webContents.on("did-finish-load", () => {
-    try {
-      trayPanelWindow?.webContents?.send("netcatty:trayPanel:setMenuData", trayMenuData);
-    } catch {
-      // ignore
+    trayPanelReady = true;
+    pushTrayMenuDataToPanel();
+    if (trayPanelShowWhenReady && trayPanelWindow && !trayPanelWindow.isDestroyed()) {
+      trayPanelShowWhenReady = false;
+      try {
+        trayPanelWindow.show();
+        trayPanelWindow.focus();
+      } catch {
+        // ignore
+      }
     }
   });
 
@@ -262,14 +355,16 @@ function showTrayPanel() {
   const y = Math.min(trayBounds.y + trayBounds.height + 6, workArea.y + workArea.height - panelBounds.height);
 
   win.setBounds({ x, y, width: panelBounds.width, height: panelBounds.height }, false);
-  win.show();
-  win.focus();
-
-  try {
-    win.webContents?.send("netcatty:trayPanel:setMenuData", trayMenuData);
-  } catch {
-    // ignore
+  // Wait for first paint/load so the opaque main-app splash cannot flash as a
+  // square underlay before the tray route clears it (#2505).
+  if (!trayPanelReady) {
+    trayPanelShowWhenReady = true;
+  } else {
+    win.show();
+    win.focus();
   }
+
+  pushTrayMenuDataToPanel();
 
   if (trayPanelRefreshTimer) clearInterval(trayPanelRefreshTimer);
   trayPanelRefreshTimer = setInterval(() => {
@@ -283,6 +378,7 @@ function showTrayPanel() {
 }
 
 function hideTrayPanel() {
+  trayPanelShowWhenReady = false;
   if (trayPanelWindow && !trayPanelWindow.isDestroyed()) {
     trayPanelWindow.hide();
   }
@@ -294,7 +390,12 @@ function hideTrayPanel() {
 }
 
 function toggleTrayPanel() {
-  if (trayPanelWindow && !trayPanelWindow.isDestroyed() && trayPanelWindow.isVisible()) {
+  // A pending first-load show counts as "open" so a second click cancels it
+  // instead of leaving did-finish-load to pop the panel open later.
+  const isOpenOrPending =
+    trayPanelShowWhenReady
+    || (trayPanelWindow && !trayPanelWindow.isDestroyed() && trayPanelWindow.isVisible());
+  if (isOpenOrPending) {
     hideTrayPanel();
   } else {
     showTrayPanel();
@@ -304,11 +405,19 @@ function toggleTrayPanel() {
 function resolveTrayIconPath() {
   const { app } = electronModule;
 
-  // Use different icons for different platforms
-  // macOS: template image (black + transparent, system handles color)
-  // Windows/Linux: colored icon
-  const isMac = process.platform === "darwin";
-  const iconName = isMac ? "tray-iconTemplate.png" : "tray-icon.png";
+  // Platform-specific tray source:
+  //  - macOS: template image (black + transparent, system handles tint)
+  //  - Windows: multi-size .ico so the shell can pick the right pixel size
+  //    per DPI scale (avoids blur at 125/150/175/250 % scale)
+  //  - Linux: colored PNG (with an @2x representation attached at load time)
+  let iconName;
+  if (process.platform === "darwin") {
+    iconName = "tray-iconTemplate.png";
+  } else if (process.platform === "win32") {
+    iconName = "tray-icon.ico";
+  } else {
+    iconName = "tray-icon.png";
+  }
 
   // Security: Only use known packaged icon locations, ignore renderer-provided paths
   const candidates = [
@@ -332,6 +441,10 @@ function resolveTrayIconPath() {
  */
 function init(deps) {
   electronModule = deps.electronModule;
+  ensureMainWindow = deps.ensureMainWindow || null;
+  sendWhenRendererReady = deps.sendWhenRendererReady || null;
+  getSystemMenuMainWindow = deps.getMainWindow || null;
+  updateDockMenu();
 }
 
 /**
@@ -403,6 +516,8 @@ function hideWindowRespectingMacFullscreen(win) {
   }
 
   try {
+    const windowManager = require("./windowManager.cjs");
+    windowManager.notifyWindowWillHide?.(win);
     win.hide();
     return true;
   } catch (err) {
@@ -410,6 +525,7 @@ function hideWindowRespectingMacFullscreen(win) {
     return false;
   }
 }
+
 /**
  * Convert a hotkey string from frontend format to Electron accelerator format
  * e.g., "⌘ + Space" -> "CommandOrControl+Space"
@@ -475,41 +591,18 @@ function toggleWindowVisibility() {
   try {
     // Check if window is minimized first - minimized windows may still report isVisible() = true
     if (win.isMinimized()) {
-      clearPendingFullscreenHide(win);
-      win.restore();
-      win.show();
-      win.focus();
-      const { app } = electronModule;
-      try {
-        app.focus({ steal: true });
-      } catch {
-        // ignore
-      }
+      bringMainWindowToForeground(win);
     } else if (win.isVisible()) {
       if (win.isFocused()) {
         // Window is visible and focused - hide it
         hideWindowRespectingMacFullscreen(win);
       } else {
         // Window is visible but not focused - focus it
-        clearPendingFullscreenHide(win);
-        win.focus();
-        const { app } = electronModule;
-        try {
-          app.focus({ steal: true });
-        } catch {
-          // ignore
-        }
+        bringMainWindowToForeground(win);
       }
     } else {
       // Window is hidden - show and focus it
-      win.show();
-      win.focus();
-      const { app } = electronModule;
-      try {
-        app.focus({ steal: true });
-      } catch {
-        // ignore
-      }
+      bringMainWindowToForeground(win);
     }
   } catch (err) {
     console.warn("[GlobalShortcut] Error toggling window visibility:", err);
@@ -594,12 +687,23 @@ function createTray() {
     const resolvedIconPath = resolveTrayIconPath();
     if (resolvedIconPath) {
       trayIcon = nativeImage.createFromPath(resolvedIconPath);
-      // Resize for tray (16x16 on most platforms, 22x22 on some Linux)
       if (process.platform === "darwin") {
         trayIcon = trayIcon.resize({ width: 16, height: 16 });
         trayIcon.setTemplateImage(true);
+      } else if (process.platform === "win32") {
+        // The .ico already carries 16/20/24/32/40/48/64 — Windows picks the
+        // right size per DPI scale on its own. Do not resize.
       } else {
-        trayIcon = trayIcon.resize({ width: 16, height: 16 });
+        // Linux: attach the @2x representation so the shell can pick the
+        // right pixel size on HiDPI. Leaving the base at its native size
+        // (no force resize) keeps it crisp at 100 % too.
+        const hiDpiPath = resolvedIconPath.replace(/\.png$/i, "@2x.png");
+        if (fs.existsSync(hiDpiPath)) {
+          trayIcon.addRepresentation({
+            scaleFactor: 2,
+            buffer: fs.readFileSync(hiDpiPath),
+          });
+        }
       }
     }
 
@@ -609,10 +713,28 @@ function createTray() {
     // Build and set initial context menu
     updateTrayMenu();
 
-    // Click on tray icon toggles tray panel
-    tray.on("click", () => {
-      toggleTrayPanel();
-    });
+    // Click on tray icon behaviors depending on platform conventions
+    if (process.platform === "win32") {
+      // Windows: Left-click opens/focuses main window, Right-click toggles custom tray panel
+      tray.on("click", () => {
+        openMainWindow();
+      });
+      tray.on("right-click", () => {
+        toggleTrayPanel();
+      });
+    } else if (process.platform === "linux") {
+      // Linux: GtkStatusIcon left-click can toggle the custom panel; StatusNotifier
+      // activation shows the native context menu set via setContextMenu() (there is
+      // no right-click / popUpContextMenu API on Linux — see Electron Tray docs).
+      tray.on("click", () => {
+        toggleTrayPanel();
+      });
+    } else {
+      // macOS: Click toggles custom tray panel
+      tray.on("click", () => {
+        toggleTrayPanel();
+      });
+    }
 
     console.log("[GlobalShortcut] System tray created");
   } catch (err) {
@@ -631,17 +753,7 @@ function buildTrayMenuTemplate() {
   menuTemplate.push({
     label: "Open Main Window",
     click: () => {
-      const win = getMainWindow();
-      if (win) {
-        if (win.isMinimized()) win.restore();
-        win.show();
-        win.focus();
-        try {
-          app.focus({ steal: true });
-        } catch {
-          // ignore
-        }
-      }
+      openMainWindow();
     },
   });
 
@@ -663,15 +775,11 @@ function buildTrayMenuTemplate() {
       menuTemplate.push({
         label: `  ${session.hostLabel || session.label}  (${statusText})`,
         click: () => {
-          // Focus window and switch to this session
-          const win = getMainWindow();
-          if (win) {
-            if (win.isMinimized()) win.restore();
-            win.show();
-            win.focus();
-            // Notify renderer to focus this session
-            win.webContents?.send("netcatty:tray:focusSession", session.id);
-          }
+          // AI silent sessions open a terminal popup from the renderer and must
+          // not be force-focused into a tab-less main-window surface.
+          void sendToMainWindow("netcatty:tray:focusSession", session.id, {
+            focus: session.aiHidden !== true,
+          });
         },
       });
     }
@@ -687,6 +795,7 @@ function buildTrayMenuTemplate() {
     for (const rule of trayMenuData.portForwardRules) {
       const isActive = rule.status === "active";
       const isConnecting = rule.status === "connecting";
+      const isStoppable = isActive || isConnecting || rule.canStop === true;
       const statusText =
         rule.status === "active"
           ? STATUS_TEXT.portForward.active
@@ -706,7 +815,7 @@ function buildTrayMenuTemplate() {
         click: () => {
           const win = getMainWindow();
           if (win) {
-            win.webContents?.send("netcatty:tray:togglePortForward", rule.id, !isActive);
+            win.webContents?.send("netcatty:tray:togglePortForward", rule.id, !isStoppable);
           }
         },
       });
@@ -726,15 +835,83 @@ function buildTrayMenuTemplate() {
   return menuTemplate;
 }
 
+function getDockHostLabel(host) {
+  const label = typeof host?.label === "string" ? host.label.trim() : "";
+  if (label) return label;
+  const hostname = typeof host?.hostname === "string" ? host.hostname.trim() : "";
+  return hostname || "Untitled Host";
+}
+
+function getDockHostLastConnectedAt(host) {
+  const value = Number(host?.lastConnectedAt);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function getDockMenuHosts() {
+  return (Array.isArray(trayMenuData.hosts) ? trayMenuData.hosts : [])
+    .filter((host) => host && typeof host.id === "string" && host.id.length > 0)
+    .slice()
+    .sort((a, b) => {
+      if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+      const recentDiff = getDockHostLastConnectedAt(b) - getDockHostLastConnectedAt(a);
+      if (recentDiff !== 0) return recentDiff;
+      return getDockHostLabel(a).localeCompare(getDockHostLabel(b), undefined, { sensitivity: "base" });
+    });
+}
+
+function buildDockMenuTemplate() {
+  const hostItems = getDockMenuHosts().map((host) => ({
+    label: getDockHostLabel(host),
+    click: async () => {
+      await connectToHostFromSystemMenu(host.id);
+    },
+  }));
+
+  return [
+    {
+      label: "Open Main Window",
+      click: async () => {
+        await openMainWindowReady();
+      },
+    },
+    { type: "separator" },
+    {
+      label: "New Connection",
+      enabled: hostItems.length > 0,
+      submenu: hostItems.length > 0
+        ? hostItems
+        : [{ label: "No Saved Hosts", enabled: false }],
+    },
+  ];
+}
+
+function updateDockMenu() {
+  if (!electronModule || process.platform !== "darwin") return;
+  const { Menu, app } = electronModule;
+  if (!Menu || !app?.dock?.setMenu) return;
+
+  try {
+    app.dock.setMenu(Menu.buildFromTemplate(buildDockMenuTemplate()));
+  } catch {
+    // ignore
+  }
+}
+
 /**
  * Update the tray context menu
  */
 function updateTrayMenu() {
   if (!tray) return;
-  // Avoid showing a context menu on left-click; we toggle our custom panel instead.
-  // On macOS, right-click may still show a menu if one is set, so we don't set any.
   try {
-    tray.setContextMenu(null);
+    if (process.platform === "linux") {
+      const { Menu } = electronModule;
+      const menu = Menu.buildFromTemplate(buildTrayMenuTemplate());
+      tray.setContextMenu(menu);
+    } else {
+      // Avoid showing a context menu on left-click; we toggle our custom panel instead.
+      // On macOS, right-click may still show a menu if one is set, so we don't set any.
+      tray.setContextMenu(null);
+    }
   } catch {
     // ignore
   }
@@ -750,8 +927,13 @@ function setTrayMenuData(data) {
   if (data.portForwardRules !== undefined) {
     trayMenuData.portForwardRules = data.portForwardRules;
   }
+  if (data.hosts !== undefined) {
+    trayMenuData.hosts = data.hosts;
+  }
   // Rebuild menu with new data
   updateTrayMenu();
+  updateDockMenu();
+  pushTrayMenuDataToPanel();
 }
 
 /**
@@ -860,30 +1042,33 @@ function registerHandlers(ipcMain) {
   });
 
   ipcMain.handle("netcatty:trayPanel:openMainWindow", async () => {
-    openMainWindow();
+    await openMainWindowReady();
     return { success: true };
   });
 
   ipcMain.handle("netcatty:trayPanel:jumpToSession", async (_event, sessionId) => {
-    openMainWindow();
-    try {
-      const win = getMainWindow();
-      win?.webContents?.send("netcatty:trayPanel:jumpToSession", sessionId);
-    } catch {
-      // ignore
-    }
+    // Do not force-focus the main window here. Visible sessions open/focus it
+    // from the renderer; AI silent sessions open a terminal popup instead and
+    // should not steal focus into a tab-less main-window surface.
+    await sendToMainWindow("netcatty:trayPanel:jumpToSession", sessionId, {
+      focus: false,
+    });
     return { success: true };
   });
 
   ipcMain.handle("netcatty:trayPanel:connectToHost", async (_event, hostId) => {
-    openMainWindow();
-    try {
-      const win = getMainWindow();
-      win?.webContents?.send("netcatty:trayPanel:connectToHost", hostId);
-    } catch {
-      // ignore
-    }
+    await connectToHostFromSystemMenu(hostId);
     return { success: true };
+  });
+
+  ipcMain.handle("netcatty:trayPanel:closeSession", async (_event, sessionId) => {
+    const delivered = await sendToMainWindow("netcatty:trayPanel:closeSession", sessionId, {
+      focus: false,
+      createIfMissing: false,
+    });
+    return delivered
+      ? { success: true }
+      : { success: false, error: "Main window is not available" };
   });
 
   ipcMain.handle("netcatty:trayPanel:quitApp", async () => {
@@ -902,6 +1087,13 @@ function registerHandlers(ipcMain) {
 function cleanup() {
   unregisterGlobalHotkey();
   destroyTray();
+  if (electronModule?.app?.dock?.setMenu) {
+    try {
+      electronModule.app.dock.setMenu(null);
+    } catch {
+      // ignore
+    }
+  }
 
   if (trayPanelRefreshTimer) {
     clearInterval(trayPanelRefreshTimer);
@@ -916,12 +1108,15 @@ function cleanup() {
     }
     trayPanelWindow = null;
   }
+  trayPanelReady = false;
+  trayPanelShowWhenReady = false;
 }
 
 module.exports = {
   init,
   registerHandlers,
-  clearPendingFullscreenHide,
   handleWindowClose,
+  clearPendingFullscreenHide,
   cleanup,
+  getTray: () => tray,
 };

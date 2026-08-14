@@ -1,5 +1,7 @@
 import { ArrowDownToLine, ArrowUpFromLine, X } from 'lucide-react';
 import React from 'react';
+import { useI18n } from '../../application/i18n/I18nProvider';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 
 interface ZmodemProgressIndicatorProps {
   transferType: 'upload' | 'download' | null;
@@ -9,6 +11,7 @@ interface ZmodemProgressIndicatorProps {
   fileIndex: number;
   fileCount: number;
   finalizing: boolean;
+  bytesPerSecond: number | null;
   onCancel: () => void;
 }
 
@@ -20,6 +23,11 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
+function formatSpeed(bytesPerSecond: number | null): string | null {
+  if (!bytesPerSecond || bytesPerSecond <= 0) return null;
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
 export const ZmodemProgressIndicator: React.FC<ZmodemProgressIndicatorProps> = ({
   transferType,
   filename,
@@ -28,12 +36,19 @@ export const ZmodemProgressIndicator: React.FC<ZmodemProgressIndicatorProps> = (
   fileIndex,
   fileCount,
   finalizing,
+  bytesPerSecond,
   onCancel,
 }) => {
+  const { t } = useI18n();
   const percent = total > 0 ? Math.min(100, Math.round((transferred / total) * 100)) : 0;
   const Icon = transferType === 'upload' ? ArrowUpFromLine : ArrowDownToLine;
-  const label = finalizing ? 'Waiting for remote...' : transferType === 'upload' ? 'Uploading' : 'Downloading';
+  const label = finalizing
+    ? t('zmodem.waitingForRemote')
+    : transferType === 'upload'
+      ? t('zmodem.uploading')
+      : t('zmodem.downloading');
   const fileInfo = fileCount > 0 ? ` (${fileIndex + 1}/${fileCount})` : '';
+  const speed = formatSpeed(bytesPerSecond);
 
   return (
     <div
@@ -64,16 +79,22 @@ export const ZmodemProgressIndicator: React.FC<ZmodemProgressIndicatorProps> = (
           />
         </div>
         <div className="text-[10px] opacity-50 mt-0.5">
-          {formatBytes(transferred)} / {formatBytes(total)}
+          {finalizing
+            ? label
+            : `${formatBytes(transferred)} / ${formatBytes(total)}${speed ? ` · ${speed}` : ''}`}
         </div>
       </div>
-      <button
-        onClick={onCancel}
-        className="flex-shrink-0 p-1 rounded transition-colors hover:bg-white/10"
-        title="Cancel transfer (Ctrl+C)"
-      >
-        <X className="h-3.5 w-3.5 opacity-60" />
-      </button>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={onCancel}
+            className="flex-shrink-0 p-1 rounded transition-colors hover:bg-white/10"
+          >
+            <X className="h-3.5 w-3.5 opacity-60" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>{t('zmodem.cancelTransfer')}</TooltipContent>
+      </Tooltip>
     </div>
   );
 };

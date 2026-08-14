@@ -10,6 +10,7 @@ import React, { useCallback, useMemo, useState } from 'react';
 import { cn } from '../../lib/utils';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import {
+  getExternalAgentSdkBackend,
   isSettingsManagedDiscoveredAgent,
   matchesManagedAgentConfig,
 } from '../../infrastructure/ai/managedAgents';
@@ -20,6 +21,7 @@ import {
   DropdownContent,
   DropdownTrigger,
 } from '../ui/dropdown';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 
 interface AgentSelectorProps {
   currentAgentId: string;
@@ -43,7 +45,7 @@ const BUILTIN_AGENTS: AgentInfo[] = [
 ];
 
 const SectionLabel: React.FC<{ children: React.ReactNode; action?: React.ReactNode }> = ({ children, action }) => (
-  <div className="px-4 pb-2 pt-2 flex items-center justify-between">
+  <div className="flex items-center justify-between px-3 pb-1.5 pt-1.5">
     <span className="text-[10px] font-medium tracking-wide text-muted-foreground/52">
       {children}
     </span>
@@ -61,7 +63,7 @@ const AgentMenuRow: React.FC<{
     <button
       onClick={onClick}
       className={cn(
-        'flex h-10 w-full items-center gap-3 px-4 text-left text-[13px] text-foreground/86 transition-colors cursor-pointer hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/30',
+        'flex h-9 w-full items-center gap-2.5 px-3 text-left text-xs text-foreground/86 transition-colors cursor-pointer hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/30',
         isActive && 'bg-muted',
       )}
     >
@@ -80,6 +82,7 @@ const DiscoveredAgentRow: React.FC<{
   agent: DiscoveredAgent;
   onEnable: () => void;
 }> = ({ agent, onEnable }) => {
+  const { t } = useI18n();
   const agentLike: AgentInfo = {
     id: `discovered_${agent.command}`,
     name: agent.name,
@@ -90,7 +93,7 @@ const DiscoveredAgentRow: React.FC<{
   };
 
   return (
-    <div className="flex h-10 w-full items-center gap-3 rounded-md px-4 text-[13px]">
+    <div className="flex h-9 w-full items-center gap-2.5 rounded px-3 text-xs">
       <AgentIconBadge agent={agentLike} size="xs" variant="plain" className="opacity-78" />
       <div className="min-w-0 flex-1">
         <span className="block truncate text-foreground/86">{agent.name}</span>
@@ -98,13 +101,17 @@ const DiscoveredAgentRow: React.FC<{
           {agent.version || agent.path}
         </span>
       </div>
-      <button
-        onClick={onEnable}
-        className="shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors cursor-pointer"
-        title={`Enable ${agent.name}`}
-      >
-        <Plus size={12} />
-      </button>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={onEnable}
+            className="shrink-0 rounded-md px-2 py-0.5 text-[11px] font-medium text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors cursor-pointer"
+          >
+            <Plus size={12} />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>{t('ai.chat.enableAgent', { name: agent.name })}</TooltipContent>
+      </Tooltip>
     </div>
   );
 };
@@ -125,7 +132,7 @@ const AgentSelector: React.FC<AgentSelectorProps> = ({
   const enabledExternalAgents = useMemo(
     () =>
       externalAgents
-        .filter((agent) => agent.enabled)
+        .filter((agent) => agent.enabled && Boolean(getExternalAgentSdkBackend(agent)))
         .map(
           (agent): AgentInfo => ({
             id: agent.id,
@@ -193,19 +200,19 @@ const AgentSelector: React.FC<AgentSelectorProps> = ({
       <DropdownTrigger asChild>
         <button
           type="button"
-          className="group flex h-8 min-w-0 max-w-[170px] items-center gap-2 rounded-md px-2 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/28"
+          className="group flex h-6 min-w-0 max-w-[170px] items-center gap-1.5 rounded-md px-1.5 text-left transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/28"
         >
           <AgentIconBadge
             agent={currentAgent}
             size="xs"
             variant="plain"
-            className="opacity-78"
+            className="h-3 w-3 opacity-78"
           />
-          <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground/90">
+          <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-foreground/90">
             {currentAgent.name}
           </span>
           <ChevronDown
-            size={12}
+            size={10}
             className={cn(
               'shrink-0 text-muted-foreground/60 transition-transform',
               open && 'rotate-180',
@@ -217,7 +224,7 @@ const AgentSelector: React.FC<AgentSelectorProps> = ({
       <DropdownContent
         align="start"
         sideOffset={6}
-        className="w-[288px] overflow-hidden rounded-2xl border border-border/50 bg-popover p-0 text-foreground shadow-lg supports-[backdrop-filter]:backdrop-blur-xl"
+        className="w-[256px] overflow-hidden rounded-md border border-border/50 bg-popover p-0 text-foreground shadow-lg supports-[backdrop-filter]:backdrop-blur-sm"
       >
         {BUILTIN_AGENTS.map((agent) => (
           <AgentMenuRow
@@ -250,14 +257,18 @@ const AgentSelector: React.FC<AgentSelectorProps> = ({
             <SectionLabel
               action={
                 onRediscover && (
-                  <button
-                    onClick={onRediscover}
-                    disabled={isDiscovering}
-                    className="text-[10px] text-muted-foreground/40 hover:text-muted-foreground/70 transition-colors cursor-pointer disabled:opacity-50"
-                    title={t('ai.chat.rescan')}
-                  >
-                    <RefreshCw size={10} className={cn(isDiscovering && 'animate-spin')} />
-                  </button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        onClick={onRediscover}
+                        disabled={isDiscovering}
+                        className="text-[10px] text-muted-foreground/40 hover:text-muted-foreground/70 transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        <RefreshCw size={10} className={cn(isDiscovering && 'animate-spin')} />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>{t('ai.chat.rescan')}</TooltipContent>
+                  </Tooltip>
                 )
               }
             >
@@ -276,9 +287,9 @@ const AgentSelector: React.FC<AgentSelectorProps> = ({
         <div className="mx-0 my-1 border-t border-border/50" />
         <button
           onClick={handleManageAgents}
-          className="flex h-10 w-full items-center gap-3 px-4 text-left text-[13px] text-foreground/82 transition-colors cursor-pointer hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/30"
+          className="flex h-9 w-full items-center gap-2.5 px-3 text-left text-xs text-foreground/82 transition-colors cursor-pointer hover:bg-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary/30"
         >
-          <Settings size={16} className="opacity-72 shrink-0" />
+          <Settings size={14} className="opacity-72 shrink-0" />
           <span className="min-w-0 flex-1 truncate">{t('ai.agentSettings')}</span>
         </button>
       </DropdownContent>

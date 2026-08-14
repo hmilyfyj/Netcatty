@@ -1,20 +1,15 @@
-import type { SyncPayload } from './sync';
+import {
+  CLOUD_SYNC_PAYLOAD_ENTITY_KEYS,
+  type CloudSyncPayloadEntityKey,
+  type SyncPayload,
+} from './sync';
 
 export type ShrinkFinding =
   | { suspicious: false }
   | {
       suspicious: true;
       reason: 'bulk-shrink' | 'large-shrink';
-      entityType:
-        | 'hosts'
-        | 'keys'
-        | 'identities'
-        | 'snippets'
-        | 'customGroups'
-        | 'snippetPackages'
-        | 'knownHosts'
-        | 'portForwardingRules'
-        | 'groupConfigs';
+      entityType: CloudSyncPayloadEntityKey;
       baseCount: number;
       outgoingCount: number;
       lost: number;
@@ -22,22 +17,9 @@ export type ShrinkFinding =
       viaRemote?: boolean;
     };
 
-// Keep in sync with all array-typed fields of SyncPayload. When a new
-// array entity type is added there, add it here too — there is no
-// compile-time check enforcing this.
-const CHECKED_ENTITIES = [
-  'hosts',
-  'keys',
-  'identities',
-  'snippets',
-  'customGroups',
-  'snippetPackages',
-  'knownHosts',
-  'portForwardingRules',
-  'groupConfigs',
-] as const;
+const CHECKED_ENTITIES = CLOUD_SYNC_PAYLOAD_ENTITY_KEYS;
 
-type CheckedEntityType = typeof CHECKED_ENTITIES[number];
+type CheckedEntityType = CloudSyncPayloadEntityKey;
 
 const BULK_SHRINK_RATIO = 0.5;
 const BULK_SHRINK_MIN_ABSOLUTE = 3;
@@ -69,6 +51,28 @@ export function detectSuspiciousShrink(
     const outgoingCount = countOf(outgoing, entityType);
     const lost = baseCount - outgoingCount;
     if (lost <= 0) continue;
+
+    // groupConfigs often hold startup commands / host appearance for only one
+    // or two folders. A hydration race that uploads hosts + groupConfigs:[]
+    // falls below the bulk/ratio gates (#2757). Only flag this entity — wiping
+    // the last snippet/note/etc. while hosts remain stays a normal delete.
+    // Fully empty outgoing snapshots remain allowed as real deletions.
+    if (
+      entityType === 'groupConfigs'
+      && outgoingCount === 0
+      && baseCount > 0
+      && CHECKED_ENTITIES.some((other) => other !== entityType && countOf(outgoing, other) > 0)
+    ) {
+      return {
+        suspicious: true,
+        reason: lost >= LARGE_SHRINK_ABSOLUTE ? 'large-shrink' : 'bulk-shrink',
+        entityType,
+        baseCount,
+        outgoingCount,
+        lost,
+        ...(viaRemote ? { viaRemote: true } : {}),
+      };
+    }
 
     if (lost >= LARGE_SHRINK_ABSOLUTE) {
       return {

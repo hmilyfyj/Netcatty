@@ -1,5 +1,26 @@
 import { Host, HostChainConfig, HostProtocol } from "./models";
+import { isEncryptedCredentialPlaceholder } from "./credentials";
+import { sanitizeHost } from "./host";
+import { hasMacKeychainAgentDirectives } from "./sshAuth";
+import {
+  buildVaultHostFromDraft,
+  buildVaultHostMergeKey,
+  type VaultHostKeyPassphrase,
+  type VaultHostDraftProtocol,
+} from "./vaultHostCreate";
+
+export {
+  buildVaultHostEndpointKey,
+  buildVaultHostMergeKey,
+} from "./vaultHostCreate";
 import { parseQuickConnectInput } from "./quickConnect";
+import { findExactHeaderIndex, findHeaderIndex, parseCsv } from "./vaultImport/csvUtils";
+import { decodeCsvKeyPath, decodeCsvPassphrase } from "./vaultImport/csvCredentialFields";
+export {
+  exportHostsToCsvWithStats,
+  getVaultCsvTemplate,
+  resolveVaultCsvHostKeyPath,
+} from "./vaultImport/csvExport";
 
 interface ParsedJumpHost {
   hostname: string;
@@ -66,7 +87,6 @@ const parseJumpHostSpec = (spec: string): ParsedJumpHost | null => {
   if (!hostname) return null;
   return { hostname, username, port };
 };
-
 const parseProxyJump = (value: string): ParsedJumpHost[] => {
   if (!value || value.toLowerCase() === "none") return [];
   return value
@@ -84,29 +104,65 @@ export type VaultImportFormat =
   | "securecrt"
   | "ssh_config";
 
+export const VAULT_IMPORT_FORMATS: VaultImportFormat[] = [
+  "csv",
+  "putty",
+  "mobaxterm",
+  "securecrt",
+  "ssh_config",
+];
+
 type VaultImportIssueLevel = "warning" | "error";
 
-interface VaultImportIssue {
+export interface VaultImportIssue {
   level: VaultImportIssueLevel;
   message: string;
 }
 
-interface VaultImportStats {
+export interface VaultImportStats {
   parsed: number;
   imported: number;
   skipped: number;
   duplicates: number;
 }
 
-interface VaultImportResult {
+export interface VaultImportResult {
   hosts: Host[];
   groups: string[];
   issues: VaultImportIssue[];
   stats: VaultImportStats;
+  keyPassphrases?: VaultHostKeyPassphrase[];
+  keyPassphraseCandidates?: VaultHostKeyPassphrase[];
 }
 
-interface VaultCsvTemplateOptions {
-  includeExampleRows?: boolean;
+export type VaultImportDestination =
+  | { mode: "preserve" }
+  | { mode: "group"; group: string };
+
+export type ApplyVaultImportDestinationOptions = {
+  /**
+   * When false, only rewrite groups. SecureCRT keeps distinct session files that
+   * share an endpoint even after an import-location override.
+   * @default true
+   */
+  collapseDuplicateEndpoints?: boolean;
+  /**
+   * Return false to keep a host even when another shares its merge key after the
+   * destination rewrite (plugin hosts that differ by configuration/credentials).
+   */
+  isCollapsible?: (host: Host) => boolean;
+};
+
+export function mergeVaultImportIssues(
+  ...groups: ReadonlyArray<ReadonlyArray<VaultImportIssue>>
+): VaultImportIssue[] {
+  const seen = new Set<string>();
+  return groups.flatMap((issues) => issues.filter((issue) => {
+    const key = `${issue.level}\u0000${issue.message}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }));
 }
 
 const DEFAULT_SSH_PORT = 22;
@@ -120,9 +176,98 @@ const normalizeGroupPath = (raw: string | undefined): string | undefined => {
   return parts.join("/");
 };
 
+export function applyVaultImportDestination(
+  result: VaultImportResult,
+  destination: VaultImportDestination,
+  options?: ApplyVaultImportDestinationOptions,
+): VaultImportResult {
+  if (destination.mode === "preserve") return result;
+  const group = normalizeGroupPath(destination.group);
+  if (!group) return result;
+
+  const rewrittenHosts = result.hosts.map((host) => ({ ...host, group }));
+  // SecureCRT (and similar) keep same-endpoint sessions as distinct imports.
+  if (options?.collapseDuplicateEndpoints === false) {
+    return {
+      ...result,
+      hosts: rewrittenHosts,
+      groups: [group],
+    };
+  }
+
+  // Destination rewriting can collapse previously distinct group-scoped sessions
+  // onto one merge key; re-dedupe so identical endpoints are not imported twice.
+  // Plugin hosts can opt out via isCollapsible so configuration/credential
+  // differences survive a shared destination group.
+  const { hosts, duplicates } = dedupeHosts(rewrittenHosts, {
+    isCollapsible: options?.isCollapsible,
+  });
+  const retainedIds = new Set(hosts.map((host) => host.id));
+  const retainedByMergeKey = new Map(
+    hosts
+      .filter((host) => options?.isCollapsible?.(host) !== false)
+      .map((host) => [hostKey(host), host]),
+  );
+  const originalById = new Map(result.hosts.map((host) => [host.id, host]));
+
+  const remapHostId = (hostId: string): string | undefined => {
+    if (retainedIds.has(hostId)) return hostId;
+    const original = originalById.get(hostId);
+    if (!original) return undefined;
+    if (options?.isCollapsible?.({ ...original, group }) === false) return undefined;
+    return retainedByMergeKey.get(hostKey({ ...original, group }))?.id;
+  };
+
+  const selectedKeyByHostId = new Map(
+    hosts.map((host) => {
+      const selected = host.identityFilePaths?.find((path) => path.trim())?.trim();
+      return [host.id, selected ? normalizeKeyPathKey(selected) : undefined] as const;
+    }),
+  );
+
+  const remapKeyPassphrases = (
+    entries: VaultHostKeyPassphrase[] | undefined,
+    remapOptions?: { matchSelectedKey?: boolean },
+  ): VaultHostKeyPassphrase[] | undefined => {
+    if (!entries) return entries;
+    const remapped: VaultHostKeyPassphrase[] = [];
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      const nextHostId = remapHostId(entry.hostId);
+      if (!nextHostId) continue;
+      // Match CSV same-group dedupe: never attach a passphrase for a key the
+      // retained host did not keep as its selected identity file.
+      if (remapOptions?.matchSelectedKey) {
+        const selectedKey = selectedKeyByHostId.get(nextHostId);
+        if (!selectedKey || normalizeKeyPathKey(entry.keyPath) !== selectedKey) continue;
+      }
+      const dedupeKey = `${nextHostId}\u0000${normalizeKeyPathKey(entry.keyPath)}\u0000${entry.passphrase}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      remapped.push(nextHostId === entry.hostId ? entry : { ...entry, hostId: nextHostId });
+    }
+    return remapped;
+  };
+
+  return {
+    ...result,
+    hosts,
+    groups: [group],
+    keyPassphrases: remapKeyPassphrases(result.keyPassphrases, { matchSelectedKey: true }),
+    // Keep remapped candidates for alias conflict checks (same as CSV same-group
+    // dedupe); the import handler still gates saves on the retained key path.
+    keyPassphraseCandidates: remapKeyPassphrases(result.keyPassphraseCandidates),
+    stats: {
+      ...result.stats,
+      imported: hosts.length,
+      duplicates: result.stats.duplicates + duplicates,
+    },
+  };
+}
+
 const normalizeProtocol = (
   raw: string | undefined,
-): Exclude<HostProtocol, "mosh"> | undefined => {
+): Exclude<HostProtocol, "mosh" | "et"> | undefined => {
   const s = raw?.trim().toLowerCase();
   if (!s) return undefined;
   if (s === "ssh" || s === "ssh2" || s === "ssh-2") return "ssh";
@@ -148,57 +293,83 @@ const splitTags = (raw: string | undefined): string[] => {
     .filter(Boolean);
 };
 
-const hostKey = (h: Pick<Host, "hostname" | "port" | "username" | "protocol">) =>
-  `${(h.protocol ?? "ssh").toLowerCase()}|${h.hostname.toLowerCase()}|${h.port}|${(h.username ?? "").toLowerCase()}`;
+const hostKey = buildVaultHostMergeKey;
+
+const normalizeKeyPathKey = (keyPath: string): string => {
+  const isWindowsPath = /^[A-Za-z]:[\\/]/u.test(keyPath) || /^[\\/]{2}/u.test(keyPath);
+  return isWindowsPath ? keyPath.replace(/\\/g, "/").toLowerCase() : keyPath;
+};
 
 const createHost = (input: {
   label?: string;
   hostname: string;
   username?: string;
   password?: string;
+  keyPath?: string;
   port?: number;
-  protocol?: Exclude<HostProtocol, "mosh">;
+  protocol?: VaultHostDraftProtocol;
   group?: string;
   tags?: string[];
+  notes?: string;
 }): Host => {
-  const now = Date.now();
-  return {
-    id: crypto.randomUUID(),
-    label: input.label?.trim() || input.hostname,
-    hostname: input.hostname.trim(),
-    port: input.port ?? DEFAULT_SSH_PORT,
-    username: input.username?.trim() ?? "",
-    password: input.password || undefined,
-    group: normalizeGroupPath(input.group),
-    tags: (input.tags ?? []).filter(Boolean),
-    os: "linux",
-    protocol: input.protocol ?? "ssh",
-    createdAt: now,
-  };
+  const built = buildVaultHostFromDraft(input);
+  if (!built.ok) {
+    throw new Error(built.error);
+  }
+  return built.host;
 };
 
-const dedupeHosts = (hosts: Host[]): { hosts: Host[]; duplicates: number } => {
+const dedupeHosts = (
+  hosts: Host[],
+  options?: { isCollapsible?: (host: Host) => boolean },
+): { hosts: Host[]; duplicates: number } => {
   const seen = new Map<string, Host>();
+  const retained: Host[] = [];
   let duplicates = 0;
 
   for (const host of hosts) {
+    if (options?.isCollapsible?.(host) === false) {
+      retained.push(host);
+      continue;
+    }
     const key = hostKey(host);
     const existing = seen.get(key);
     if (!existing) {
       seen.set(key, host);
+      retained.push(host);
       continue;
     }
     duplicates++;
     const mergedTags = Array.from(new Set([...(existing.tags ?? []), ...(host.tags ?? [])]));
     existing.tags = mergedTags;
     if (!existing.password && host.password) existing.password = host.password;
+    if (!existing.identityFilePaths?.some((path) => path.trim()) && host.identityFilePaths?.length) {
+      existing.identityFilePaths = host.identityFilePaths;
+      existing.authMethod = host.authMethod;
+      existing.authPolicyVersion = host.authPolicyVersion;
+      existing.useSshAgent = host.useSshAgent;
+    }
+    // Only graft referenced credentials onto a retained host that has no auth
+    // source yet. Otherwise identity auth can override an existing key path.
+    const retainedHasCredentialSource = Boolean(
+      existing.identityId
+      || existing.telnetIdentityId
+      || existing.identityFileId
+      || existing.identityFilePaths?.some((path) => path.trim())
+      || (typeof existing.password === "string" && existing.password.length > 0)
+    );
+    if (!retainedHasCredentialSource) {
+      if (host.identityId) existing.identityId = host.identityId;
+      if (host.telnetIdentityId) existing.telnetIdentityId = host.telnetIdentityId;
+      if (host.identityFileId) existing.identityFileId = host.identityFileId;
+    }
     if (existing.group == null && host.group != null) existing.group = host.group;
     if (existing.label === existing.hostname && host.label && host.label !== host.hostname) {
       existing.label = host.label;
     }
   }
 
-  return { hosts: Array.from(seen.values()), duplicates };
+  return { hosts: retained, duplicates };
 };
 
 const uniq = (items: string[]) => Array.from(new Set(items.filter(Boolean)));
@@ -210,7 +381,7 @@ const looksLikeHostnameToken = (token: string): boolean => {
 
 const parseTarget = (
   raw: string,
-): { hostname: string; username?: string; port?: number; protocol?: Exclude<HostProtocol, "mosh"> } | null => {
+): { hostname: string; username?: string; port?: number; protocol?: Exclude<HostProtocol, "mosh" | "et"> } | null => {
   const trimmed = raw.trim();
   if (!trimmed) return null;
 
@@ -243,76 +414,6 @@ const parseTarget = (
   return null;
 };
 
-const parseCsv = (text: string): string[][] => {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let field = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inQuotes) {
-      if (ch === '"') {
-        const next = text[i + 1];
-        if (next === '"') {
-          field += '"';
-          i++;
-        } else {
-          inQuotes = false;
-        }
-      } else {
-        field += ch;
-      }
-      continue;
-    }
-
-    if (ch === '"') {
-      inQuotes = true;
-      continue;
-    }
-
-    if (ch === ",") {
-      row.push(field);
-      field = "";
-      continue;
-    }
-
-    if (ch === "\r" || ch === "\n") {
-      if (ch === "\r" && text[i + 1] === "\n") i++;
-      row.push(field);
-      field = "";
-      rows.push(row);
-      row = [];
-      continue;
-    }
-
-    field += ch;
-  }
-
-  row.push(field);
-  rows.push(row);
-  return rows;
-};
-
-const normalizeHeaderKey = (raw: string): string => {
-  return raw
-    .trim()
-    .toLowerCase()
-    .replace(/[\s_-]+/g, "")
-    .replace(/[^\p{L}\p{N}]/gu, "");
-};
-
-const findHeaderIndex = (headers: string[], candidates: string[]): number => {
-  const normalized = headers.map((h) => normalizeHeaderKey(h));
-  for (const cand of candidates) {
-    const c = cand.toLowerCase();
-    for (let i = 0; i < normalized.length; i++) {
-      const h = normalized[i];
-      if (h === c || h.startsWith(c)) return i;
-    }
-  }
-  return -1;
-};
 
 const importFromCsv = (text: string): VaultImportResult => {
   const issues: VaultImportIssue[] = [];
@@ -332,11 +433,29 @@ const importFromCsv = (text: string): VaultImportResult => {
   const groupsIdx = findHeaderIndex(header, ["groups", "group", "folder", "path"]);
   const labelIdx = findHeaderIndex(header, ["label", "name"]);
   const tagsIdx = findHeaderIndex(header, ["tags", "tag"]);
+  const notesIdx = findHeaderIndex(header, ["notes", "note", "remark", "description", "memo"]);
   const hostnameIdx = findHeaderIndex(header, ["hostname", "host", "server"]);
   const protocolIdx = findHeaderIndex(header, ["protocol", "proto", "scheme"]);
   const portIdx = findHeaderIndex(header, ["port"]);
   const usernameIdx = findHeaderIndex(header, ["username", "user", "login"]);
-  const passwordIdx = findHeaderIndex(header, ["password", "pass", "passwd"]);
+  const keyPathIdx = findExactHeaderIndex(header, ["keypath", "key path", "identityfile", "identity file"]);
+  const explicitPassphraseIdx = findExactHeaderIndex(header, ["passphrase", "keypassphrase", "key passphrase"]);
+  const passphraseIdx = keyPathIdx >= 0 ? explicitPassphraseIdx : -1;
+  const exactPasswordIdx = findExactHeaderIndex(header, ["password", "pass", "passwd"]);
+  const fuzzyNamedPasswordIdx = findHeaderIndex(header, ["password", "passwd"]);
+  const fuzzyPassIdx = header.findIndex((value) => {
+    const normalized = value.trim().toLowerCase().replace(/[^a-z0-9]/gu, "");
+    if (!normalized.startsWith("pass")) return false;
+    if (!normalized.startsWith("passphrase")) return true;
+    const suffix = normalized.slice("passphrase".length);
+    return keyPathIdx < 0 && ["", "optional", "value"].includes(suffix);
+  });
+  const fuzzyPasswordIdx = fuzzyNamedPasswordIdx >= 0 ? fuzzyNamedPasswordIdx : fuzzyPassIdx;
+  const passwordIdx = exactPasswordIdx >= 0
+    ? exactPasswordIdx
+    : keyPathIdx < 0 && explicitPassphraseIdx >= 0
+      ? explicitPassphraseIdx
+      : fuzzyPasswordIdx;
 
   if (hostnameIdx === -1) {
     return {
@@ -354,6 +473,17 @@ const importFromCsv = (text: string): VaultImportResult => {
   }
 
   const parsedHosts: Host[] = [];
+  const keyPassphraseCandidates: Array<{
+    hostKey: string;
+    keyPathKey: string;
+    keyPath: string;
+    passphrase: string;
+  }> = [];
+  const keyPassphrasesByPath = new Map<string, {
+    keyPath: string;
+    passphrase?: string;
+    conflict: boolean;
+  }>();
   let parsed = 0;
   let skipped = 0;
 
@@ -376,6 +506,8 @@ const importFromCsv = (text: string): VaultImportResult => {
     const group = groupsIdx >= 0 ? normalizeGroupPath(row[groupsIdx]) : undefined;
     const label = labelIdx >= 0 ? row[labelIdx] : undefined;
     const tags = tagsIdx >= 0 ? splitTags(row[tagsIdx]) : [];
+    const notesRaw = notesIdx >= 0 ? row[notesIdx] : undefined;
+    const notes = notesRaw?.trim() || undefined;
     const protocol =
       normalizeProtocol(protocolIdx >= 0 ? row[protocolIdx] : undefined) ??
       target.protocol ??
@@ -383,27 +515,92 @@ const importFromCsv = (text: string): VaultImportResult => {
     const port = parsePort(portIdx >= 0 ? row[portIdx] : undefined) ?? target.port;
     const username = (usernameIdx >= 0 ? row[usernameIdx] : undefined)?.trim() || target.username;
     const password = (passwordIdx >= 0 ? row[passwordIdx] : undefined) || undefined;
+    const keyPathRaw = (keyPathIdx >= 0 ? row[keyPathIdx] : undefined)?.trim();
+    const keyPath = keyPathRaw ? decodeCsvKeyPath(keyPathRaw) : undefined;
+    const passphraseRaw = (passphraseIdx >= 0 ? row[passphraseIdx] : undefined) || undefined;
+    const decodedPassphrase = passphraseRaw ? decodeCsvPassphrase(passphraseRaw) : undefined;
+    const passphrase = decodedPassphrase && !isEncryptedCredentialPlaceholder(decodedPassphrase)
+      ? decodedPassphrase
+      : undefined;
 
-    parsedHosts.push(
-      createHost({
-        label,
-        hostname: target.hostname,
-        username,
-        password,
-        port,
-        protocol,
-        group,
-        tags,
-      }),
-    );
+    if (decodedPassphrase && isEncryptedCredentialPlaceholder(decodedPassphrase)) {
+      issues.push({
+        level: "warning",
+        message: `CSV row ${i + 2}: Passphrase was ignored because encrypted credential values cannot be imported.`,
+      });
+    }
+
+    if (passphrase && !keyPath) {
+      issues.push({
+        level: "warning",
+        message: `CSV row ${i + 2}: Passphrase was ignored because KeyPath is empty.`,
+      });
+    }
+
+    const host = createHost({
+      label,
+      hostname: target.hostname,
+      username,
+      password,
+      keyPath,
+      port,
+      protocol,
+      group,
+      tags,
+      notes,
+    });
+    parsedHosts.push(host);
+    if (keyPath && passphrase) {
+      const keyPathKey = normalizeKeyPathKey(keyPath);
+      const stored = keyPassphrasesByPath.get(keyPathKey);
+      if (!stored) {
+        keyPassphrasesByPath.set(keyPathKey, { keyPath, passphrase, conflict: false });
+      } else if (stored.passphrase !== passphrase && !stored.conflict) {
+        stored.conflict = true;
+        issues.push({
+          level: "warning",
+          message: `CSV contains conflicting passphrases for KeyPath "${keyPath}"; no passphrase was saved for that path.`,
+        });
+      }
+      keyPassphraseCandidates.push({
+        hostKey: buildVaultHostMergeKey(host),
+        keyPathKey,
+        keyPath,
+        passphrase,
+      });
+    }
   }
 
   const { hosts, duplicates } = dedupeHosts(parsedHosts);
+  const keyPassphrases = hosts.flatMap((host) => {
+    const selectedKeyPath = host.identityFilePaths?.find((path) => path.trim())?.trim();
+    if (!selectedKeyPath) return [];
+    const selectedKeyPathKey = normalizeKeyPathKey(selectedKeyPath);
+    const candidate = keyPassphraseCandidates.find((entry) => (
+      entry.hostKey === buildVaultHostMergeKey(host)
+      && entry.keyPathKey === selectedKeyPathKey
+    ));
+    const entry = candidate ? keyPassphrasesByPath.get(candidate.keyPathKey) : undefined;
+    return entry?.passphrase && !entry.conflict
+      ? [{ hostId: host.id, keyPath: entry.keyPath, passphrase: entry.passphrase }]
+      : [];
+  });
+  const allKeyPassphraseCandidates = hosts.flatMap((host) => {
+    return keyPassphraseCandidates
+      .filter((entry) => entry.hostKey === buildVaultHostMergeKey(host))
+      .map((entry) => ({
+        hostId: host.id,
+        keyPath: entry.keyPath,
+        passphrase: entry.passphrase,
+      }));
+  });
   const groups = uniq(hosts.map((h) => h.group).filter(Boolean) as string[]);
   return {
     hosts,
     groups,
     issues,
+    keyPassphrases,
+    keyPassphraseCandidates: allKeyPassphraseCandidates,
     stats: {
       parsed,
       imported: hosts.length,
@@ -446,7 +643,7 @@ const importFromPuttyReg = (text: string): VaultImportResult => {
     hostname?: string;
     username?: string;
     port?: number;
-    protocol?: Exclude<HostProtocol, "mosh">;
+    protocol?: Exclude<HostProtocol, "mosh" | "et">;
   };
 
   const sessions: Session[] = [];
@@ -526,6 +723,11 @@ const importFromSshConfig = (text: string): VaultImportResult => {
     port?: number;
     proxyJump?: string;
     identityFiles?: string[];
+    identityAgent?: string;
+    identitiesOnly?: boolean;
+    addKeysToAgent?: string;
+    useKeychain?: boolean;
+    forwardX11?: boolean;
   };
 
   const blocks: Block[] = [];
@@ -564,6 +766,11 @@ const importFromSshConfig = (text: string): VaultImportResult => {
     else if (keyword === "user") current.username = value;
     else if (keyword === "port") current.port = parsePort(value);
     else if (keyword === "proxyjump") current.proxyJump = value;
+    else if (keyword === "forwardx11") current.forwardX11 = value.toLowerCase() === "yes";
+    else if (keyword === "identityagent") current.identityAgent = value.replace(/^["']|["']$/g, "");
+    else if (keyword === "identitiesonly") current.identitiesOnly = value.toLowerCase() === "yes";
+    else if (keyword === "addkeystoagent") current.addKeysToAgent = value.toLowerCase();
+    else if (keyword === "usekeychain") current.useKeychain = value.toLowerCase() === "yes";
     else if (keyword === "identityfile") {
       if (!current.identityFiles) current.identityFiles = [];
       // Remove surrounding quotes (ssh_config allows quoted paths with spaces)
@@ -613,6 +820,34 @@ const importFromSshConfig = (text: string): VaultImportResult => {
       // Attach IdentityFile paths if present
       if (block.identityFiles && block.identityFiles.length > 0) {
         host.identityFilePaths = [...block.identityFiles];
+      }
+      if (block.identityAgent !== undefined) {
+        host.identityAgent = block.identityAgent;
+      }
+      if (block.identitiesOnly !== undefined) {
+        host.identitiesOnly = block.identitiesOnly;
+      }
+      if (block.addKeysToAgent !== undefined) {
+        host.addKeysToAgent = block.addKeysToAgent;
+      }
+      if (block.useKeychain !== undefined) {
+        host.useKeychain = block.useKeychain;
+      }
+      const identityAgentEnabled = block.identityAgent !== undefined
+        && block.identityAgent.toLowerCase() !== "none";
+      const identityAgentDisabled = block.identityAgent?.toLowerCase() === "none";
+      // The #2119 macOS pattern relies on AddKeysToAgent + UseKeychain without
+      // declaring IdentityAgent. Treat that pair as an agent-backed login so
+      // the bridge can ask Apple's ssh-add to load the configured IdentityFile.
+      // AddKeysToAgent alone still keeps direct-key semantics on other setups.
+      const macKeychainAgentEnabled = hasMacKeychainAgentDirectives(block);
+      if (!identityAgentDisabled && (identityAgentEnabled || macKeychainAgentEnabled)) {
+        host.useSshAgent = true;
+      } else if (identityAgentDisabled) {
+        host.useSshAgent = false;
+      }
+      if (block.forwardX11 !== undefined) {
+        host.x11Forwarding = block.forwardX11;
       }
 
       parsedHosts.push(host);
@@ -759,7 +994,10 @@ const importFromSecureCrt = (text: string, fileName?: string): VaultImportResult
     hostname?: string;
     username?: string;
     port?: number;
-    protocol?: Exclude<HostProtocol, "mosh">;
+    ssh1Port?: number;
+    ssh2Port?: number;
+    sshVersion?: "ssh1" | "ssh2";
+    protocol?: Exclude<HostProtocol, "mosh" | "et">;
   };
 
   const sessions: Session[] = [];
@@ -798,9 +1036,19 @@ const importFromSecureCrt = (text: string, fileName?: string): VaultImportResult
       current.username = value;
     } else if (key === "Port") {
       current.port = parseSecureCrtPort(value);
+    } else if (key === "[SSH2] Port") {
+      current.ssh2Port = parseSecureCrtPort(value);
+    } else if (key === "[SSH1] Port") {
+      current.ssh1Port = parseSecureCrtPort(value);
     } else if (key === "Protocol Name") {
       const p = normalizeProtocol(value);
-      current.protocol = p;
+      const normalizedName = value.trim().toLowerCase();
+      current.sshVersion = normalizedName === "ssh1"
+        ? "ssh1"
+        : normalizedName === "ssh2" || normalizedName === "ssh-2"
+          ? "ssh2"
+          : undefined;
+      current.protocol = p ?? (current.sshVersion ? "ssh" : undefined);
     } else if (key === "Session Name") {
       current.label = value;
     }
@@ -829,12 +1077,19 @@ const importFromSecureCrt = (text: string, fileName?: string): VaultImportResult
     }
 
     const label = s.label || (sessions.length > 1 ? `${fallbackLabel} ${i + 1}` : fallbackLabel);
+    const protocolSpecificPort = protocol === "ssh"
+      ? s.sshVersion === "ssh1"
+        ? s.ssh1Port
+        : s.sshVersion === "ssh2"
+          ? s.ssh2Port
+          : s.ssh2Port ?? s.ssh1Port
+      : undefined;
     parsedHosts.push(
       createHost({
         label,
         hostname: s.hostname,
         username: s.username,
-        port: s.port ?? (protocol === "ssh" ? DEFAULT_SSH_PORT : 23),
+        port: protocolSpecificPort ?? s.port ?? (protocol === "ssh" ? DEFAULT_SSH_PORT : 23),
         protocol,
       }),
     );
@@ -855,6 +1110,7 @@ const importFromMobaXterm = (text: string): VaultImportResult => {
 
   type Entry = { section: string; key: string; value: string };
   const entries: Entry[] = [];
+  const sectionGroups = new Map<string, string | undefined>();
 
   let section = "";
   for (const line of lines) {
@@ -870,11 +1126,21 @@ const importFromMobaXterm = (text: string): VaultImportResult => {
 
     const mKv = trimmed.match(/^([^=]+)=(.*)$/);
     if (!mKv) continue;
-    entries.push({ section, key: mKv[1].trim(), value: mKv[2].trim() });
+    const key = mKv[1].trim();
+    const value = mKv[2].trim();
+    const isBookmarkSection = /^bookmarks(?:_\d+)?$/i.test(section.trim());
+
+    if (isBookmarkSection && key.toLowerCase() === "subrep") {
+      sectionGroups.set(section, normalizeGroupPath(value));
+      continue;
+    }
+    if (isBookmarkSection && key.toLowerCase() === "imgnum") continue;
+
+    entries.push({ section, key, value });
   }
 
   const candidateEntries = entries.filter((e) =>
-    ["sessions", "bookmarks", "bookmarks2", "bookmark"].includes(e.section.trim().toLowerCase()),
+    /^(?:sessions|bookmarks(?:_\d+)?|bookmarks2|bookmark)$/i.test(e.section.trim()),
   );
 
   const parsedHosts: Host[] = [];
@@ -888,55 +1154,81 @@ const importFromMobaXterm = (text: string): VaultImportResult => {
 
     parsed++;
 
+    const isBookmarkSection = /^bookmarks(?:_\d+)?$/i.test(e.section.trim());
+    const hasBookmarkGroup = sectionGroups.has(e.section);
     const keyParts = rawKey.replace(/\\/g, "/").split("/").filter(Boolean);
-    const label = keyParts[keyParts.length - 1] || rawKey;
-    const group =
-      keyParts.length > 1 ? keyParts.slice(0, -1).join("/") : undefined;
+    const label = isBookmarkSection && hasBookmarkGroup
+      ? rawKey
+      : keyParts[keyParts.length - 1] || rawKey;
+    const group = isBookmarkSection && hasBookmarkGroup
+      ? sectionGroups.get(e.section)
+      : keyParts.length > 1
+        ? keyParts.slice(0, -1).join("/")
+        : undefined;
 
-    let protocol: Exclude<HostProtocol, "mosh"> | undefined;
+    let protocol: Exclude<HostProtocol, "mosh" | "et"> | undefined;
     let hostname: string | undefined;
     let username: string | undefined;
     let port: number | undefined;
 
-    const tokens = rawValue
-      .split("#")
-      .map((t) => t.trim())
-      .filter(Boolean);
+    const outerFields = rawValue.split("#");
+    const sessionFields = outerFields.length >= 3 ? outerFields[2].split("%") : [];
+    const sessionType = sessionFields[0]?.trim();
+    const isStandardSession = /^(?:;\s*logout)?\s*#\d+(?:#|$)/i.test(rawValue);
 
-    if (tokens.length > 0) {
-      protocol =
-        normalizeProtocol(tokens[0]) ??
-        tokens.map((t) => normalizeProtocol(t)).find(Boolean);
-
-      // Find a token that looks like [user@]host[:port]
-      for (const tok of tokens) {
-        const t = tok.replace(/^ssh:/i, "").trim();
-        const target = parseTarget(t);
-        if (target) {
-          hostname = target.hostname;
-          username = target.username ?? username;
-          port = target.port ?? port;
-          protocol = target.protocol ?? protocol;
-          break;
-        }
+    if (isStandardSession) {
+      if (!/^\d+$/.test(sessionType ?? "")) {
+        skipped++;
+        issues.push({
+          level: "warning",
+          message: `MobaXterm entry "${label}": invalid session type.`,
+        });
+        continue;
+      }
+      if (sessionType !== "0" && sessionType !== "7") {
+        skipped++;
+        issues.push({
+          level: "warning",
+          message: `MobaXterm entry "${label}": unsupported session type.`,
+        });
+        continue;
       }
 
-      if (!hostname) {
-        const hostToken = tokens.find(looksLikeHostnameToken);
-        if (hostToken) {
-          const target = parseTarget(hostToken);
-          hostname = target?.hostname;
-          username = target?.username;
-          port = target?.port;
+      protocol = "ssh";
+      hostname = sessionFields[1]?.trim() || undefined;
+      port = parsePort(sessionFields[2]);
+      const rawUsername = sessionFields[3]?.trim();
+      username = rawUsername && rawUsername !== "<default>" ? rawUsername : undefined;
+    } else {
+      // Retain support for the simpler token layouts accepted by older imports.
+      const tokens = rawValue
+        .split("#")
+        .map((t) => t.trim())
+        .filter(Boolean);
+
+      if (tokens.length > 0) {
+        protocol =
+          normalizeProtocol(tokens[0]) ??
+          tokens.map((t) => normalizeProtocol(t)).find(Boolean);
+
+        for (const tok of tokens) {
+          const target = parseTarget(tok.replace(/^ssh:/i, "").trim());
+          if (target) {
+            hostname = target.hostname;
+            username = target.username ?? username;
+            port = target.port ?? port;
+            protocol = target.protocol ?? protocol;
+            break;
+          }
         }
-      }
 
-      const numericPort = tokens.map((t) => parsePort(t)).find(Boolean);
-      if (numericPort) port = numericPort;
+        const numericPort = tokens.map((t) => parsePort(t)).find(Boolean);
+        if (numericPort) port = numericPort;
 
-      if (!username) {
-        const userToken = tokens.find((t) => t.includes("@"));
-        if (userToken) username = userToken.split("@")[0];
+        if (!username) {
+          const userToken = tokens.find((t) => t.includes("@"));
+          if (userToken) username = userToken.split("@")[0];
+        }
       }
     }
 
@@ -995,101 +1287,176 @@ export const importVaultHostsFromText = (
   }
 };
 
-export const getVaultCsvTemplate = (
-  opts: VaultCsvTemplateOptions = {},
-): string => {
-  const includeExampleRows = opts.includeExampleRows !== false;
-  const header = ["Groups", "Label", "Tags", "Hostname/IP", "Protocol", "Port", "Username", "Password"];
-  const rows: string[][] = [header];
-  if (includeExampleRows) {
-    rows.push(["Project/Dev", "Web Server (dev)", "dev,web", "192.168.1.10", "ssh", "22", "root", ""]);
-    rows.push(["Project/Prod", "Web Server (prod)", "prod,web", "server-a.example.com", "ssh", "22", "ubuntu", ""]);
-    rows.push(["Database", "DB", "db,mysql", "db.example.com", "ssh", "4567", "admin", ""]);
+export function detectVaultImportFormat(text: string): VaultImportFormat | null {
+  const input = (text ?? "").trim();
+  if (!input) return null;
+
+  if (
+    /Windows Registry Editor Version/i.test(input)
+    || /\\Software\\SimonTatham\\PuTTY\\Sessions/i.test(input)
+  ) {
+    return "putty";
   }
 
-  const escapeCsv = (value: string) => {
-    if (value.includes('"')) value = value.replace(/"/g, '""');
-    if (/[",\r\n]/.test(value)) return `"${value}"`;
-    return value;
-  };
-
-  return rows.map((r) => r.map((c) => escapeCsv(c)).join(",")).join("\r\n") + "\r\n";
-};
-
-const exportHostsToCsv = (hosts: Host[]): string => {
-  const header = ["Groups", "Label", "Tags", "Hostname/IP", "Protocol", "Port", "Username", "Password"];
-  const rows: string[][] = [header];
-
-  const escapeCsv = (value: string, skipFormulaGuard = false) => {
-    // Prevent CSV formula injection by prefixing dangerous characters with a single quote
-    // These characters can be interpreted as formulas by spreadsheet applications
-    // Skip for password fields to preserve credentials verbatim for round-trip
-    if (!skipFormulaGuard && /^[=+\-@\t\r]/.test(value)) {
-      value = "'" + value;
-    }
-    if (value.includes('"')) value = value.replace(/"/g, '""');
-    if (/[",\r\n]/.test(value)) return `"${value}"`;
-    return value;
-  };
-
-  // Filter out serial hosts - CSV format doesn't support serial port configuration
-  // Note: mosh-enabled hosts are exported as SSH (losing mosh flag) rather than being skipped,
-  // since exporting partial data is better than losing the entire host entry
-  const isUnsupported = (h: Host) => h.protocol === "serial";
-  const exportableHosts = hosts.filter((h) => !isUnsupported(h));
-
-  // Helper to bracket IPv6 addresses for CSV export
-  // IPv6 addresses contain colons which would be misinterpreted as port separators on import
-  const formatHostname = (hostname: string): string => {
-    // Check if it looks like an IPv6 address (contains colons but not already bracketed)
-    if (hostname.includes(":") && !hostname.startsWith("[")) {
-      return `[${hostname}]`;
-    }
-    return hostname;
-  };
-
-  for (const host of exportableHosts) {
-    // For telnet hosts, use telnet-specific port and username
-    const isTelnet = host.protocol === "telnet";
-    const effectivePort = isTelnet
-      ? (host.telnetPort ?? host.port ?? 23)
-      : (host.port ?? 22);
-    const effectiveUsername = isTelnet
-      ? (host.telnetUsername ?? host.username ?? "")
-      : (host.username ?? "");
-
-    rows.push([
-      host.group ?? "",
-      host.label ?? "",
-      (host.tags ?? []).join(","),
-      formatHostname(host.hostname),
-      host.protocol ?? "ssh",
-      String(effectivePort),
-      effectiveUsername,
-      host.password ?? "",
-    ]);
+  const hasMobaBookmarkSection = /^\[Bookmarks(?:_\d+)?\]\s*$/im.test(input);
+  const hasMobaBookmarkMetadata = /^SubRep=.*$/im.test(input) && /^ImgNum=\d+\s*$/im.test(input);
+  const hasMobaSessionLine = /^[^=\r\n]+=\s*(?:; logout)?\s*#\d+#\d+%[^%\r\n]+%\d+/im.test(input);
+  if (
+    /\[MobaXterm\]/i.test(input)
+    || (hasMobaBookmarkSection && (hasMobaBookmarkMetadata || hasMobaSessionLine))
+  ) {
+    return "mobaxterm";
   }
 
-  const passwordColIdx = header.indexOf("Password");
-  return rows.map((r, rowIdx) => r.map((c, i) => escapeCsv(c, rowIdx > 0 && i === passwordColIdx)).join(",")).join("\r\n") + "\r\n";
-};
+  if (/^Host\s+/m.test(input) && (/^\s+HostName\s+/m.test(input) || /^\s+User\s+/m.test(input))) {
+    return "ssh_config";
+  }
 
-interface ExportHostsResult {
-  csv: string;
-  exportedCount: number;
-  skippedCount: number;
+  if (/S:"Hostname"/m.test(input) && (/S:"Username"/m.test(input) || /D:"\[Sessions\]/i.test(input))) {
+    return "securecrt";
+  }
+
+  const firstLine = input.split(/\r?\n/, 1)[0] ?? "";
+  if (
+    /hostname|host(name)?|server/i.test(firstLine)
+    && (firstLine.includes(",") || firstLine.includes("\t"))
+  ) {
+    return "csv";
+  }
+
+  return null;
 }
 
-export const exportHostsToCsvWithStats = (hosts: Host[]): ExportHostsResult => {
-  // Only serial hosts are truly unsupported - mosh hosts are exported as SSH
-  const isUnsupported = (h: Host) => h.protocol === "serial";
-  const skippedHosts = hosts.filter((h) => isUnsupported(h));
-  const exportableHosts = hosts.filter((h) => !isUnsupported(h));
+export function applyVaultHostImport(
+  existingHosts: Host[],
+  existingGroups: string[],
+  importResult: VaultImportResult,
+  options?: { skipDuplicates?: boolean },
+): {
+  hosts: Host[];
+  customGroups: string[];
+  addedCount: number;
+  skippedExistingCount: number;
+  addedHosts: Host[];
+} {
+  const skipDuplicates = options?.skipDuplicates !== false;
+  const existingKeys = new Set(existingHosts.map(buildVaultHostMergeKey));
+  let newHosts = importResult.hosts;
+  let skippedExistingCount = 0;
+
+  if (skipDuplicates) {
+    newHosts = importResult.hosts.filter((host) => {
+      const duplicate = existingKeys.has(buildVaultHostMergeKey(host));
+      if (duplicate) skippedExistingCount++;
+      return !duplicate;
+    });
+  }
+
+  const customGroups = Array.from(
+    new Set([
+      ...existingGroups,
+      ...importResult.groups,
+      ...newHosts.map((host) => host.group).filter(Boolean),
+    ]),
+  ) as string[];
 
   return {
-    csv: exportHostsToCsv(hosts),
-    exportedCount: exportableHosts.length,
-    skippedCount: skippedHosts.length,
+    hosts: [...existingHosts, ...newHosts].map(sanitizeHost),
+    customGroups,
+    addedCount: newHosts.length,
+    skippedExistingCount,
+    addedHosts: newHosts,
   };
-};
+}
 
+export async function resolveVaultImportKeyPassphraseConflicts(
+  entries: VaultHostKeyPassphrase[],
+  resolveAliases: (keyPath: string) => Promise<string[]>,
+  eligibleHostIds?: ReadonlySet<string>,
+  eligibleKeyPathsByHostId?: ReadonlyMap<string, string>,
+): Promise<{ keyPassphrases: VaultHostKeyPassphrase[]; issues: VaultImportIssue[] }> {
+  const groups: Array<{
+    aliases: Set<string>;
+    entries: VaultHostKeyPassphrase[];
+  }> = [];
+
+  for (const entry of entries) {
+    const aliases = new Set((await resolveAliases(entry.keyPath)).map(normalizeKeyPathKey));
+    aliases.add(normalizeKeyPathKey(entry.keyPath));
+    const eligibleKeyPath = eligibleKeyPathsByHostId?.get(entry.hostId);
+    if (eligibleKeyPath) {
+      const eligibleAliases = new Set(
+        (await resolveAliases(eligibleKeyPath)).map(normalizeKeyPathKey),
+      );
+      eligibleAliases.add(normalizeKeyPathKey(eligibleKeyPath));
+      if (![...aliases].some((alias) => eligibleAliases.has(alias))) continue;
+    } else if (eligibleKeyPathsByHostId && eligibleHostIds?.has(entry.hostId)) {
+      continue;
+    }
+    const matching = groups.filter((group) => (
+      [...aliases].some((alias) => group.aliases.has(alias))
+    ));
+    const mergedAliases = new Set([
+      ...aliases,
+      ...matching.flatMap((group) => [...group.aliases]),
+    ]);
+    const mergedEntries = [
+      ...matching.flatMap((group) => group.entries),
+      entry,
+    ];
+    for (const group of matching) {
+      groups.splice(groups.indexOf(group), 1);
+    }
+    groups.push({ aliases: mergedAliases, entries: mergedEntries });
+  }
+
+  const keyPassphrases: VaultHostKeyPassphrase[] = [];
+  const issues: VaultImportIssue[] = [];
+  for (const group of groups) {
+    const passphrases = new Set(group.entries.map((entry) => entry.passphrase));
+    if (passphrases.size > 1) {
+      issues.push({
+        level: "warning",
+        message: `CSV contains conflicting passphrases for KeyPath "${group.entries[0].keyPath}"; no passphrase was saved for that path.`,
+      });
+    } else {
+      const selected = eligibleHostIds
+        ? group.entries.find((entry) => eligibleHostIds.has(entry.hostId))
+        : group.entries[0];
+      if (selected) keyPassphrases.push(selected);
+    }
+  }
+  return { keyPassphrases, issues };
+}
+
+export interface VaultExistingKeyPassphraseRead {
+  values: string[];
+  unreadable: boolean;
+}
+
+export async function filterVaultImportKeyPassphrasesAgainstExisting(
+  entries: VaultHostKeyPassphrase[],
+  readExisting: (keyPath: string) => Promise<VaultExistingKeyPassphraseRead>,
+): Promise<{ keyPassphrases: VaultHostKeyPassphrase[]; issues: VaultImportIssue[] }> {
+  const keyPassphrases: VaultHostKeyPassphrase[] = [];
+  const issues: VaultImportIssue[] = [];
+  for (const entry of entries) {
+    const existing = await readExisting(entry.keyPath);
+    if (existing.unreadable) {
+      issues.push({
+        level: "warning",
+        message: `Could not verify the existing saved passphrase for KeyPath "${entry.keyPath}"; the imported passphrase was not saved.`,
+      });
+      continue;
+    }
+    if (existing.values.some((value) => value !== entry.passphrase)) {
+      issues.push({
+        level: "warning",
+        message: `CSV passphrase conflicts with an existing saved passphrase for KeyPath "${entry.keyPath}"; the existing passphrase was kept.`,
+      });
+      continue;
+    }
+    keyPassphrases.push(entry);
+  }
+  return { keyPassphrases, issues };
+}

@@ -1,23 +1,21 @@
 /**
  * Port Forwarding utilities and constants
  */
-import { Globe,Server,Shuffle } from 'lucide-react';
-import React from 'react';
-import { PortForwardingType } from '../../domain/models';
+import type { PortForwardingRule, PortForwardingType } from '../../domain/models';
 
-export const TYPE_LABEL_KEYS: Record<PortForwardingType, string> = {
+const TYPE_LABEL_KEYS: Record<PortForwardingType, string> = {
   local: 'pf.type.local',
   remote: 'pf.type.remote',
   dynamic: 'pf.type.dynamic',
 };
 
-export const TYPE_MENU_LABEL_KEYS: Record<PortForwardingType, string> = {
+const TYPE_MENU_LABEL_KEYS: Record<PortForwardingType, string> = {
   local: 'pf.type.menu.local',
   remote: 'pf.type.menu.remote',
   dynamic: 'pf.type.menu.dynamic',
 };
 
-export const TYPE_DESCRIPTION_KEYS: Record<PortForwardingType, string> = {
+const TYPE_DESCRIPTION_KEYS: Record<PortForwardingType, string> = {
   local: 'pf.type.local.desc',
   remote: 'pf.type.remote.desc',
   dynamic: 'pf.type.dynamic.desc',
@@ -44,11 +42,35 @@ export function getTypeDescription(
   return t(TYPE_DESCRIPTION_KEYS[type]);
 }
 
-export const TYPE_ICONS: Record<PortForwardingType, React.ReactNode> = {
-  local: <Globe size={16} />,
-  remote: <Server size={16} />,
-  dynamic: <Shuffle size={16} />,
-};
+export function buildRuleSummary(
+  t: (key: string, vars?: Record<string, unknown>) => string,
+  rule: PortForwardingRule
+): string {
+  const vars = {
+    bindAddress: rule.bindAddress,
+    localPort: rule.localPort,
+    remoteHost: rule.remoteHost,
+    remotePort: rule.remotePort,
+  };
+
+  switch (rule.type) {
+    case 'local':
+      return t('pf.rule.summary.local', vars);
+    case 'remote':
+      return t('pf.rule.summary.remote', vars);
+    case 'dynamic':
+      return t('pf.rule.summary.dynamic', vars);
+    default:
+      return t('pf.rule.summary.local', vars);
+  }
+}
+
+export async function stopRuntimeTunnelBeforeDelete(
+  ruleId: string,
+  stopTunnel: (ruleId: string) => Promise<{ success: boolean }>,
+): Promise<boolean> {
+  return (await stopTunnel(ruleId)).success;
+}
 
 /**
  * Get status color class for a rule
@@ -61,6 +83,8 @@ export function getStatusColor(status: string): string {
       return 'bg-yellow-500 animate-pulse';
     case 'error':
       return 'bg-red-500';
+    case 'unknown':
+      return 'bg-muted-foreground/60 animate-pulse';
     default:
       return 'bg-muted-foreground/40';
   }
@@ -71,9 +95,9 @@ export function getStatusColor(status: string): string {
  */
 export function getTypeColor(type: PortForwardingType, isActive: boolean): string {
   const colors = {
-    local: isActive ? 'bg-blue-500 text-white' : 'bg-blue-500/15 text-blue-500',
-    remote: isActive ? 'bg-orange-500 text-white' : 'bg-orange-500/15 text-orange-500',
-    dynamic: isActive ? 'bg-purple-500 text-white' : 'bg-purple-500/15 text-purple-500',
+    local: isActive ? 'bg-sky-500 text-white' : 'bg-sky-600 text-white dark:bg-sky-400 dark:text-slate-950',
+    remote: isActive ? 'bg-indigo-500 text-white' : 'bg-indigo-600 text-white dark:bg-indigo-400 dark:text-slate-950',
+    dynamic: isActive ? 'bg-violet-500 text-white' : 'bg-violet-600 text-white dark:bg-violet-400 dark:text-slate-950',
   };
   return colors[type];
 }

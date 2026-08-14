@@ -12,13 +12,20 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { existsSync } = require("node:fs");
 
-const { toUnpackedAsarPath } = require("./ai/shellUtils.cjs");
+const { toUnpackedAsarPath, getFreshIdlePrompt, formatSyntheticEcho } = require("./ai/shellUtils.cjs");
+const { appendVaultAgentGuidance } = require("../shared/vaultAgentGuidance.cjs");
 const { execViaPty, startPtyJob, execViaChannel, execViaRawPty } = require("./ai/ptyExec.cjs");
 const { safeSend } = require("./ipcUtils.cjs");
 const { getCliDiscoveryFilePath } = require("../cli/discoveryPath.cjs");
+const { EXTERNAL_MCP_CHAT_SESSION_ID } = require("../cli/externalMcpDiscoveryPath.cjs");
 const sftpBridge = require("./sftpBridge.cjs");
+const portForwardingBridge = require("./portForwardingBridge.cjs");
 
 const DEBUG_MCP = process.env.NETCATTY_MCP_DEBUG === "1";
+
+/** Optional external-MCP activity / host-ready hooks (set by externalMcpController). */
+let externalMcpActivityHook = null;
+let externalMcpHostReadyHook = null;
 
 function debugLog(...args) {
   if (!DEBUG_MCP) return;
@@ -26,19 +33,80 @@ function debugLog(...args) {
 }
 
 let sessions = null;   // Map<sessionId, { sshClient, stream, pty, proc, conn, ... }>
+let terminalWorkerManager = null;
+let fileTransferBridge = null;
 let tcpServer = null;
 let tcpPort = null;
 let authToken = null;  // Random token generated when TCP server starts
+// Dedicated token for External MCP discovery. Rotated on enable/disable so a
+// stale discovery file cannot keep writing after External MCP is turned off.
+let externalAuthToken = null;
 let pendingHostStart = null; // { promise, server, cancel }
 let electronModule = null;
 let cliDiscoveryFilePath = getCliDiscoveryFilePath();
 
 // Track which sockets have completed authentication
 const authenticatedSockets = new WeakSet();
+// Sockets authenticated with the External MCP token (or that used the reserved scope).
+const externalMcpSockets = new Set();
+
+function markExternalMcpSocket(socket) {
+  if (!socket || socket.destroyed) return;
+  externalMcpSockets.add(socket);
+  if (!socket.__netcattyExternalMcpCleanupBound) {
+    socket.__netcattyExternalMcpCleanupBound = true;
+    const cleanup = () => {
+      externalMcpSockets.delete(socket);
+    };
+    socket.once("close", cleanup);
+    socket.once("end", cleanup);
+    socket.once("error", cleanup);
+  }
+}
+
+function issueExternalMcpAuthToken() {
+  externalAuthToken = crypto.randomBytes(32).toString("hex");
+  return externalAuthToken;
+}
+
+function revokeExternalMcpAuthToken() {
+  externalAuthToken = null;
+}
+
+function getExternalMcpAuthToken() {
+  return externalAuthToken;
+}
+
+function disconnectExternalMcpClients() {
+  // Prefer soft revoke: keep long-lived stdio MCP TCP sockets alive so
+  // re-enable can resume without restarting Codex/Claude/Grok. Hard destroy
+  // is reserved for process shutdown paths that call this intentionally.
+  for (const socket of Array.from(externalMcpSockets)) {
+    externalMcpSockets.delete(socket);
+    try {
+      if (!socket.destroyed) socket.destroy();
+    } catch {
+      // Ignore destroy failures while revoking external clients.
+    }
+  }
+}
 
 // Per-scope metadata: chatSessionId → { sessionIds: string[], metadata: Map<sessionId, meta> }
 // Each chat session only sees the hosts registered for its scope.
 const scopedMetadata = new Map();
+let liveSessionMetadata = new Map();
+let sessionMetadataRevision = 0;
+let terminalSessionCloseRevision = 0;
+const closedTerminalSessionRevisions = new Map();
+const MAX_CLOSED_TERMINAL_SESSION_REVISIONS = 2048;
+const scopedAttachments = new Map(); // chatSessionId -> Map<filePath, attachment>
+const { createSessionOwnershipRegistry } = require("./mcpServerBridge/sessionOwnership.cjs");
+const { retainOwnedSessions, mergeRetentionMeta } = require("./mcpServerBridge/retainOwnedSessions.cjs");
+const {
+  createSessionIdleManager,
+  normalizeSessionIdleTimeoutMinutes,
+} = require("./mcpServerBridge/sessionIdleManager.cjs");
+const openedSessionOwnership = createSessionOwnershipRegistry();
 
 // Command safety checking (reuse from aiBridge)
 let commandBlocklist = [];
@@ -46,29 +114,37 @@ let commandBlocklist = [];
 let compiledBlocklist = [];
 
 // Command timeout in milliseconds (default 60s, synced from user settings)
+const MAX_COMMAND_TIMEOUT_SECONDS = 24 * 60 * 60;
 let commandTimeoutMs = 60000;
 
 // Max iterations for AI agent loops (default 20, synced from user settings)
 let maxIterations = 20;
 
-// Permission mode: 'observer' | 'confirm' | 'autonomous' (synced from user settings)
+// Permission mode: 'observer' | 'confirm' | 'auto' (synced from user settings)
 let permissionMode = "confirm";
+
+// Cached permission grants synced from renderer (confirm-mode memory table)
+let permissionGrantsSnapshot = [];
 
 // Track active PTY executions for cancellation
 const activePtyExecs = new Map(); // marker → { ptyStream, cleanup }
 const cancelledChatSessions = new Set();
 const activeExecChatSessions = new Map(); // chatSessionId -> { sessionId, command, startedAt }
 const backgroundJobs = new Map(); // jobId -> job metadata
+const workerBackgroundJobs = new Map(); // jobId -> { chatSessionId, sessionId }
+const pendingWorkerJobStarts = new Map(); // sessionId -> Set<{ chatSessionId, cancelled }>
 const activeSessionExecutions = new Map(); // sessionId -> { kind, startedAt, token }
-const activeSessionSftpOps = new Map(); // opId -> { chatSessionId, cancel }
+const activeSessionSftpOps = new Map(); // opId -> { chatSessionId, sessionId, cancel }
+const closingTerminalSessions = new Map(); // sessionId -> overlapping close request count
 const pendingSessionWriteApprovals = new Map(); // sessionId -> method
 const DEFAULT_BACKGROUND_JOB_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_BACKGROUND_JOB_POLL_INTERVAL_MS = 30 * 1000;
 const BACKGROUND_JOB_RETENTION_MS = 10 * 60 * 1000;
 const MAX_BACKGROUND_JOB_OUTPUT_CHARS = 256 * 1024;
+const SESSION_CLOSE_CLEANUP_TIMEOUT_MS = 5000;
 let activeSftpOpSeq = 0;
 
-// ── Approval gate (for confirm mode with ACP/MCP agents) ──
+// ── Approval gate (for confirm mode with SDK/MCP agents) ──
 let getMainWindowFn = null; // () => BrowserWindow | null
 const pendingApprovals = new Map(); // approvalId → { resolve, chatSessionId }
 let approvalIdCounter = 0;
@@ -83,47 +159,98 @@ function setMainWindowGetter(fn) {
  * Sends an IPC event and returns a Promise<boolean> that resolves
  * when the user approves/rejects in the UI, or auto-denies after timeout.
  */
-// External ACP agents (for example Codex) may give up on MCP tool calls after
+// External SDK agents (for example Codex) may give up on MCP tool calls after
 // about 120 seconds; see openai/codex#6127 ("timed out awaiting tools/call
 // after 120s"). Keep the Netcatty-side approval window below that with a small
 // buffer so a stale approval cannot still be accepted after the agent has
 // already timed out and abandoned the call.
-const APPROVAL_TIMEOUT_MS = 110 * 1000; // 110 seconds
+const { MCP_APPROVAL_TIMEOUT_MS } = require("../shared/approvalConstants.cjs");
+const APPROVAL_TIMEOUT_MS = MCP_APPROVAL_TIMEOUT_MS;
+
+function listApprovalTargetWindows() {
+  const windows = [];
+  const seen = new Set();
+  const push = (win) => {
+    if (!win || win.isDestroyed?.()) return;
+    const id = win.webContents?.id;
+    if (id != null && seen.has(id)) return;
+    if (id != null) seen.add(id);
+    windows.push(win);
+  };
+  try {
+    if (typeof getMainWindowFn === "function") push(getMainWindowFn());
+  } catch { /* ignore */ }
+  try {
+    const windowManager = require("./windowManager.cjs");
+    push(windowManager.getSettingsWindow?.());
+  } catch { /* ignore */ }
+  return windows;
+}
+
+function broadcastApprovalEvent(channel, payload) {
+  for (const win of listApprovalTargetWindows()) {
+    try {
+      win.webContents.send(channel, payload);
+    } catch { /* ignore */ }
+  }
+}
 
 function requestApprovalFromRenderer(toolName, args, chatSessionId) {
   return new Promise((resolve) => {
     debugLog("requestApprovalFromRenderer", { toolName, args, chatSessionId });
-    const mainWin = typeof getMainWindowFn === 'function' ? getMainWindowFn() : null;
-    if (!mainWin || mainWin.isDestroyed()) {
+    const targets = listApprovalTargetWindows();
+    if (targets.length === 0) {
       // No renderer available — deny to preserve confirm mode safety guarantee
       resolve(false);
       return;
     }
     const approvalId = `mcp_approval_${++approvalIdCounter}_${Date.now()}`;
+    // Hard ceiling from creation — must stay below external SDK tool-call
+    // timeouts (~120s). Review can cancel the idle timer but not this bound.
+    const absoluteExpiresAt = Date.now() + APPROVAL_TIMEOUT_MS;
+    let timerId = null;
 
-    // Auto-deny after timeout so ACP/MCP tool calls don't hang indefinitely
-    const timerId = setTimeout(() => {
-      if (pendingApprovals.has(approvalId)) {
-        pendingApprovals.delete(approvalId);
-        resolve(false);
-        // Notify renderer to remove the stale approval card
-        try {
-          const win = typeof getMainWindowFn === 'function' ? getMainWindowFn() : null;
-          if (win && !win.isDestroyed()) {
-            win.webContents.send('netcatty:ai:mcp:approval-cleared', { approvalIds: [approvalId] });
-          }
-        } catch { /* ignore */ }
+    const denyTimedOut = () => {
+      if (!pendingApprovals.has(approvalId)) return;
+      pendingApprovals.delete(approvalId);
+      resolve(false);
+      // Notify renderer(s) to remove the stale approval card
+      broadcastApprovalEvent('netcatty:ai:mcp:approval-cleared', { approvalIds: [approvalId] });
+    };
+
+    const clearTimer = () => {
+      if (timerId != null) {
+        clearTimeout(timerId);
+        timerId = null;
       }
-    }, APPROVAL_TIMEOUT_MS);
+    };
+
+    const armTimer = (ms) => {
+      clearTimer();
+      if (ms <= 0) {
+        denyTimedOut();
+        return;
+      }
+      timerId = setTimeout(denyTimedOut, ms);
+    };
+
+    // Auto-deny after timeout so SDK/MCP tool calls don't hang indefinitely.
+    // Idle engagement cancels this arm and re-arms the absolute remainder
+    // (never auto-approves; never extends past absoluteExpiresAt).
+    armTimer(APPROVAL_TIMEOUT_MS);
 
     pendingApprovals.set(approvalId, {
       resolve: (approved) => {
-        clearTimeout(timerId);
+        clearTimer();
         resolve(approved);
       },
+      clearTimer,
+      armAbsoluteTimeout: () => armTimer(absoluteExpiresAt - Date.now()),
+      absoluteExpiresAt,
+      idleCancelled: false,
       chatSessionId: chatSessionId || null,
     });
-    mainWin.webContents.send('netcatty:ai:mcp:approval-request', {
+    broadcastApprovalEvent('netcatty:ai:mcp:approval-request', {
       approvalId,
       toolName,
       args,
@@ -138,19 +265,28 @@ function resolveApprovalFromRenderer(approvalId, approved) {
   if (entry) {
     pendingApprovals.delete(approvalId);
     entry.resolve(approved);
+    // Main + settings both receive approval requests; clear the sibling card.
+    notifyRendererApprovalCleared([approvalId]);
   }
+}
+
+/**
+ * Drop the idle auto-deny timer after the user starts reviewing an approval card.
+ * Re-arms the absolute creation deadline so a late approve cannot outlive the
+ * external agent's tool-call timeout window.
+ */
+function cancelApprovalTimeoutFromRenderer(approvalId) {
+  const entry = pendingApprovals.get(approvalId);
+  if (!entry || entry.idleCancelled) return false;
+  entry.idleCancelled = true;
+  entry.clearTimer?.();
+  entry.armAbsoluteTimeout?.();
+  return true;
 }
 
 function notifyRendererApprovalCleared(approvalIds) {
   if (!Array.isArray(approvalIds) || approvalIds.length === 0) return;
-  try {
-    const win = typeof getMainWindowFn === "function" ? getMainWindowFn() : null;
-    if (win && !win.isDestroyed()) {
-      win.webContents.send("netcatty:ai:mcp:approval-cleared", { approvalIds });
-    }
-  } catch {
-    // Ignore renderer notification failures during approval cleanup.
-  }
+  broadcastApprovalEvent("netcatty:ai:mcp:approval-cleared", { approvalIds });
 }
 
 /**
@@ -205,256 +341,81 @@ function cancelPtyExecsForSession(chatSessionId) {
   }
 }
 
-function createBackgroundJobId() {
-  return `job_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
-}
+const { createBackgroundJobApi } = require("./mcpServerBridge/backgroundJobs.cjs");
+const backgroundJobApi = createBackgroundJobApi({
+  get activeSftpOpSeq() { return activeSftpOpSeq; },
+  set activeSftpOpSeq(value) { activeSftpOpSeq = value; },
+  backgroundJobs, activeSessionSftpOps, activeSessionExecutions, closingTerminalSessions, crypto,
+  BACKGROUND_JOB_RETENTION_MS, DEFAULT_BACKGROUND_JOB_POLL_INTERVAL_MS, MAX_BACKGROUND_JOB_OUTPUT_CHARS,
+  SESSION_CLOSE_CLEANUP_TIMEOUT_MS,
+  debugLog, sftpBridge,
+});
+const {
+  createBackgroundJobId,
+  cancelBackgroundJobsForSession,
+  cancelBackgroundJobsForTerminalSession,
+  settleBackgroundJobsForTerminalSession,
+  registerSftpOp,
+  cancelSftpOpsForSession,
+  cancelSftpOpsForTerminalSession,
+  beginTerminalSessionClose,
+  endTerminalSessionClose,
+  cancelAllSftpOps,
+  readBackgroundJobSnapshot,
+  createOutputWindow,
+  refreshRunningJobSnapshot,
+  storeCompletedJobOutput,
+  pruneCompletedBackgroundJobs,
+  collapseCarriageReturns,
+  serializeBackgroundJob,
+  describeActiveSessionExecution,
+  getSessionBusyError,
+  reserveSessionExecution,
+  releaseSessionExecution,
+} = backgroundJobApi;
 
-function cancelBackgroundJobsForSession(chatSessionId) {
-  if (!chatSessionId) return;
-  for (const [, job] of backgroundJobs) {
-    if (job.chatSessionId !== chatSessionId) continue;
-    if (job.status !== "running") continue;
-    try {
-      job.handle?.cancel?.();
-      job.status = "stopping";
-      job.error = "Cancellation requested";
-      job.updatedAt = Date.now();
-    } catch {
-      // Ignore cancellation failures
-    }
-  }
-}
-
-function registerSftpOp(chatSessionId, cancel) {
-  if (!chatSessionId || typeof cancel !== "function") {
-    return () => {};
-  }
-  const opId = `sftp_${Date.now().toString(36)}_${(++activeSftpOpSeq).toString(36)}`;
-  activeSessionSftpOps.set(opId, { chatSessionId, cancel });
-  return () => {
-    activeSessionSftpOps.delete(opId);
-  };
-}
-
-async function cancelSftpOpsForSession(chatSessionId) {
-  if (!chatSessionId) return;
-  const pending = [];
-  for (const [opId, entry] of activeSessionSftpOps) {
-    if (entry.chatSessionId !== chatSessionId) continue;
-    activeSessionSftpOps.delete(opId);
-    try {
-      pending.push(Promise.resolve(entry.cancel()));
-    } catch {
-      // Ignore cancellation failures for already-closed SFTP handles.
-    }
-  }
-  if (pending.length) {
-    await Promise.allSettled(pending);
-  }
-}
-
-function cancelAllSftpOps() {
-  const pending = [];
-  for (const [opId, entry] of activeSessionSftpOps) {
-    activeSessionSftpOps.delete(opId);
-    try {
-      pending.push(Promise.resolve(entry.cancel()));
-    } catch {
-      // Ignore cancellation failures during global cleanup.
-    }
-  }
-  return pending.length ? Promise.allSettled(pending) : Promise.resolve([]);
-}
-
-function readBackgroundJobSnapshot(job) {
-  if (!job) {
-    return {
-      stdout: "",
-      outputBaseOffset: 0,
-      totalOutputChars: 0,
-      outputTruncated: false,
-    };
-  }
-  if (job.status === "running" || job.status === "stopping") {
-    const snapshot = job.handle?.getSnapshot?.();
-    if (snapshot) {
-      const stdout = String(snapshot.stdout || "");
-      const outputBaseOffset = Math.max(0, Number(snapshot.outputBaseOffset) || 0);
-      const totalOutputChars = Math.max(outputBaseOffset + stdout.length, Number(snapshot.totalOutputChars) || 0);
-      return {
-        stdout,
-        outputBaseOffset,
-        totalOutputChars,
-        outputTruncated: Boolean(snapshot.outputTruncated),
-      };
-    }
-  }
-  const stdout = String(job.stdout || "");
-  const outputBaseOffset = Math.max(0, Number(job.outputBaseOffset) || 0);
-  const totalOutputChars = Math.max(outputBaseOffset + stdout.length, Number(job.totalOutputChars) || 0);
-  return {
-    stdout,
-    outputBaseOffset,
-    totalOutputChars,
-    outputTruncated: Boolean(job.outputTruncated),
-  };
-}
-
-function createOutputWindow(stdout) {
-  const fullText = String(stdout || "");
-  const totalOutputChars = fullText.length;
-  const outputBaseOffset = Math.max(0, totalOutputChars - MAX_BACKGROUND_JOB_OUTPUT_CHARS);
-  return {
-    stdout: outputBaseOffset > 0 ? fullText.slice(outputBaseOffset) : fullText,
-    outputBaseOffset,
-    totalOutputChars,
-    outputTruncated: outputBaseOffset > 0,
-  };
-}
-
-function refreshRunningJobSnapshot(job) {
-  if (!job || (job.status !== "running" && job.status !== "stopping")) return;
-  const snapshot = readBackgroundJobSnapshot(job);
-  job.stdout = snapshot.stdout;
-  job.outputBaseOffset = snapshot.outputBaseOffset;
-  job.totalOutputChars = snapshot.totalOutputChars;
-  job.outputTruncated = snapshot.outputTruncated;
-}
-
-function storeCompletedJobOutput(job, stdout, metadata = null) {
-  if (metadata && typeof metadata === "object") {
-    const normalizedStdout = String(metadata.stdout ?? stdout ?? "");
-    const outputBaseOffset = Math.max(0, Number(metadata.outputBaseOffset) || 0);
-    const totalOutputChars = Math.max(outputBaseOffset + normalizedStdout.length, Number(metadata.totalOutputChars) || 0);
-    job.stdout = normalizedStdout;
-    job.outputBaseOffset = outputBaseOffset;
-    job.totalOutputChars = totalOutputChars;
-    job.outputTruncated = Boolean(metadata.outputTruncated);
-    job.handle = null;
-    return;
-  }
-  const window = createOutputWindow(stdout);
-  job.stdout = window.stdout;
-  job.outputBaseOffset = window.outputBaseOffset;
-  job.totalOutputChars = window.totalOutputChars;
-  job.outputTruncated = window.outputTruncated;
-  job.handle = null;
-}
-
-function pruneCompletedBackgroundJobs(now = Date.now()) {
-  for (const [jobId, job] of backgroundJobs) {
-    if (job.status === "running" || job.status === "stopping") continue;
-    const updatedAt = Number(job.updatedAt) || 0;
-    if (updatedAt > 0 && now - updatedAt > BACKGROUND_JOB_RETENTION_MS) {
-      backgroundJobs.delete(jobId);
-    }
-  }
-}
-
-// Collapse carriage-return progress redraws to the latest frame.
-// Each \r resets the cursor to the start of the current line; the next
-// non-\r character overwrites the existing line content. A trailing \r
-// (with no following content) leaves the existing line intact, so a
-// snapshot taken between redraws still shows the latest visible frame.
-// Used at serialize time so the stored buffer can keep raw monotonic
-// offsets while polled output shows the latest frame.
-function collapseCarriageReturns(text) {
-  if (!text || text.indexOf("\r") === -1) return text;
-  let result = "";
-  let crPending = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === "\r") {
-      crPending = true;
-      continue;
-    }
-    if (ch === "\n") {
-      crPending = false;
-      result += ch;
-      continue;
-    }
-    if (crPending) {
-      const lastNl = result.lastIndexOf("\n");
-      result = lastNl >= 0 ? result.slice(0, lastNl + 1) : "";
-      crPending = false;
-    }
-    result += ch;
-  }
-  return result;
-}
-
-function serializeBackgroundJob(job, offset = 0) {
-  if (job.status === "running" || job.status === "stopping") {
-    refreshRunningJobSnapshot(job);
-  }
-  const stdout = job.stdout || "";
-  const outputBaseOffset = job.outputBaseOffset || 0;
-  const totalOutputChars = Math.max(outputBaseOffset + stdout.length, job.totalOutputChars || 0);
-  const numericOffset = Math.max(0, Number(offset) || 0);
-  const relativeOffset = numericOffset <= outputBaseOffset
-    ? 0
-    : Math.min(numericOffset - outputBaseOffset, stdout.length);
-  return {
-    ok: true,
-    jobId: job.id,
-    sessionId: job.sessionId,
-    command: job.command,
-    status: job.status,
-    completed: job.status !== "running" && job.status !== "stopping",
-    exitCode: job.exitCode,
-    error: job.error,
-    startedAt: job.startedAt,
-    updatedAt: job.updatedAt,
-    output: collapseCarriageReturns(stdout.slice(relativeOffset)),
-    nextOffset: totalOutputChars,
-    totalOutputChars,
-    outputBaseOffset,
-    outputTruncated: Boolean(job.outputTruncated),
-    recommendedPollIntervalMs: DEFAULT_BACKGROUND_JOB_POLL_INTERVAL_MS,
-  };
-}
-
-function describeActiveSessionExecution(entry) {
-  if (!entry) return "another command";
-  return entry.kind === "job" ? "a long-running command" : "another command";
-}
-
-function getSessionBusyError(sessionId) {
-  const active = activeSessionExecutions.get(sessionId);
-  if (!active) return null;
-  return {
-    ok: false,
-    error: `Session already has ${describeActiveSessionExecution(active)} in progress. Wait for it to finish or stop it before starting another command.`,
-  };
-}
-
-function reserveSessionExecution(sessionId, kind) {
-  const existing = getSessionBusyError(sessionId);
-  if (existing) return existing;
-  const token = `${kind}_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
-  activeSessionExecutions.set(sessionId, {
-    kind,
-    startedAt: Date.now(),
-    token,
-  });
-  return { ok: true, token };
-}
-
-function releaseSessionExecution(sessionId, token) {
-  const active = activeSessionExecutions.get(sessionId);
-  if (!active) return;
-  if (token && active.token !== token) return;
-  activeSessionExecutions.delete(sessionId);
-}
+let disposeWorkerSessionClosed = null;
 
 function init(deps) {
   sessions = deps.sessions;
+  terminalWorkerManager = deps.terminalWorkerManager || null;
+  fileTransferBridge = deps.transferBridge || null;
   electronModule = deps.electronModule || null;
   cliDiscoveryFilePath = deps.cliDiscoveryFilePath || getCliDiscoveryFilePath();
   debugLog("init", { hasSessions: Boolean(sessions), hasElectron: Boolean(electronModule) });
   if (deps.commandBlocklist) {
     commandBlocklist = deps.commandBlocklist;
   }
+  try { disposeWorkerSessionClosed?.dispose?.(); } catch { /* ignore */ }
+  disposeWorkerSessionClosed = null;
+  // Only explicit UI/tab closes drop host_open ownership. Shell "exited"
+  // events (including missing/nonzero exitCode) and recoverable exits
+  // (error / worker-exit / superseded / quiet transport "closed") keep
+  // ownership so a disconnected tab can reconnect with the same session id.
+  // Auto-close clean exits still forget ownership when the renderer closes
+  // the tab and the worker emits explicit:true.
+  if (typeof terminalWorkerManager?.onSessionClosed === "function") {
+    disposeWorkerSessionClosed = terminalWorkerManager.onSessionClosed((event) => {
+      const sessionId = event?.sessionId;
+      if (!sessionId) return;
+      if (event?.explicit === true) {
+        forgetClosedTerminalSession(sessionId);
+      }
+    });
+  }
+}
+
+async function listActivePortForwards() {
+  if (terminalWorkerManager?.request) {
+    const tunnels = await terminalWorkerManager.request(
+      "netcatty:portforward:list",
+      {},
+      {},
+    );
+    return Array.isArray(tunnels) ? tunnels : [];
+  }
+  const tunnels = await portForwardingBridge.listPortForwards();
+  return Array.isArray(tunnels) ? tunnels : [];
 }
 
 function writeCliDiscoveryFile() {
@@ -504,6 +465,8 @@ function shutdownHost({ preserveScopedMetadata = false } = {}) {
   pendingSessionWriteApprovals.clear();
   if (!preserveScopedMetadata) {
     scopedMetadata.clear();
+    scopedAttachments.clear();
+    liveSessionMetadata.clear();
   }
   for (const [, job] of backgroundJobs) {
     try {
@@ -513,7 +476,9 @@ function shutdownHost({ preserveScopedMetadata = false } = {}) {
     }
   }
   backgroundJobs.clear();
+  pendingWorkerJobStarts.clear();
   activeSessionExecutions.clear();
+  sessionIdleManager.clearAll();
 }
 
 function echoCommandToSession(session, sessionId, command) {
@@ -521,7 +486,7 @@ function echoCommandToSession(session, sessionId, command) {
   const contents = electronModule.webContents?.fromId?.(session.webContentsId);
   safeSend(contents, "netcatty:data", {
     sessionId,
-    data: `${command}\r\n`,
+    data: formatSyntheticEcho(command),
     syntheticEcho: true,
   });
 }
@@ -540,11 +505,21 @@ function setCommandBlocklist(list) {
 }
 
 function setCommandTimeout(seconds) {
-  commandTimeoutMs = Math.max(1, Math.min(3600, seconds || 60)) * 1000;
+  commandTimeoutMs = Math.max(1, Math.min(MAX_COMMAND_TIMEOUT_SECONDS, seconds || 60)) * 1000;
 }
 
 function getCommandTimeoutMs() {
   return commandTimeoutMs;
+}
+
+function setSessionIdleTimeoutMinutes(minutes) {
+  return sessionIdleManager.setTimeoutMinutes(
+    normalizeSessionIdleTimeoutMinutes(minutes),
+  );
+}
+
+function getSessionIdleTimeoutMinutes() {
+  return sessionIdleManager.getTimeoutMinutes();
 }
 
 function setMaxIterations(value) {
@@ -556,10 +531,162 @@ function getMaxIterations() {
 }
 
 function setPermissionMode(mode) {
-  if (mode === "observer" || mode === "confirm" || mode === "autonomous") {
+  if (mode === "observer" || mode === "confirm" || mode === "auto") {
     permissionMode = mode;
     writeCliDiscoveryFile();
+    try {
+      if (typeof externalMcpActivityHook?.onPermissionModeChanged === "function") {
+        externalMcpActivityHook.onPermissionModeChanged();
+      }
+    } catch {
+      // External MCP permission sync is best-effort.
+    }
   }
+}
+
+function setExternalMcpHooks(hooks = null) {
+  externalMcpActivityHook = hooks && typeof hooks === "object" ? hooks : null;
+  externalMcpHostReadyHook = typeof hooks?.onBridgeHostReady === "function"
+    ? hooks.onBridgeHostReady.bind(hooks)
+    : null;
+}
+
+function notifyExternalMcpActivity(method, params) {
+  try {
+    const chatSessionId = params?.chatSessionId || null;
+    if (chatSessionId === EXTERNAL_MCP_CHAT_SESSION_ID) {
+      externalMcpActivityHook?.recordActivity?.({ method, chatSessionId });
+    }
+  } catch {
+    // Ignore activity hook failures.
+  }
+}
+
+/**
+ * Build MCP session metadata from the live main-process session map and
+ * register it under the reserved external MCP chat scope.
+ */
+function syncLiveSessionsToExternalScope(chatSessionId = EXTERNAL_MCP_CHAT_SESSION_ID) {
+  const existingScoped = scopedMetadata.get(chatSessionId);
+  const existingMeta = existingScoped?.metadata || new Map();
+  const sessionList = [];
+  if (sessions && typeof sessions.entries === "function") {
+    for (const [sessionId, session] of sessions.entries()) {
+      if (!session || typeof session !== "object") continue;
+      const previous = existingMeta.get(sessionId) || findSessionMetaAcrossScopes(sessionId) || {};
+      sessionList.push({
+        sessionId,
+        hostId: session.hostId || previous.hostId || "",
+        hostname: session.hostname || session.host || previous.hostname || "",
+        label: session.label || session.hostname || previous.label || sessionId,
+        os: session.os || previous.os || "",
+        username: session.username || previous.username || "",
+        protocol: session.protocol || session.type || previous.protocol || "",
+        shellType: session.shellKind || session.shellType || previous.shellType || "",
+        deviceType: session.deviceType || previous.deviceType || "",
+        connected: session.connected !== false,
+        hostChain: Array.isArray(session.hostChain)
+          ? session.hostChain
+          : (Array.isArray(previous.hostChain) ? previous.hostChain : []),
+        activePortForwards: Array.isArray(session.activePortForwards)
+          ? session.activePortForwards
+          : (Array.isArray(previous.activePortForwards) ? previous.activePortForwards : []),
+      });
+    }
+  }
+  // Terminal-worker mode keeps live sessions off the main-process map. Do not
+  // wipe renderer-pushed external scope metadata with an empty live snapshot.
+  if (sessionList.length === 0) {
+    if (existingScoped?.sessionIds?.length) {
+      return {
+        ok: true,
+        count: existingScoped.sessionIds.length,
+        chatSessionId,
+        preserved: true,
+      };
+    }
+    // Only seed when the external scope key has never been written. An explicit
+    // empty updateSessionMetadata([]) must stay empty (authoritative clear).
+    if (!scopedMetadata.has(chatSessionId)) {
+      const seeded = seedExternalScopeFromOtherScopes(chatSessionId);
+      if (seeded) {
+        return {
+          ok: true,
+          count: seeded,
+          chatSessionId,
+          seeded: true,
+        };
+      }
+    }
+    return { ok: true, count: 0, chatSessionId };
+  }
+  updateSessionMetadata(sessionList, chatSessionId);
+  return { ok: true, count: sessionList.length, chatSessionId };
+}
+
+function findSessionMetaAcrossScopes(sessionId, excludeChatSessionId = null) {
+  let latest = liveSessionMetadata.get(sessionId) || null;
+  let latestRevision = Number.isSafeInteger(latest?._revision) ? latest._revision : -1;
+  for (const [scopeId, scoped] of scopedMetadata.entries()) {
+    if (excludeChatSessionId && scopeId === excludeChatSessionId) continue;
+    const meta = scoped?.metadata?.get?.(sessionId);
+    if (!meta) continue;
+    const revision = Number.isSafeInteger(meta._revision) ? meta._revision : 0;
+    if (revision > latestRevision) {
+      latest = meta;
+      latestRevision = revision;
+    }
+  }
+  return latest;
+}
+
+/**
+ * App-owned live session snapshot. Unlike the External MCP scope, this is
+ * always refreshed by the main renderer and is never exposed as a scope of
+ * its own. It only supplies current state for session ids a chat already owns.
+ */
+function updateLiveSessionMetadata(sessionList) {
+  const incoming = Array.isArray(sessionList) ? sessionList : [];
+  const updateRevision = ++sessionMetadataRevision;
+  const next = new Map();
+  for (const entry of incoming) {
+    if (!entry || typeof entry !== "object" || !entry.sessionId) continue;
+    next.set(entry.sessionId, {
+      hostname: entry.hostname || "",
+      label: entry.label || "",
+      os: entry.os || "",
+      username: entry.username || "",
+      protocol: entry.protocol || "",
+      shellType: entry.shellType || "",
+      deviceType: entry.deviceType || "",
+      connected: entry.connected !== false,
+      hostId: entry.hostId || "",
+      hostChain: Array.isArray(entry.hostChain) ? entry.hostChain : [],
+      activePortForwards: Array.isArray(entry.activePortForwards) ? entry.activePortForwards : [],
+      _revision: updateRevision,
+    });
+  }
+  liveSessionMetadata = next;
+  return { ok: true, count: next.size };
+}
+
+function seedExternalScopeFromOtherScopes(chatSessionId) {
+  const byId = new Map();
+  for (const [scopeId, scoped] of scopedMetadata.entries()) {
+    if (scopeId === chatSessionId || !scoped?.metadata) continue;
+    for (const [sessionId, meta] of scoped.metadata.entries()) {
+      if (!sessionId || !meta) continue;
+      const existing = byId.get(sessionId);
+      const existingRevision = Number.isSafeInteger(existing?._revision) ? existing._revision : 0;
+      const revision = Number.isSafeInteger(meta._revision) ? meta._revision : 0;
+      if (!existing || revision > existingRevision) {
+        byId.set(sessionId, { sessionId, ...meta });
+      }
+    }
+  }
+  if (byId.size === 0) return 0;
+  updateSessionMetadata(Array.from(byId.values()), chatSessionId);
+  return byId.size;
 }
 
 function getPermissionMode() {
@@ -620,14 +747,34 @@ function beginChatExecution(chatSessionId, sessionId, command) {
  * @param {string} [chatSessionId] - AI chat session ID for per-scope isolation
  */
 function updateSessionMetadata(sessionList, chatSessionId) {
+  const incoming = Array.isArray(sessionList) ? sessionList : [];
+  const updateRevision = ++sessionMetadataRevision;
+  // Authoritative empty replace: clear retention ownership for this scope so a
+  // later non-empty sync cannot resurrect sessions via cross-scope fallback.
+  if (chatSessionId && incoming.length === 0) {
+    openedSessionOwnership.releaseScopeOwnership(chatSessionId);
+  }
+  // host_open merges the new session into this chat scope, but the AI side
+  // panel later pushes a full replace of only the currently focused tab —
+  // which would drop mid-turn opened sessions. Retain ownership-tracked ids.
+  const effectiveList = chatSessionId
+    ? retainOwnedSessions({
+      incomingSessions: incoming,
+      ownedSessionIds: openedSessionOwnership.listOwned(chatSessionId),
+      previousById: scopedMetadata.get(chatSessionId)?.metadata || null,
+      // Skip the current scope so a stale connected:false snapshot cannot
+      // shadow a fresher copy from External MCP / another chat tab.
+      findFallbackMeta: (sessionId) => findSessionMetaAcrossScopes(sessionId, chatSessionId),
+    })
+    : incoming;
   debugLog("updateSessionMetadata", {
     chatSessionId,
-    count: Array.isArray(sessionList) ? sessionList.length : 0,
-    sessionIds: Array.isArray(sessionList) ? sessionList.map(s => s.sessionId) : [],
+    count: effectiveList.length,
+    sessionIds: effectiveList.map(s => s.sessionId),
   });
-  const ids = sessionList.map(s => s.sessionId);
+  const ids = effectiveList.map(s => s.sessionId);
   const metaMap = new Map();
-  for (const s of sessionList) {
+  for (const s of effectiveList) {
     metaMap.set(s.sessionId, {
       hostname: s.hostname || "",
       label: s.label || "",
@@ -637,6 +784,10 @@ function updateSessionMetadata(sessionList, chatSessionId) {
       shellType: s.shellType || "",
       deviceType: s.deviceType || "",
       connected: s.connected !== false,
+      hostId: s.hostId || "",
+      hostChain: Array.isArray(s.hostChain) ? s.hostChain : [],
+      activePortForwards: Array.isArray(s.activePortForwards) ? s.activePortForwards : [],
+      _revision: Number.isSafeInteger(s._revision) ? s._revision : updateRevision,
     });
   }
 
@@ -644,6 +795,174 @@ function updateSessionMetadata(sessionList, chatSessionId) {
   if (chatSessionId) {
     scopedMetadata.set(chatSessionId, { sessionIds: ids, metadata: metaMap });
   }
+}
+
+/**
+ * Merge session metadata into an existing chat scope without dropping
+ * previously known sessions. Used for the app-wide External MCP scope so a
+ * single Catty sidebar push cannot shrink the exposed host set.
+ */
+function mergeSessionMetadata(sessionList, chatSessionId) {
+  if (!chatSessionId || !Array.isArray(sessionList)) return { ok: false, count: 0 };
+  const existing = scopedMetadata.get(chatSessionId);
+  const byId = new Map();
+  if (existing?.metadata) {
+    for (const [sessionId, meta] of existing.metadata.entries()) {
+      byId.set(sessionId, { sessionId, ...meta });
+    }
+  }
+  for (const entry of sessionList) {
+    if (!entry || typeof entry !== "object" || !entry.sessionId) continue;
+    const previous = byId.get(entry.sessionId) || {};
+    byId.set(entry.sessionId, {
+      sessionId: entry.sessionId,
+      hostname: entry.hostname || previous.hostname || "",
+      label: entry.label || previous.label || "",
+      os: entry.os || previous.os || "",
+      username: entry.username || previous.username || "",
+      protocol: entry.protocol || previous.protocol || "",
+      shellType: entry.shellType || previous.shellType || "",
+      deviceType: entry.deviceType || previous.deviceType || "",
+      connected: entry.connected !== undefined ? entry.connected !== false : previous.connected !== false,
+      hostId: entry.hostId || previous.hostId || "",
+      hostChain: Array.isArray(entry.hostChain)
+        ? entry.hostChain
+        : (Array.isArray(previous.hostChain) ? previous.hostChain : []),
+      activePortForwards: Array.isArray(entry.activePortForwards)
+        ? entry.activePortForwards
+        : (Array.isArray(previous.activePortForwards) ? previous.activePortForwards : []),
+    });
+  }
+  updateSessionMetadata(Array.from(byId.values()), chatSessionId);
+  return { ok: true, count: byId.size };
+}
+
+function normalizeAttachmentEntry(attachment) {
+  if (!attachment || typeof attachment !== "object") return null;
+  const filename = String(attachment.filename || "attachment").trim() || "attachment";
+  const mediaType = String(attachment.mediaType || "application/octet-stream").trim() || "application/octet-stream";
+  const base64Data = typeof attachment.base64Data === "string" ? attachment.base64Data : "";
+  const filePathValue = typeof attachment.filePath === "string" ? attachment.filePath.trim() : "";
+  if (!base64Data && !filePathValue) return null;
+  let resolvedPath = filePathValue;
+  if (filePathValue) {
+    try {
+      resolvedPath = path.resolve(filePathValue);
+    } catch {
+      resolvedPath = filePathValue;
+    }
+  }
+  const sizeBytes = base64Data ? Buffer.byteLength(base64Data, "base64") : undefined;
+  return {
+    filename,
+    mediaType,
+    filePath: resolvedPath,
+    base64Data,
+    sizeBytes,
+  };
+}
+
+function updateAttachmentMetadata(attachments, chatSessionId) {
+  if (!chatSessionId || !Array.isArray(attachments)) return;
+  const existing = scopedAttachments.get(chatSessionId) || new Map();
+  for (const attachment of attachments) {
+    const normalized = normalizeAttachmentEntry(attachment);
+    if (!normalized) continue;
+    const key = normalized.filePath || normalized.filename;
+    existing.set(key, normalized);
+  }
+  scopedAttachments.set(chatSessionId, existing);
+}
+
+function getScopedAttachments(chatSessionId) {
+  if (!chatSessionId) return [];
+  return Array.from(scopedAttachments.get(chatSessionId)?.values() || []);
+}
+
+function attachmentSummary(attachment) {
+  return {
+    filename: attachment.filename,
+    mediaType: attachment.mediaType,
+    filePath: attachment.filePath || undefined,
+    sizeBytes: attachment.sizeBytes,
+  };
+}
+
+function handleListAttachments(params) {
+  const chatSessionId = params?.chatSessionId;
+  if (!chatSessionId || typeof chatSessionId !== "string") {
+    return { ok: false, error: "chatSessionId is required." };
+  }
+  return {
+    ok: true,
+    attachments: getScopedAttachments(chatSessionId).map(attachmentSummary),
+  };
+}
+
+const TEXT_ATTACHMENT_EXTENSIONS = new Set([
+  ".txt", ".md", ".markdown", ".json", ".jsonc", ".jsonl", ".yaml", ".yml",
+  ".toml", ".ini", ".csv", ".tsv", ".xml", ".html", ".css", ".js", ".jsx",
+  ".ts", ".tsx", ".mjs", ".cjs", ".py", ".sh", ".bash", ".zsh", ".fish",
+  ".rs", ".go", ".java", ".kt", ".rb", ".php", ".sql", ".log", ".conf",
+  ".cfg", ".env", ".gitignore",
+]);
+
+function isLikelyTextAttachment(mediaType, filename) {
+  return /^text\//i.test(mediaType)
+    || /^(application\/(json|xml|javascript|x-javascript|typescript|yaml|x-yaml|toml|csv|x-ndjson|ndjson))$/i.test(mediaType)
+    || /\+(json|xml)$/i.test(mediaType)
+    || TEXT_ATTACHMENT_EXTENSIONS.has(path.extname(filename || "").toLowerCase());
+}
+
+function findRegisteredAttachment(params) {
+  const chatSessionId = params?.chatSessionId;
+  if (!chatSessionId || typeof chatSessionId !== "string") {
+    return { error: "chatSessionId is required." };
+  }
+  const attachments = getScopedAttachments(chatSessionId);
+  const requestedPath = typeof params.filePath === "string" && params.filePath.trim()
+    ? path.resolve(params.filePath.trim())
+    : "";
+  const requestedName = typeof params.filename === "string" ? params.filename.trim() : "";
+  if (!requestedPath && !requestedName) {
+    return { error: "filePath or filename is required." };
+  }
+  const attachment = attachments.find((entry) => (
+    (requestedPath && entry.filePath === requestedPath)
+    || (requestedName && entry.filename === requestedName)
+  ));
+  if (!attachment) {
+    return { error: "Attachment is not registered for this chat session." };
+  }
+  return { attachment };
+}
+
+function handleReadAttachment(params) {
+  const found = findRegisteredAttachment(params);
+  if (found.error) return { ok: false, error: found.error };
+  const attachment = found.attachment;
+  let base64Data = attachment.base64Data;
+  if (!base64Data && attachment.filePath) {
+    try {
+      base64Data = fs.readFileSync(attachment.filePath).toString("base64");
+    } catch (err) {
+      return { ok: false, error: err?.message || "Failed to read attachment." };
+    }
+  }
+  if (!base64Data) return { ok: false, error: "Attachment content is unavailable." };
+  const buffer = Buffer.from(base64Data, "base64");
+  const result = {
+    ok: true,
+    filename: attachment.filename,
+    mediaType: attachment.mediaType,
+    filePath: attachment.filePath || undefined,
+    sizeBytes: buffer.length,
+    base64Data,
+  };
+  if (isLikelyTextAttachment(attachment.mediaType, attachment.filename)) {
+    result.text = buffer.toString("utf8");
+  }
+  return result;
 }
 
 /**
@@ -688,11 +1007,92 @@ function resolveScopedSessionIds(chatSessionId, explicitScopedIds = null) {
 /**
  * Look up metadata for a sessionId, scoped to a specific chat session.
  * Falls back to session object properties if no scoped metadata is found.
+ * When this scope still has a stale connected:false snapshot (common after
+ * host_open + tab switch), refresh connected from a fresher cross-scope copy.
+ * Owned host_open sessions also refresh while still connected so another
+ * scope's empty activePortForwards reaches getContext without a later sidebar
+ * replace.
  */
 function getSessionMeta(sessionId, chatSessionId) {
   if (!chatSessionId) return null;
   const scoped = scopedMetadata.get(chatSessionId);
-  return scoped?.metadata?.get(sessionId) || null;
+  const meta = scoped?.metadata?.get(sessionId) || null;
+  if (!meta) return null;
+  const owned = openedSessionOwnership.validate(chatSessionId, sessionId).ok;
+  // Live non-owned snapshots stay local. Owned sessions (and stale
+  // connected:false copies) consult other scopes.
+  if (!owned && meta.connected !== false) return toPublicSessionMeta(meta);
+  const fresher = findSessionMetaAcrossScopes(sessionId, chatSessionId);
+  if (!fresher) return toPublicSessionMeta(meta);
+  if (!owned && fresher.connected === false) return toPublicSessionMeta(meta);
+  const refreshed = mergeRetentionMeta(meta, fresher);
+  if (!refreshed) return toPublicSessionMeta(meta);
+  scoped.metadata.set(sessionId, refreshed);
+  return toPublicSessionMeta(refreshed);
+}
+
+function toPublicSessionMeta(meta) {
+  if (!meta || typeof meta !== "object") return meta;
+  const { _revision, ...publicMeta } = meta;
+  return publicMeta;
+}
+
+function buildOpenedSessionMeta(result, sessionId) {
+  const host = result?.host && typeof result.host === "object" ? result.host : {};
+  return {
+    sessionId,
+    hostname: host.hostname || "",
+    label: host.label || host.hostname || sessionId,
+    os: host.os || "",
+    username: host.username || "",
+    protocol: result?.protocol || host.protocol || "",
+    shellType: "",
+    deviceType: host.deviceType || "",
+    connected: result?.status === "connected",
+    hostId: result?.hostId || host.id || "",
+    hostChain: [],
+    activePortForwards: [],
+  };
+}
+
+function ensureOpenedSessionMetadata(chatSessionId, sessionId, result) {
+  if (!chatSessionId || !sessionId) return;
+  if (scopedMetadata.get(chatSessionId)?.metadata?.has(sessionId)) return;
+  const latest = findSessionMetaAcrossScopes(sessionId, chatSessionId);
+  mergeSessionMetadata([
+    latest ? { sessionId, ...latest } : buildOpenedSessionMeta(result, sessionId),
+  ], chatSessionId);
+}
+
+/**
+ * Drop host_open ownership and scoped metadata after a terminal session is
+ * actually closed (explicit UI tab close or agent session_close).
+ */
+function forgetClosedTerminalSession(sessionId) {
+  if (!sessionId) return;
+  terminalSessionCloseRevision += 1;
+  closedTerminalSessionRevisions.delete(sessionId);
+  closedTerminalSessionRevisions.set(sessionId, terminalSessionCloseRevision);
+  while (closedTerminalSessionRevisions.size > MAX_CLOSED_TERMINAL_SESSION_REVISIONS) {
+    closedTerminalSessionRevisions.delete(closedTerminalSessionRevisions.keys().next().value);
+  }
+  sessionIdleManager.forgetSession(sessionId);
+  openedSessionOwnership.forgetSession(sessionId);
+  liveSessionMetadata.delete(sessionId);
+  for (const scoped of scopedMetadata.values()) {
+    scoped.sessionIds = scoped.sessionIds.filter((id) => id !== sessionId);
+    scoped.metadata.delete(sessionId);
+  }
+}
+
+function forgetUnownedTerminalSessionMetadata(sessionId) {
+  if (!sessionId) return;
+  openedSessionOwnership.forgetSession(sessionId);
+  liveSessionMetadata.delete(sessionId);
+  for (const scoped of scopedMetadata.values()) {
+    scoped.sessionIds = scoped.sessionIds.filter((id) => id !== sessionId);
+    scoped.metadata.delete(sessionId);
+  }
 }
 
 /**
@@ -770,6 +1170,11 @@ function getOrCreateHost() {
       tcpServer = server;
       debugLog("TCP server listening", { port: tcpPort });
       writeCliDiscoveryFile();
+      try {
+        externalMcpHostReadyHook?.({ port: tcpPort, token: authToken });
+      } catch {
+        // External MCP host-ready sync is best-effort.
+      }
       finishResolve(tcpPort);
     });
 
@@ -796,15 +1201,20 @@ function handleConnection(socket) {
       socket.destroy();
       return;
     }
+    const previousBufferLength = buffer.length;
     buffer += chunk;
+    let consumedUntil = 0;
+    let searchFrom = previousBufferLength;
     let newlineIdx;
-    while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, newlineIdx);
-      buffer = buffer.slice(newlineIdx + 1);
+    while ((newlineIdx = buffer.indexOf("\n", searchFrom)) !== -1) {
+      const line = buffer.slice(consumedUntil, newlineIdx);
+      consumedUntil = newlineIdx + 1;
+      searchFrom = consumedUntil;
       if (!line.trim()) continue;
       debugLog("Incoming line", line);
       handleMessage(socket, line);
     }
+    if (consumedUntil > 0) buffer = buffer.slice(consumedUntil);
   });
 
   socket.on("error", () => {
@@ -828,9 +1238,32 @@ async function handleMessage(socket, line) {
   // The first message from any connection MUST be auth/verify with the correct token.
   // All other methods are rejected until the socket is authenticated.
   if (!authenticatedSockets.has(socket)) {
-    if (method === "auth/verify" && params?.token === authToken) {
-      debugLog("auth/verify success");
+    const presentedToken = typeof params?.token === "string" ? params.token : "";
+    const isCattyToken = Boolean(presentedToken && authToken && presentedToken === authToken);
+    const isExternalToken = Boolean(
+      presentedToken && externalAuthToken && presentedToken === externalAuthToken,
+    );
+    if (method === "auth/verify" && (isCattyToken || isExternalToken)) {
+      if (isExternalToken && !externalMcpActivityHook?.isEnabled?.()) {
+        const response = JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32001,
+            message: "External MCP is disabled. Re-enable it in Netcatty Settings → AI.",
+          },
+        }) + "\n";
+        if (!socket.destroyed) {
+          socket.write(response);
+          socket.destroy();
+        }
+        return;
+      }
+      debugLog("auth/verify success", { external: isExternalToken });
       authenticatedSockets.add(socket);
+      if (isExternalToken) {
+        markExternalMcpSocket(socket);
+      }
       const response = JSON.stringify({ jsonrpc: "2.0", id, result: { ok: true } }) + "\n";
       if (!socket.destroyed) socket.write(response);
       return;
@@ -850,7 +1283,28 @@ async function handleMessage(socket, line) {
   }
 
   try {
-    const result = await dispatch(method, params || {});
+    const callParams = { ...(params || {}) };
+    // External-token sockets always operate under the reserved app-wide scope so
+    // callers cannot omit chatSessionId and widen access via scopedSessionIds.
+    if (externalMcpSockets.has(socket)) {
+      callParams.chatSessionId = EXTERNAL_MCP_CHAT_SESSION_ID;
+    }
+    const isExternalScope = callParams.chatSessionId === EXTERNAL_MCP_CHAT_SESSION_ID;
+    if (isExternalScope) {
+      markExternalMcpSocket(socket);
+    }
+    // External MCP clients keep an authenticated TCP socket after disable unless
+    // we reject reserved-scope RPCs (and previously marked external sockets).
+    if (
+      (isExternalScope || externalMcpSockets.has(socket))
+      && !externalMcpActivityHook?.isEnabled?.()
+    ) {
+      throw new Error(
+        "External MCP is disabled. Re-enable it in Netcatty Settings → AI.",
+      );
+    }
+    notifyExternalMcpActivity(method, callParams);
+    const result = await dispatch(method, callParams);
     const response = JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n";
     if (!socket.destroyed) socket.write(response);
   } catch (err) {
@@ -865,19 +1319,158 @@ async function handleMessage(socket, line) {
 
 // ── RPC Dispatch ──
 
-// Methods that modify remote state — blocked in observer mode
-const WRITE_METHODS = new Set([
-  "netcatty/exec",
-  "netcatty/sftp/write",
-  "netcatty/sftp/download",
-  "netcatty/sftp/upload",
-  "netcatty/sftp/mkdir",
-  "netcatty/sftp/delete",
-  "netcatty/sftp/rename",
-  "netcatty/sftp/chmod",
-  "netcatty/jobStart",
-  "netcatty/jobStop",
-]);
+const {
+  evaluateRpcPermission,
+  evaluatePermissionWithGrants,
+  USER_DENIED_MESSAGE,
+} = require("../capabilities/policy.cjs");
+const { CAPABILITY_SURFACES } = require("../capabilities/constants.cjs");
+const { getCapabilityByRpcMethod } = require("../capabilities/registry.cjs");
+const { listMcpTools } = require("../capabilities/codegen/toolSurfaces.cjs");
+const {
+  createCapabilityRpcDispatcher,
+  UNROUTED,
+} = require("./mcpServerBridge/capabilityRpcDispatch.cjs");
+const { buildBuiltinRpcHandlerRegistry } = require("./mcpServerBridge/builtinRpcHandlers.cjs");
+const { createSessionService } = require("../capabilities/services/sessionService.cjs");
+
+let invokeVaultAgentFn = null;
+
+function setVaultAgentInvoker(fn) {
+  invokeVaultAgentFn = typeof fn === "function" ? fn : null;
+}
+
+let sessionService = null;
+const sessionIdleManager = createSessionIdleManager({
+  onIdle: async ({ chatSessionId, sessionId }, activityVersion) => {
+    const hasWorkerJob = await hasActiveWorkerJobForTerminalSession(sessionId);
+    if (!sessionIdleManager.isIdleCheckCurrent(sessionId, activityVersion)) {
+      return;
+    }
+    if (activeSessionExecutions.has(sessionId) || hasWorkerJob) {
+      sessionIdleManager.resume(sessionId);
+      return;
+    }
+    if (!sessionIdleManager.beginIdleClose(sessionId, activityVersion)) {
+      return;
+    }
+    await sessionService?.closeTracked({ chatSessionId, sessionId });
+  },
+});
+
+function reportOpenedSessionActivity(event = {}) {
+  const sessionId = event?.sessionId;
+  if (!sessionId) return false;
+  if (event.phase === "closed") {
+    forgetClosedTerminalSession(sessionId);
+    return true;
+  }
+  if (event.phase === "begin") {
+    return sessionIdleManager.beginActivity(null, sessionId);
+  }
+  if (event.phase === "end") {
+    return sessionIdleManager.endActivity(null, sessionId);
+  }
+  return sessionIdleManager.touch(null, sessionId);
+}
+
+sessionService = createSessionService({
+  invokeSessionAgent: (...args) => {
+    if (typeof invokeVaultAgentFn !== "function") {
+      return Promise.resolve({ ok: false, error: "Vault agent bridge is unavailable." });
+    }
+    return invokeVaultAgentFn(...args);
+  },
+  validateClose: (params = {}) => {
+    const scopeErr = validateSessionScope(
+      params.sessionId,
+      params.chatSessionId,
+      params.scopedSessionIds,
+    );
+    if (scopeErr) return { ok: false, error: scopeErr };
+    if (sessionIdleManager.isClosing(params.sessionId)) {
+      return { ok: false, error: `Session "${params.sessionId}" is closing.` };
+    }
+    return openedSessionOwnership.validate(params.chatSessionId, params.sessionId);
+  },
+  beforeClose: async (params = {}) => {
+    sessionIdleManager.beginClose(params.sessionId);
+    beginTerminalSessionClose(params.sessionId);
+    cancelBackgroundJobsForTerminalSession(params.sessionId);
+    await cancelWorkerBackgroundJobsForTerminalSession(params.sessionId);
+    await cancelSftpOpsForTerminalSession(params.sessionId);
+  },
+  afterClose: (params = {}, outcome = {}) => {
+    endTerminalSessionClose(params.sessionId);
+    if (outcome.closed) return;
+    if (outcome.notFound) {
+      forgetClosedTerminalSession(params.sessionId);
+      return;
+    }
+    sessionIdleManager.resume(params.sessionId);
+  },
+  onClosed: async (sessionId) => {
+    await settleBackgroundJobsForTerminalSession(sessionId);
+    forgetClosedTerminalSession(sessionId);
+  },
+});
+
+const dispatchCapabilityRpc = createCapabilityRpcDispatcher({
+  invokeVaultAgent: (...args) => {
+    if (typeof invokeVaultAgentFn !== "function") {
+      return Promise.resolve({ ok: false, error: "Vault agent bridge is unavailable." });
+    }
+    return invokeVaultAgentFn(...args);
+  },
+  evaluatePermissionWithGrants,
+  get permissionMode() {
+    return permissionMode;
+  },
+  get permissionGrantsSnapshot() {
+    return permissionGrantsSnapshot;
+  },
+  isChatSessionCancelled,
+  requestApprovalFromRenderer,
+  USER_DENIED_MESSAGE,
+  listPortForwards: () => listActivePortForwards(),
+  sessionService,
+  captureHostOpenScope: (chatSessionId) => ({
+    ownershipGeneration: openedSessionOwnership.captureGeneration(chatSessionId),
+    closeRevision: terminalSessionCloseRevision,
+  }),
+  onHostOpened: async (chatSessionId, sessionId, generation, result) => {
+    // The renderer creates the tab before replying to host_open. If the user
+    // explicitly closes it while that reply is still in flight, the eventual
+    // result must not revive ownership or scope metadata for the closed tab.
+    if ((closedTerminalSessionRevisions.get(sessionId) || 0) > generation?.closeRevision) return;
+    if (!openedSessionOwnership.register(
+      chatSessionId,
+      sessionId,
+      generation?.ownershipGeneration ?? generation,
+    )) {
+      // The chat may have been deleted while the renderer was creating the
+      // terminal. The generation revoke correctly rejects ownership, but the
+      // newly created backend session must also be reclaimed or it becomes an
+      // unowned session that no agent can close.
+      // host_open mints a fresh tab/session id. A reconnect with that id is the
+      // same logical tab and must also be reclaimed after its initiating chat
+      // was deleted; unrelated sessions do not reuse the minted id.
+      sessionIdleManager.track(chatSessionId, sessionId);
+      await sessionService.closeTracked({ chatSessionId, sessionId });
+      // A failed close stays idle-tracked so the normal bounded retry can try
+      // again. Remove only scope/live metadata here so a deleted chat cannot be
+      // recreated by the renderer's late merge.
+      forgetUnownedTerminalSessionMetadata(sessionId);
+      return;
+    }
+    closedTerminalSessionRevisions.delete(sessionId);
+    // A full empty scope replace can land after the renderer's best-effort
+    // host_open merge but before this async operation completes. Once the open
+    // succeeds, restore the returned session atomically with its ownership.
+    ensureOpenedSessionMetadata(chatSessionId, sessionId, result);
+    sessionIdleManager.track(chatSessionId, sessionId);
+  },
+});
 
 /**
  * Validate that a sessionId is allowed in the current scope.
@@ -905,31 +1498,363 @@ function validateSessionScope(sessionId, chatSessionId, explicitScopedIds = null
   return null;
 }
 
-async function dispatch(method, params) {
-  debugLog("dispatch", { method, params, permissionMode });
-  const sessionWriteLockId = (method === "netcatty/exec" || method === "netcatty/jobStart") ? params?.sessionId : null;
-  pruneCompletedBackgroundJobs();
+function isNetworkDeviceLikeMeta(meta) {
+  const protocol = meta?.protocol || "";
+  const isSshOrSerial = protocol === "ssh" || protocol === "serial";
+  return (meta?.deviceType === "network" && isSshOrSerial) || protocol === "serial";
+}
 
-  // Observer mode: block all write operations *except* netcatty/jobStop,
-  // which must remain available so users can interrupt long-running jobs
-  // they started before switching to observer mode (otherwise the job
-  // would hold the per-session lock until it exits on its own).
-  if (permissionMode === "observer" && WRITE_METHODS.has(method) && method !== "netcatty/jobStop") {
-    return { ok: false, error: `Operation denied: permission mode is "observer" (read-only). Change to "confirm" or "autonomous" in Settings → AI → Safety to allow this action.` };
+function buildHostFromMetadata(sessionId, meta) {
+  return {
+    sessionId,
+    hostname: meta.hostname || "",
+    label: meta.label || "",
+    os: meta.os || "",
+    username: meta.username || "",
+    protocol: meta.protocol || "",
+    shellType: meta.shellType || "",
+    deviceType: meta.deviceType || "",
+    connected: meta.connected !== false,
+    hostId: meta.hostId || "",
+    hostChain: Array.isArray(meta.hostChain) ? meta.hostChain : [],
+    activePortForwards: Array.isArray(meta.activePortForwards) ? meta.activePortForwards : [],
+  };
+}
+
+function pickToolHints(toolMap, hints) {
+  return Object.fromEntries(
+    Object.entries(hints)
+      .map(([key, capabilityId]) => [key, toolMap.get(capabilityId)])
+      .filter(([, toolName]) => Boolean(toolName)),
+  );
+}
+
+function buildMcpToolHints() {
+  const toolMap = new Map(listMcpTools().map((tool) => [tool.capabilityId, tool.mcpTool]));
+
+  return {
+    environment: toolMap.get("session.environment"),
+    terminal: pickToolHints(toolMap, {
+      execute: "terminal.execute",
+      start: "terminal.start",
+      poll: "terminal.poll",
+      stop: "terminal.stop",
+    }),
+    attachments: pickToolHints(toolMap, {
+      list: "attachment.list",
+      read: "attachment.read",
+    }),
+    sftp: pickToolHints(toolMap, {
+      list: "sftp.list",
+      read: "sftp.read",
+      write: "sftp.write",
+      download: "sftp.download",
+      upload: "sftp.upload",
+    }),
+  };
+}
+
+function buildTerminalToolGuidance(toolHints) {
+  const terminal = toolHints?.terminal || {};
+  if (terminal.execute && terminal.start && terminal.poll && terminal.stop) {
+    return `For terminal commands, use \`${terminal.execute}\` for short commands and \`${terminal.start}\`, \`${terminal.poll}\`, and \`${terminal.stop}\` for long-running commands. `;
+  }
+  if (Object.keys(terminal).length > 0) {
+    return "For terminal commands, use the terminal tools listed in tools.terminal. ";
+  }
+  return "";
+}
+
+async function handleWorkerTerminalExec(params = {}) {
+  const { sessionId, command } = params;
+  if (!sessionId || !command) throw new Error("sessionId and command are required");
+  if (typeof command !== "string" || !command.trim()) {
+    return { ok: false, error: "Invalid command", exitCode: 1 };
+  }
+  if (!terminalWorkerManager?.request) {
+    return { ok: false, error: "Session not found" };
   }
 
-  if (WRITE_METHODS.has(method) && !params?.chatSessionId) {
+  const chatSessionId = params?.chatSessionId || null;
+  const meta = getSessionMeta(sessionId, chatSessionId) || {};
+  if (!isNetworkDeviceLikeMeta(meta)) {
+    const safety = checkCommandSafety(command);
+    if (safety.blocked) {
+      return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
+    }
+  }
+
+  const reservation = reserveSessionExecution(sessionId, "exec");
+  if (!reservation.ok) return reservation;
+  const sessionToken = reservation.token;
+  const executionLock = beginChatExecution(chatSessionId, sessionId, command);
+  if (!executionLock.ok) {
+    releaseSessionExecution(sessionId, sessionToken);
     return {
       ok: false,
-      error: "chatSessionId is required for write operations.",
+      code: "COMMAND_ALREADY_RUNNING",
+      error: `Another Netcatty command is already running for chat session "${chatSessionId}". Wait for it to finish before starting a new exec.`,
+      activeCommand: executionLock.active.command,
+      activeSessionId: executionLock.active.sessionId,
     };
   }
 
-  // netcatty/jobStop must remain callable after ACP cancel so users can stop
-  // a long-running terminal_start job (which intentionally survives ACP Stop)
-  // even from a chat session whose write methods are otherwise blocked.
-  if (WRITE_METHODS.has(method) && method !== "netcatty/jobStop" && isChatSessionCancelled(params?.chatSessionId)) {
-    return { ok: false, error: "Operation cancelled: the ACP session was stopped." };
+  try {
+    return await terminalWorkerManager.request("netcatty:ai:exec", {
+      sessionId,
+      command,
+      chatSessionId,
+      commandTimeoutMs,
+      sessionMeta: meta,
+      enforceWallTimeout: true,
+    }, {});
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  } finally {
+    releaseSessionExecution(sessionId, sessionToken);
+    executionLock.release();
+  }
+}
+
+async function handleWorkerJobStart(params = {}) {
+  const { sessionId, command } = params;
+  if (!sessionId || !command) throw new Error("sessionId and command are required");
+  if (typeof command !== "string" || !command.trim()) {
+    return { ok: false, error: "Invalid command", exitCode: 1 };
+  }
+  if (!terminalWorkerManager?.request) {
+    return { ok: false, error: "Session not found" };
+  }
+  if (closingTerminalSessions.has(sessionId)) {
+    return { ok: false, error: `Session "${sessionId}" is closing.` };
+  }
+
+  const chatSessionId = params?.chatSessionId || null;
+  const meta = getSessionMeta(sessionId, chatSessionId) || {};
+  if (!isNetworkDeviceLikeMeta(meta)) {
+    const safety = checkCommandSafety(command);
+    if (safety.blocked) {
+      return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
+    }
+  }
+
+  const pendingStart = { chatSessionId, cancelled: false };
+  let pendingForSession = pendingWorkerJobStarts.get(sessionId);
+  if (!pendingForSession) {
+    pendingForSession = new Set();
+    pendingWorkerJobStarts.set(sessionId, pendingForSession);
+  }
+  pendingForSession.add(pendingStart);
+
+  try {
+    const result = await terminalWorkerManager.request("netcatty:ai:jobStart", {
+      sessionId,
+      command,
+      chatSessionId,
+      commandTimeoutMs,
+      sessionMeta: meta,
+    }, {});
+    if (result?.ok && result.jobId) {
+      if (pendingStart.cancelled || closingTerminalSessions.has(sessionId)) {
+        await waitForWorkerCleanup(terminalWorkerManager.request("netcatty:ai:jobStop", {
+          jobId: result.jobId,
+          sessionId,
+          chatSessionId,
+        }, {}));
+        return { ok: false, error: "Session is closing.", jobId: result.jobId, status: "cancelled" };
+      }
+      workerBackgroundJobs.set(result.jobId, {
+        chatSessionId: chatSessionId || null,
+        sessionId,
+      });
+    }
+    return result;
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  } finally {
+    pendingForSession.delete(pendingStart);
+    if (pendingForSession.size === 0) pendingWorkerJobStarts.delete(sessionId);
+  }
+}
+
+function getWorkerJob(jobId, chatSessionId) {
+  const job = workerBackgroundJobs.get(jobId);
+  if (!job) return null;
+  if (job.chatSessionId && (!chatSessionId || chatSessionId !== job.chatSessionId)) {
+    return null;
+  }
+  return job;
+}
+
+async function handleWorkerJobPoll(params = {}) {
+  const { jobId, chatSessionId, scopedSessionIds } = params || {};
+  if (!jobId) throw new Error("jobId is required");
+  const job = getWorkerJob(jobId, chatSessionId || null);
+  if (!job || !terminalWorkerManager?.request) {
+    return { ok: false, error: "Background job not found" };
+  }
+  if (job.sessionId) {
+    const scopeErr = validateSessionScope(job.sessionId, chatSessionId || null, scopedSessionIds);
+    if (scopeErr) return { ok: false, error: scopeErr };
+  }
+  const result = await terminalWorkerManager.request("netcatty:ai:jobPoll", params, {});
+  if (result?.completed) {
+    workerBackgroundJobs.delete(jobId);
+  }
+  return result;
+}
+
+async function handleWorkerJobStop(params = {}) {
+  const { jobId, chatSessionId, scopedSessionIds } = params || {};
+  if (!jobId) throw new Error("jobId is required");
+  const job = getWorkerJob(jobId, chatSessionId || null);
+  if (!job || !terminalWorkerManager?.request) {
+    return { ok: false, error: "Background job not found" };
+  }
+  if (Array.isArray(scopedSessionIds) && job.sessionId && !scopedSessionIds.includes(job.sessionId)) {
+    return { ok: false, error: `Session "${job.sessionId}" is not in the current scope.` };
+  }
+  const result = await terminalWorkerManager.request("netcatty:ai:jobStop", params, {});
+  if (result?.completed) {
+    workerBackgroundJobs.delete(jobId);
+  }
+  return result;
+}
+
+async function hasActiveWorkerJobForTerminalSession(sessionId) {
+  const matchingJobs = Array.from(workerBackgroundJobs.entries())
+    .filter(([, job]) => job?.sessionId === sessionId);
+  for (const [jobId, job] of matchingJobs) {
+    if (!terminalWorkerManager?.request) return true;
+    try {
+      const result = await terminalWorkerManager.request("netcatty:ai:jobPoll", {
+        jobId,
+        sessionId,
+        chatSessionId: job.chatSessionId || null,
+        offset: 0,
+      }, {});
+      if (result?.completed || (result?.ok === false && /not found/i.test(result?.error || ""))) {
+        workerBackgroundJobs.delete(jobId);
+        continue;
+      }
+      return true;
+    } catch {
+      // A transient worker failure should not close a possibly active session.
+      return true;
+    }
+  }
+  return false;
+}
+
+function cancelWorkerBackgroundJobsForSession(chatSessionId) {
+  if (!chatSessionId) return;
+  for (const pendingStarts of pendingWorkerJobStarts.values()) {
+    for (const pendingStart of pendingStarts) {
+      if (pendingStart.chatSessionId === chatSessionId) pendingStart.cancelled = true;
+    }
+  }
+  for (const [jobId, job] of workerBackgroundJobs) {
+    if (job.chatSessionId === chatSessionId) {
+      workerBackgroundJobs.delete(jobId);
+    }
+  }
+  try {
+    terminalWorkerManager?.send?.("netcatty:ai:catty:cancel", { chatSessionId }, {});
+  } catch {
+    // Worker may already be gone while cancelling a torn-down chat/session.
+  }
+}
+
+function waitForWorkerCleanup(requestPromise) {
+  const timeoutMs = Math.max(1, Math.min(commandTimeoutMs, 5000));
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  return Promise.race([requestPromise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+async function cancelWorkerBackgroundJobsForTerminalSession(sessionId) {
+  if (!sessionId) return;
+  for (const pendingStart of pendingWorkerJobStarts.get(sessionId) || []) {
+    pendingStart.cancelled = true;
+  }
+  const matchingJobs = [];
+  const pending = [];
+  for (const [jobId, job] of workerBackgroundJobs) {
+    if (job.sessionId !== sessionId) continue;
+    matchingJobs.push(jobId);
+    if (terminalWorkerManager?.request) {
+      pending.push(waitForWorkerCleanup(terminalWorkerManager.request("netcatty:ai:jobStop", {
+        jobId,
+        sessionId,
+        chatSessionId: job.chatSessionId || null,
+      }, {})));
+    }
+  }
+  if (pending.length) await Promise.allSettled(pending);
+  for (const jobId of matchingJobs) workerBackgroundJobs.delete(jobId);
+}
+
+let builtinRpcHandlerRegistry = null;
+
+function getBuiltinRpcHandlerRegistry() {
+  if (!builtinRpcHandlerRegistry) {
+    builtinRpcHandlerRegistry = buildBuiltinRpcHandlerRegistry({
+      "session.environment": handleGetContext,
+      "meta.status": handleGetStatus,
+      "attachment.list": handleListAttachments,
+      "attachment.read": handleReadAttachment,
+      "terminal.execute": handleExec,
+      "sftp.list": handleSftpList,
+      "sftp.read": handleSftpRead,
+      "sftp.write": handleSftpWrite,
+      "sftp.download": handleSftpDownload,
+      "sftp.upload": handleSftpUpload,
+      "sftp.mkdir": handleSftpMkdir,
+      "sftp.delete": handleSftpDelete,
+      "sftp.rename": handleSftpRename,
+      "sftp.stat": handleSftpStat,
+      "sftp.chmod": handleSftpChmod,
+      "sftp.home": handleSftpHome,
+      "session.cancel": handleSetCancelled,
+      "terminal.start": handleJobStart,
+      "terminal.poll": handleJobPoll,
+      "terminal.stop": handleJobStop,
+    });
+  }
+  return builtinRpcHandlerRegistry;
+}
+
+async function dispatch(method, params) {
+  debugLog("dispatch", { method, params, permissionMode });
+
+  if (!method.startsWith("netcatty/")) {
+    const capabilityResult = await dispatchCapabilityRpc(method, params || {});
+    if (capabilityResult !== UNROUTED) {
+      return capabilityResult;
+    }
+  }
+
+  const capability = getCapabilityByRpcMethod(method, CAPABILITY_SURFACES.BUILTIN);
+  const sessionWriteLockId = (capability?.id === "terminal.execute" || capability?.id === "terminal.start")
+    ? params?.sessionId
+    : null;
+  pruneCompletedBackgroundJobs();
+
+  const permission = evaluatePermissionWithGrants({
+    rpcMethod: method,
+    surface: CAPABILITY_SURFACES.BUILTIN,
+    permissionMode,
+    params,
+    context: {
+      chatSessionCancelled: isChatSessionCancelled(params?.chatSessionId),
+    },
+  }, permissionGrantsSnapshot);
+  if (!permission.allowed) {
+    return { ok: false, error: permission.error };
   }
 
   // Validate session scope *first* so out-of-scope callers cannot infer the
@@ -940,7 +1865,15 @@ async function dispatch(method, params) {
     if (scopeErr) return { ok: false, error: scopeErr };
   }
 
-  if ((method === "netcatty/exec" || method === "netcatty/jobStart") && params?.sessionId) {
+  if (
+    (capability?.id === "terminal.execute" || capability?.id === "terminal.start")
+    && params?.sessionId
+    && closingTerminalSessions.has(params.sessionId)
+  ) {
+    return { ok: false, error: `Session "${params.sessionId}" is closing.` };
+  }
+
+  if ((capability?.id === "terminal.execute" || capability?.id === "terminal.start") && params?.sessionId) {
     const busy = getSessionBusyError(params.sessionId);
     if (busy) return busy;
   }
@@ -956,59 +1889,65 @@ async function dispatch(method, params) {
     pendingSessionWriteApprovals.set(sessionWriteLockId, method);
   }
 
+  const tracksSessionActivity = Boolean(
+    params?.sessionId
+    && (
+      capability?.id === "terminal.execute"
+      || capability?.id === "terminal.start"
+      || capability?.id?.startsWith("sftp.")
+    )
+  );
+  const activityStarted = tracksSessionActivity
+    ? sessionIdleManager.beginActivity(params?.chatSessionId, params.sessionId)
+    : false;
+
   try {
     // Confirm mode: request user approval for write operations.
     // netcatty/jobStop bypasses approval — it's a stop/cancel action that
     // must remain available even if the renderer is unavailable; otherwise
     // a runaway terminal_start job could not be interrupted at all.
-    if (permissionMode === "confirm" && WRITE_METHODS.has(method) && method !== "netcatty/jobStop") {
+    if (permission.requiresApproval) {
       const { chatSessionId, ...toolArgs } = params || {};
       const approved = await requestApprovalFromRenderer(method, toolArgs, chatSessionId);
       if (!approved) {
-        return { ok: false, error: "Operation denied by user." };
+        return { ok: false, error: USER_DENIED_MESSAGE };
       }
     }
-    switch (method) {
-      case "netcatty/getContext":
-        return handleGetContext(params);
-      case "netcatty/getStatus":
-        return handleGetStatus();
-      case "netcatty/exec":
-        return handleExec(params);
-      case "netcatty/sftp/list":
-        return handleSftpList(params);
-      case "netcatty/sftp/read":
-        return handleSftpRead(params);
-      case "netcatty/sftp/write":
-        return handleSftpWrite(params);
-      case "netcatty/sftp/download":
-        return handleSftpDownload(params);
-      case "netcatty/sftp/upload":
-        return handleSftpUpload(params);
-      case "netcatty/sftp/mkdir":
-        return handleSftpMkdir(params);
-      case "netcatty/sftp/delete":
-        return handleSftpDelete(params);
-      case "netcatty/sftp/rename":
-        return handleSftpRename(params);
-      case "netcatty/sftp/stat":
-        return handleSftpStat(params);
-      case "netcatty/sftp/chmod":
-        return handleSftpChmod(params);
-      case "netcatty/sftp/home":
-        return handleSftpHome(params);
-      case "netcatty/setCancelled":
-        return handleSetCancelled(params);
-      case "netcatty/jobStart":
-        return handleJobStart(params);
-      case "netcatty/jobPoll":
-        return handleJobPoll(params);
-      case "netcatty/jobStop":
-        return handleJobStop(params);
-      default:
-        throw new Error(`Unknown method: ${method}`);
+    if (
+      (capability?.id === "terminal.execute" || capability?.id === "terminal.start")
+      && params?.sessionId
+    ) {
+      const scopeErr = validateSessionScope(
+        params.sessionId,
+        params?.chatSessionId,
+        params?.scopedSessionIds,
+      );
+      if (scopeErr) return { ok: false, error: scopeErr };
+      if (closingTerminalSessions.has(params.sessionId)) {
+        return { ok: false, error: `Session "${params.sessionId}" is closing.` };
+      }
     }
+    const handler = getBuiltinRpcHandlerRegistry().get(method);
+    if (!handler) {
+      throw new Error(`Unknown method: ${method}`);
+    }
+    if (capability?.id === "terminal.execute" && params?.sessionId && !sessions?.get?.(params.sessionId)) {
+      return await handleWorkerTerminalExec(params);
+    }
+    if (capability?.id === "terminal.start" && params?.sessionId && !sessions?.get?.(params.sessionId)) {
+      return await handleWorkerJobStart(params);
+    }
+    if (capability?.id === "terminal.poll" && workerBackgroundJobs.has(params?.jobId)) {
+      return await handleWorkerJobPoll(params);
+    }
+    if (capability?.id === "terminal.stop" && workerBackgroundJobs.has(params?.jobId)) {
+      return await handleWorkerJobStop(params);
+    }
+    return await handler(params);
   } finally {
+    if (activityStarted) {
+      sessionIdleManager.endActivity(params?.chatSessionId, params.sessionId);
+    }
     if (sessionWriteLockId) {
       pendingSessionWriteApprovals.delete(sessionWriteLockId);
     }
@@ -1017,12 +1956,35 @@ async function dispatch(method, params) {
 
 // ── Handler: getContext ──
 
-function handleGetContext(params) {
+async function handleGetContext(params) {
   debugLog("handleGetContext:start", { params, sessionCount: sessions?.size || 0 });
-  if (!sessions) return { hosts: [], instructions: "No sessions available." };
+  const toolHints = buildMcpToolHints();
+  if (!sessions) {
+    return {
+      hosts: [],
+      instructions: "No sessions available.",
+      tools: toolHints,
+    };
+  }
 
   // chatSessionId may be passed via env for per-scope metadata lookup
   const chatSessionId = params?.chatSessionId || null;
+  // External MCP clients use the reserved app-wide scope; refresh from the live
+  // session map so newly opened terminals appear without waiting for a renderer push.
+  // Only sync while External MCP is enabled — otherwise a stale client could
+  // rebuild the cleared scope after disable/idle timeout.
+  if (chatSessionId === EXTERNAL_MCP_CHAT_SESSION_ID) {
+    if (!externalMcpActivityHook?.isEnabled?.()) {
+      return {
+        environment: "netcatty-terminal",
+        description: "External MCP is disabled.",
+        hosts: [],
+        hostCount: 0,
+        tools: toolHints,
+      };
+    }
+    syncLiveSessionsToExternalScope(chatSessionId);
+  }
   const explicitScopedIds = Array.isArray(params?.scopedSessionIds)
     ? params.scopedSessionIds
     : null;
@@ -1034,6 +1996,7 @@ function handleGetContext(params) {
   const scopedIds = resolvedScopedIds ? new Set(resolvedScopedIds) : null;
 
   const hosts = [];
+  const addedHostIds = new Set();
   // When a scoped context exists but currently resolves to zero sessions, treat
   // it as "no access" rather than falling back to all sessions.
   if (hasScopedContext && (!resolvedScopedIds || resolvedScopedIds.length === 0)) {
@@ -1042,6 +2005,7 @@ function handleGetContext(params) {
       description: "No hosts are available in the current scope.",
       hosts: [],
       hostCount: 0,
+      tools: toolHints,
     };
   }
   for (const [sessionId, session] of sessions.entries()) {
@@ -1065,19 +2029,46 @@ function handleGetContext(params) {
       shellType: meta.shellType || session.shellKind || "",
       deviceType: meta.deviceType || "",
       connected: meta.connected !== undefined ? meta.connected : !!(session.sshClient || session.conn || ptyStream || session.serialPort),
+      hostId: meta.hostId || "",
+      hostChain: meta.hostChain || [],
+      activePortForwards: meta.activePortForwards || [],
     });
+    addedHostIds.add(sessionId);
+  }
+
+  if (resolvedScopedIds?.length) {
+    for (const sessionId of resolvedScopedIds) {
+      if (addedHostIds.has(sessionId)) continue;
+      const meta = getSessionMeta(sessionId, chatSessionId);
+      if (!meta || meta.connected === false) continue;
+      hosts.push(buildHostFromMetadata(sessionId, meta));
+      addedHostIds.add(sessionId);
+    }
+  }
+
+  let activePortForwardTunnels = [];
+  try {
+    activePortForwardTunnels = await listActivePortForwards();
+  } catch {
+    activePortForwardTunnels = [];
   }
 
   return {
     environment: "netcatty-terminal",
-    description: "You are operating inside Netcatty, a multi-session terminal manager. " +
+    description: appendVaultAgentGuidance(
+      "You are operating inside Netcatty, a multi-session terminal manager. " +
       "The available sessions may be remote hosts, local terminals, Mosh-backed shells, or serial port connections (network devices, embedded systems). " +
       "Use the provided tools to execute commands through the sessions exposed by Netcatty. " +
+      buildTerminalToolGuidance(toolHints) +
       "Serial sessions (protocol: serial, shellType: raw) do not run a standard shell — commands are sent as-is. " +
       "Network device sessions (deviceType: network) use vendor CLIs (Huawei VRP, Cisco IOS, etc.) — commands are sent as-is without shell wrapping, and exit codes are unavailable. " +
+      "Vault snippets, port forwarding rules/tunnels, and SFTP read/write tools are available when exposed in the tool list. " +
       "Always prefer these tools over suggesting the user to do things manually.",
+    ),
     hosts,
     hostCount: hosts.length,
+    activePortForwardTunnels,
+    tools: toolHints,
   };
 }
 
@@ -1101,711 +2092,106 @@ function handleGetStatus() {
   };
 }
 
-async function handleSetCancelled(params) {
-  const chatSessionId = params?.chatSessionId;
-  const cancelled = params?.cancelled !== false;
+function setPermissionGrants(grants) {
+  const { sanitizePermissionGrants } = require("../shared/permissionGrants.cjs");
+  permissionGrantsSnapshot = sanitizePermissionGrants(grants);
+}
+
+function getPermissionGrants() {
+  return permissionGrantsSnapshot;
+}
+
+function applyChatSessionCancelled(chatSessionId, cancelled) {
   if (!chatSessionId || typeof chatSessionId !== "string") {
     throw new Error("chatSessionId is required");
   }
-
   if (cancelled) {
     setChatSessionCancelled(chatSessionId, true);
     cancelPtyExecsForSession(chatSessionId);
     cancelBackgroundJobsForSession(chatSessionId);
+    cancelWorkerBackgroundJobsForSession(chatSessionId);
     clearPendingApprovals(chatSessionId);
     void cancelSftpOpsForSession(chatSessionId);
   } else {
     setChatSessionCancelled(chatSessionId, false);
   }
-
   return {
     ok: true,
     chatSessionId,
-    cancelled,
+    cancelled: !!cancelled,
   };
 }
 
-function getSessionSftpEncodingStateKey(chatSessionId, sessionId) {
-  if (!chatSessionId || !sessionId) return null;
-  return `chat:${chatSessionId}:session:${sessionId}`;
+async function handleSetCancelled(params) {
+  const chatSessionId = params?.chatSessionId;
+  const cancelled = params?.cancelled !== false;
+  return applyChatSessionCancelled(chatSessionId, cancelled);
 }
 
-async function withSessionBackedSftp(params, action, options = {}) {
-  if (!params?.sessionId) throw new Error("sessionId is required");
-  const chatSessionId = typeof params?.chatSessionId === "string" && params.chatSessionId ? params.chatSessionId : null;
-  const encodingStateKey = getSessionSftpEncodingStateKey(chatSessionId, params.sessionId);
-  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 0;
-  const cancelCleanupGraceMs = Number.isFinite(options.cancelCleanupGraceMs) && options.cancelCleanupGraceMs >= 0
-    ? options.cancelCleanupGraceMs
-    : 1000;
-  const operationName = options.operationName || "SFTP operation";
-  const abortController = new AbortController();
-  let sftpId = null;
-  let timeoutId = null;
-  let forceCloseTimer = null;
-  let closeRequested = false;
-  let closePromise = null;
-  let cancellationError = null;
-  let timeoutError = null;
-  const closeSftpHandle = () => {
-    if (!sftpId) {
-      return Promise.resolve();
-    }
-    if (!closePromise) {
-      closePromise = Promise.resolve().then(() => sftpBridge.closeSftp(null, { sftpId, encodingStateKey }));
-    }
-    return closePromise;
-  };
-  const closeSftpInBackground = () => {
-    if (closeRequested) return;
-    closeRequested = true;
-    void closeSftpHandle().catch(() => {
-      // Ignore close failures while cleaning up a cancelled or timed-out handle.
-    });
-  };
-  const requestAbort = (err) => {
-    if (!abortController.signal.aborted) {
-      abortController.abort(err);
-    }
-    if (!forceCloseTimer && !closeRequested) {
-      forceCloseTimer = setTimeout(() => {
-        forceCloseTimer = null;
-        closeSftpInBackground();
-      }, cancelCleanupGraceMs);
-    }
-  };
-  const unregisterSftpOp = registerSftpOp(chatSessionId, () => {
-    if (!cancellationError) {
-      cancellationError = new Error("Cancelled");
-    }
-    requestAbort(cancellationError);
-  });
-  try {
-    if (timeoutMs) {
-      timeoutId = setTimeout(() => {
-        if (!timeoutError) {
-          timeoutError = new Error(`${operationName} timed out after ${timeoutMs}ms`);
-        }
-        requestAbort(timeoutError);
-      }, timeoutMs);
-    }
-
-    const opened = await sftpBridge.openSftpForSession(null, {
-      sessionId: params.sessionId,
-      encodingStateKey,
-      abortSignal: abortController.signal,
-      timeoutMs,
-    });
-    sftpId = opened?.sftpId;
-    if (!sftpId) throw new Error("Failed to open session-backed SFTP handle");
-    if (timeoutError) {
-      throw timeoutError;
-    }
-    if (cancellationError) {
-      throw cancellationError;
-    }
-
-    const payload = {
-      ...params,
-      sftpId,
-      abortSignal: abortController.signal,
-      timeoutMs,
-    };
-    const value = await Promise.resolve().then(() => action(payload));
-    if (timeoutError) {
-      throw timeoutError;
-    }
-    if (cancellationError) {
-      throw cancellationError;
-    }
-    return value;
-  } catch (err) {
-    if (timeoutError) {
-      throw timeoutError;
-    }
-    if (cancellationError) {
-      throw cancellationError;
-    }
-    throw err;
-  } finally {
-    unregisterSftpOp();
-    if (timeoutId) clearTimeout(timeoutId);
-    if (forceCloseTimer) {
-      clearTimeout(forceCloseTimer);
-      forceCloseTimer = null;
-    }
-    try {
-      await closeSftpHandle();
-    } catch {
-      // Ignore close failures for one-off internal SFTP handles.
-    }
-  }
-}
-
-async function handleSftpList(params) {
-  const entries = await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.listSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP list" },
-  );
-  return { ok: true, entries };
-}
-
-async function handleSftpRead(params) {
-  if (!params?.path) throw new Error("path is required");
-  const content = await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.readSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP read" },
-  );
-  return { ok: true, path: params.path, content };
-}
-
-async function handleSftpWrite(params) {
-  if (!params?.path) throw new Error("path is required");
-  if (typeof params?.content !== "string") throw new Error("content is required");
-  await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.writeSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP write" },
-  );
-  return { ok: true, path: params.path };
-}
-
-async function handleSftpDownload(params) {
-  if (!params?.remotePath || !params?.localPath) {
-    throw new Error("remotePath and localPath are required");
-  }
-  const result = await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.downloadSftpToLocal(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP download" },
-  );
-  return { ok: true, ...result };
-}
-
-async function handleSftpUpload(params) {
-  if (!params?.remotePath || !params?.localPath) {
-    throw new Error("remotePath and localPath are required");
-  }
-  const result = await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.uploadLocalToSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP upload" },
-  );
-  return { ok: true, ...result };
-}
-
-async function handleSftpMkdir(params) {
-  if (!params?.path) throw new Error("path is required");
-  await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.mkdirSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP mkdir" },
-  );
-  return { ok: true, path: params.path };
-}
-
-async function handleSftpDelete(params) {
-  if (!params?.path) throw new Error("path is required");
-  await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.deleteSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP delete" },
-  );
-  return { ok: true, path: params.path };
-}
-
-async function handleSftpRename(params) {
-  if (!params?.oldPath || !params?.newPath) {
-    throw new Error("oldPath and newPath are required");
-  }
-  await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.renameSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP rename" },
-  );
-  return { ok: true, oldPath: params.oldPath, newPath: params.newPath };
-}
-
-async function handleSftpStat(params) {
-  if (!params?.path) throw new Error("path is required");
-  const stat = await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.statSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP stat" },
-  );
-  return { ok: true, stat };
-}
-
-async function handleSftpChmod(params) {
-  if (!params?.path || !params?.mode) throw new Error("path and mode are required");
-  await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.chmodSftp(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP chmod" },
-  );
-  return { ok: true, path: params.path, mode: params.mode };
-}
-
-async function handleSftpHome(params) {
-  const result = await withSessionBackedSftp(
-    params,
-    (payload) => sftpBridge.getSftpHomeDir(null, payload),
-    { timeoutMs: commandTimeoutMs, operationName: "SFTP home" },
-  );
-  if (!result?.success) {
-    throw new Error(result?.error || "Could not determine home directory");
-  }
-  return { ok: true, homeDir: result.homeDir };
-}
+const { createSftpHandlerApi } = require("./mcpServerBridge/sftpHandlers.cjs");
+const sftpHandlerApi = createSftpHandlerApi({
+  get commandTimeoutMs() { return commandTimeoutMs; },
+  get sessions() { return sessions; },
+  get terminalWorkerManager() { return terminalWorkerManager; },
+  sftpBridge, registerSftpOp, setTimeout, clearTimeout, AbortController, Promise, Error,
+  createTransferId: () => require("node:crypto").randomUUID(),
+  reportTransferEvent: (payload) => broadcastApprovalEvent("netcatty:sftp:global-transfer", payload),
+  get transferBridge() { return fileTransferBridge; },
+});
+const {
+  getSessionSftpEncodingStateKey,
+  withSessionBackedSftp,
+  handleSftpList,
+  handleSftpRead,
+  handleSftpWrite,
+  handleSftpDownload,
+  handleSftpUpload,
+  handleSftpMkdir,
+  handleSftpDelete,
+  handleSftpRename,
+  handleSftpStat,
+  handleSftpChmod,
+  handleSftpHome,
+} = sftpHandlerApi;
 
 // ── Handler: exec ──
 
-function resolveExecContext(params) {
-  const { sessionId, command } = params;
-  debugLog("handleExec:start", { sessionId, command, chatSessionId: params?.chatSessionId });
-  if (!sessionId || !command) throw new Error("sessionId and command are required");
-  if (typeof command !== 'string' || !command.trim()) {
-    return { ok: false, error: 'Invalid command', exitCode: 1 };
-  }
-
-  const session = sessions?.get(sessionId);
-  debugLog("handleExec:sessionLookup", {
-    sessionId,
-    found: Boolean(session),
-    protocol: session?.protocol || session?.type || null,
-    shellKind: session?.shellKind || null,
-  });
-  if (!session) return { ok: false, error: "Session not found" };
-
-  // Look up device type from metadata (set by renderer from Host.deviceType).
-  const chatSessionId = params?.chatSessionId || null;
-  const meta = getSessionMeta(sessionId, chatSessionId) || {};
-  // Mosh sessions use a shell-backed PTY and cannot connect to vendor CLIs,
-  // so network device mode only applies to SSH and serial sessions.
-  // Prefer session.protocol (runtime truth) over meta.protocol (renderer hint)
-  // because Mosh tabs report as protocol:"ssh" in metadata but "mosh" in session.
-  const sessionProtocol = session.protocol || session.type || meta.protocol || "";
-  const isSshOrSerial = sessionProtocol === "ssh" || sessionProtocol === "serial";
-  const isNetworkDevice = (meta.deviceType === "network" && isSshOrSerial) || sessionProtocol === "serial";
-
-  // The blocklist targets shell-specific patterns (rm -rf, eval, $(), etc.) that
-  // are meaningless on network device CLIs. Serial sessions skip the check because
-  // commands like "shutdown" (disable an interface) are routine on Cisco/Huawei.
-  //
-  // Design note: the serial protocol is explicitly chosen by the user in the UI
-  // for network devices / embedded systems. While startSerialSession technically
-  // supports PTY devices, users connecting to a Linux/BusyBox shell should use
-  // the "local" protocol (which goes through the normal shell path with blocklist).
-  // Additionally, execViaRawPty sends commands without shell wrapping, so shell
-  // metacharacters in blocklist patterns (eval, $(), backticks, pipes) cannot
-  // actually be interpreted even if sent to a serial-connected shell.
-  if (!isNetworkDevice) {
-    const safety = checkCommandSafety(command);
-    if (safety.blocked) {
-      debugLog("handleExec:blocklisted", { sessionId, matchedPattern: safety.matchedPattern });
-      return { ok: false, error: `Command blocked by safety policy. Pattern: ${safety.matchedPattern}` };
-    }
-  }
-
-  if ((session.protocol === "local" || session.type === "local") && session.shellKind === "unknown") {
-    return {
-      ok: false,
-      error: "AI execution is not supported for this local shell executable. Configure the local terminal to use bash/zsh/sh, fish, PowerShell/pwsh, or cmd.exe.",
-    };
-  }
-
-  const sshClient = session.conn || session.sshClient;
-  const ptyStream = session.stream || session.pty || session.proc;
-  return {
-    ok: true,
-    context: {
-      sessionId,
-      command,
-      session,
-      chatSessionId,
-      sessionProtocol,
-      isNetworkDevice,
-      sshClient,
-      ptyStream,
-    },
-  };
-}
-
-function handleExec(params) {
-  const resolved = resolveExecContext(params);
-  if (!resolved.ok) return resolved;
-  const {
-    sessionId,
-    command,
-    session,
-    chatSessionId,
-    sessionProtocol,
-    isNetworkDevice,
-    sshClient,
-    ptyStream,
-  } = resolved.context;
-  const reservation = reserveSessionExecution(sessionId, "exec");
-  if (!reservation.ok) return reservation;
-  const sessionToken = reservation.token;
-  const executionLock = beginChatExecution(chatSessionId, sessionId, command);
-  if (!executionLock.ok) {
-    releaseSessionExecution(sessionId, sessionToken);
-    return {
-      ok: false,
-      code: "COMMAND_ALREADY_RUNNING",
-      error: `Another Netcatty command is already running for chat session "${chatSessionId}". Wait for it to finish before starting a new exec.`,
-      activeCommand: executionLock.active.command,
-      activeSessionId: executionLock.active.sessionId,
-    };
-  }
-
-  const runExecution = (factory) => {
-    try {
-      return Promise.resolve(factory()).finally(() => {
-        releaseSessionExecution(sessionId, sessionToken);
-        executionLock.release();
-      });
-    } catch (err) {
-      releaseSessionExecution(sessionId, sessionToken);
-      executionLock.release();
-      return { ok: false, error: err?.message || String(err) };
-    }
-  };
-
-  // Network devices (switches/routers) connected via SSH: use raw execution.
-  // Their vendor CLIs (Huawei VRP, Cisco IOS, etc.) don't run a POSIX shell,
-  // so shell-wrapped commands with markers would fail. Raw mode sends commands
-  // as-is with idle-timeout completion detection — same as serial sessions.
-  if (isNetworkDevice && ptyStream && typeof ptyStream.write === "function") {
-    return runExecution(() => execViaRawPty(ptyStream, command, {
-      timeoutMs: commandTimeoutMs,
-      trackForCancellation: activePtyExecs,
-      chatSessionId: params?.chatSessionId,
-      encoding: "utf8", // SSH PTY streams use UTF-8, not latin1
-    }));
-  }
-
-  // Prefer the interactive PTY so the user sees command/output in-session.
-  if (ptyStream && typeof ptyStream.write === "function") {
-    return runExecution(() => execViaPty(ptyStream, command, {
-      trackForCancellation: activePtyExecs,
-      timeoutMs: commandTimeoutMs,
-      shellKind: session.shellKind,
-      expectedPrompt: session.lastIdlePrompt || "",
-      typedInput: true,
-      echoCommand: (rawCommand) => echoCommandToSession(session, sessionId, rawCommand),
-      chatSessionId,
-      // MCP callers have terminal_start as a fallback for long commands,
-      // so enforce a hard wall-clock timeout here to match the MCP budget.
-      enforceWallTimeout: true,
-    }));
-  }
-
-  // Network devices require an interactive PTY for raw command execution.
-  // If we got here, ptyStream wasn't writable — there's no usable channel.
-  if (isNetworkDevice) {
-    releaseSessionExecution(sessionId, sessionToken);
-    executionLock.release();
-    return { ok: false, error: "Network device session has no writable PTY stream for command execution" };
-  }
-
-  // Fallback: SSH exec channel (invisible to terminal).
-  // At this point ptyStream is not writable (already returned above if it was).
-  if (sshClient && typeof sshClient.exec === "function") {
-    return runExecution(() => execViaChannel(sshClient, command, {
-      timeoutMs: commandTimeoutMs,
-      trackForCancellation: activePtyExecs,
-      // Pass chatSessionId so cancelPtyExecsForSession can interrupt this
-      // exec channel when the originating ACP run is stopped.
-      chatSessionId: params?.chatSessionId,
-    }));
-  }
-
-  // Serial port: raw command execution (no shell wrapping)
-  if (session.protocol === "serial" && session.serialPort && typeof session.serialPort.write === "function") {
-    return runExecution(() => execViaRawPty(session.serialPort, command, {
-      timeoutMs: commandTimeoutMs,
-      trackForCancellation: activePtyExecs,
-      chatSessionId: params?.chatSessionId,
-      encoding: session.serialEncoding || "utf8",
-    }));
-  }
-
-  releaseSessionExecution(sessionId, sessionToken);
-  executionLock.release();
-  return { ok: false, error: "Session does not support command execution" };
-}
-
-function handleJobStart(params) {
-  const resolved = resolveExecContext(params);
-  if (!resolved.ok) return resolved;
-  const {
-    sessionId,
-    command,
-    session,
-    chatSessionId,
-    isNetworkDevice,
-    sessionProtocol,
-    ptyStream,
-  } = resolved.context;
-
-  if (isNetworkDevice || sessionProtocol === "serial") {
-    return {
-      ok: false,
-      error: "Background execution currently supports shell-backed PTY sessions only.",
-    };
-  }
-
-  if (!ptyStream || typeof ptyStream.write !== "function") {
-    return {
-      ok: false,
-      error: "Background execution requires a writable PTY-backed terminal session.",
-    };
-  }
-
-  const reservation = reserveSessionExecution(sessionId, "job");
-  if (!reservation.ok) return reservation;
-  const sessionToken = reservation.token;
-
-  const jobId = createBackgroundJobId();
-  const timeoutMs = Math.max(commandTimeoutMs, DEFAULT_BACKGROUND_JOB_TIMEOUT_MS);
-  let handle;
-  try {
-    handle = startPtyJob(ptyStream, command, {
-      // Intentionally do NOT register in activePtyExecs: terminal_start jobs
-      // are designed to survive ACP "Stop" so the model can stop polling
-      // without aborting a long-running build/scan/log stream. The job is
-      // managed via terminal_stop and the per-session execution lock.
-      timeoutMs,
-      shellKind: session.shellKind,
-      chatSessionId,
-      expectedPrompt: session.lastIdlePrompt || "",
-      typedInput: true,
-      echoCommand: (rawCommand) => echoCommandToSession(session, sessionId, rawCommand),
-      maxBufferedChars: MAX_BACKGROUND_JOB_OUTPUT_CHARS,
-      normalizeFinalOutput: false,
-    });
-  } catch (err) {
-    releaseSessionExecution(sessionId, sessionToken);
-    return { ok: false, error: err?.message || String(err) };
-  }
-
-  const startedAt = Date.now();
-  const job = {
-    id: jobId,
-    sessionId,
-    chatSessionId: chatSessionId || null,
-    command,
-    status: "running",
-    startedAt,
-    updatedAt: startedAt,
-    exitCode: null,
-    error: null,
-    stdout: "",
-    outputBaseOffset: 0,
-    totalOutputChars: 0,
-    outputTruncated: false,
-    handle,
-  };
-  backgroundJobs.set(jobId, job);
-
-  handle.resultPromise.then((result) => {
-    job.updatedAt = Date.now();
-    job.exitCode = result.exitCode ?? null;
-    storeCompletedJobOutput(job, result.stdout || "", result);
-    const isForcedCancel = typeof result.error === "string" && result.error.includes("forced");
-    if (result.error === "Cancelled" || isForcedCancel) {
-      // Forced cancel means the process ignored SIGINT for the cancel
-      // wall-clock window. We mark the job as cancelled and release the
-      // lock so the session is reusable; the error message tells the
-      // caller the process may still be running so subsequent commands
-      // should be considered carefully. This is consistent: callers see
-      // completed=true exactly when the lock is no longer held.
-      job.status = "cancelled";
-      job.error = result.error;
-      releaseSessionExecution(sessionId, sessionToken);
-      return;
-    }
-    if (result.error) {
-      job.status = "failed";
-      job.error = result.error;
-      releaseSessionExecution(sessionId, sessionToken);
-      return;
-    }
-    // A non-zero exit code without an error message still represents a
-    // failed command (e.g. a build/test that returned 1). Mark it as failed
-    // so callers don't have to special-case exitCode against status.
-    if (typeof result.exitCode === "number" && result.exitCode !== 0) {
-      job.status = "failed";
-      job.error = `Command exited with code ${result.exitCode}`;
-      releaseSessionExecution(sessionId, sessionToken);
-      return;
-    }
-    job.status = "completed";
-    releaseSessionExecution(sessionId, sessionToken);
-  }).catch((err) => {
-    job.updatedAt = Date.now();
-    job.status = "failed";
-    job.error = err?.message || String(err);
-    storeCompletedJobOutput(job, job.stdout || "");
-    releaseSessionExecution(sessionId, sessionToken);
-  });
-
-  return {
-    ok: true,
-    jobId,
-    sessionId,
-    command,
-    status: "running",
-    startedAt,
-    outputMode: "foreground-mirrored",
-    recommendedPollIntervalMs: DEFAULT_BACKGROUND_JOB_POLL_INTERVAL_MS,
-  };
-}
-
-function getScopedJob(jobId, chatSessionId) {
-  const job = backgroundJobs.get(jobId);
-  if (!job) return null;
-  // Per-chat isolation: a job started under a chat session can only be
-  // accessed by callers presenting the same chatSessionId. Unscoped or
-  // statically-scoped callers cannot reach into another chat's jobs.
-  if (job.chatSessionId) {
-    if (!chatSessionId || job.chatSessionId !== chatSessionId) {
-      return null;
-    }
-  }
-  return job;
-}
-
-function handleJobPoll(params) {
-  const { jobId, offset = 0, chatSessionId, scopedSessionIds } = params || {};
-  if (!jobId) throw new Error("jobId is required");
-  const job = getScopedJob(jobId, chatSessionId || null);
-  if (!job) return { ok: false, error: "Background job not found" };
-  // Re-check session scope so a caller that lost access to the host
-  // cannot continue reading output from jobs on that session.
-  // Covers dynamic (chatSessionId) and static (scopedSessionIds) modes.
-  if (job.sessionId) {
-    const scopeErr = validateSessionScope(job.sessionId, chatSessionId || null, scopedSessionIds);
-    if (scopeErr) return { ok: false, error: scopeErr };
-  }
-  return serializeBackgroundJob(job, offset);
-}
-
-function handleJobStop(params) {
-  const { jobId, chatSessionId, scopedSessionIds } = params || {};
-  if (!jobId) throw new Error("jobId is required");
-  const job = getScopedJob(jobId, chatSessionId || null);
-  if (!job) return { ok: false, error: "Background job not found" };
-  // For statically scoped MCP clients, validate that the job's session is
-  // within the caller's static scope so a foreign jobId cannot cancel jobs
-  // outside the caller's allowed sessions. Dynamic chat scope is already
-  // enforced by getScopedJob (caller's chatSessionId must match the job's),
-  // and we intentionally do NOT re-check dynamic scope here so jobs can
-  // still be stopped after workspace membership changes — otherwise the
-  // session lock would stay held forever.
-  if (Array.isArray(scopedSessionIds) && job.sessionId) {
-    if (!scopedSessionIds.includes(job.sessionId)) {
-      return { ok: false, error: `Session "${job.sessionId}" is not in the current scope.` };
-    }
-  }
-  if (job.status === "running") {
-    try {
-      job.handle?.cancel?.();
-    } catch (err) {
-      return { ok: false, error: err?.message || String(err) };
-    }
-    job.status = "stopping";
-    job.error = "Cancellation requested";
-    job.updatedAt = Date.now();
-  }
-  return serializeBackgroundJob(job, 0);
-}
-
-// ── MCP Server Config Builder ──
-
-function resolveMcpServerRuntimeCommand() {
-  const runtimeCommand = process.execPath;
-  const runtimeEnv = [];
-
-  if (runtimeCommand && existsSync(runtimeCommand)) {
-    const basename = path.basename(runtimeCommand).toLowerCase();
-    const isNodeBinary = basename === "node" || basename.startsWith("node.");
-    if (!isNodeBinary) {
-      runtimeEnv.push({ name: "ELECTRON_RUN_AS_NODE", value: "1" });
-    }
-    return { command: runtimeCommand, env: runtimeEnv };
-  }
-
-  return { command: "node", env: runtimeEnv };
-}
-
-function buildMcpServerConfig(port, scopedSessionIds, chatSessionId) {
-  // Use provided scoped IDs, or resolve them from chatSessionId.
-  const effectiveIds = (scopedSessionIds && scopedSessionIds.length > 0)
-    ? scopedSessionIds
-    : getScopedSessionIds(chatSessionId);
-
-  const runtimePath = toUnpackedAsarPath(
-    path.join(__dirname, "..", "mcp", "netcatty-mcp-server.cjs"),
-  );
-  const runtime = resolveMcpServerRuntimeCommand();
-
-  const env = [
-    ...runtime.env,
-    { name: "NETCATTY_MCP_PORT", value: String(port) },
-  ];
-
-  if (authToken) {
-    env.push({ name: "NETCATTY_MCP_TOKEN", value: authToken });
-  }
-  if (DEBUG_MCP) {
-    env.push({ name: "NETCATTY_MCP_DEBUG", value: "1" });
-  }
-
-  // When chatSessionId is present, the MCP subprocess resolves scope dynamically
-  // through main-process metadata, so avoid freezing session IDs at spawn time.
-  if (!chatSessionId && effectiveIds && effectiveIds.length > 0) {
-    env.push({ name: "NETCATTY_MCP_SESSION_IDS", value: effectiveIds.join(",") });
-  }
-
-  // Pass chatSessionId so MCP server can scope getContext responses
-  if (chatSessionId) {
-    env.push({ name: "NETCATTY_MCP_CHAT_SESSION_ID", value: chatSessionId });
-  }
-
-  // Pass permission mode so MCP server can enforce it locally (defense-in-depth)
-  env.push({ name: "NETCATTY_MCP_PERMISSION_MODE", value: permissionMode });
-
-  return {
-    name: "netcatty-remote-hosts",
-    type: "stdio",
-    command: runtime.command,
-    args: [runtimePath],
-    env,
-  };
-}
-
-// ── Cleanup ──
-
-async function cleanupScopedMetadata(chatSessionId) {
-  if (chatSessionId) {
-    scopedMetadata.delete(chatSessionId);
-    cancelledChatSessions.delete(chatSessionId);
-    cancelBackgroundJobsForSession(chatSessionId);
-    // Resolve any in-flight approval requests so dispatch()'s finally block
-    // releases its pendingSessionWriteApprovals entry. Without this, a chat
-    // deleted while an approval was pending would leave the per-session
-    // write lock held until the approval timeout expires.
-    clearPendingApprovals(chatSessionId);
-    await cancelSftpOpsForSession(chatSessionId);
-    sftpBridge.clearSftpEncodingStateByPrefix?.(`chat:${chatSessionId}:session:`);
-  }
-}
+const { createExecHandlerApi } = require("./mcpServerBridge/execHandlers.cjs");
+const execHandlerApi = createExecHandlerApi({
+  get sessions() { return sessions; },
+  get commandTimeoutMs() { return commandTimeoutMs; },
+  DEFAULT_BACKGROUND_JOB_TIMEOUT_MS, DEFAULT_BACKGROUND_JOB_POLL_INTERVAL_MS, MAX_BACKGROUND_JOB_OUTPUT_CHARS,
+  backgroundJobs, activePtyExecs,
+  debugLog, getSessionMeta, checkCommandSafety, reserveSessionExecution, releaseSessionExecution,
+  beginChatExecution, execViaRawPty, execViaPty, execViaChannel, startPtyJob,
+  getFreshIdlePrompt, echoCommandToSession, createBackgroundJobId, storeCompletedJobOutput,
+  serializeBackgroundJob, validateSessionScope, Date, Error,
+});
+const {
+  resolveExecContext,
+  handleExec,
+  handleJobStart,
+  getScopedJob,
+  handleJobPoll,
+  handleJobStop,
+} = execHandlerApi;
+const { createConfigAndCleanupApi } = require("./mcpServerBridge/configAndCleanup.cjs");
+const configAndCleanupApi = createConfigAndCleanupApi({
+  get authToken() { return authToken; },
+  get permissionMode() { return permissionMode; },
+  process, existsSync, path, __dirname, toUnpackedAsarPath, DEBUG_MCP,
+  getScopedSessionIds, scopedMetadata, scopedAttachments, cancelledChatSessions, cancelBackgroundJobsForSession,
+  cancelWorkerBackgroundJobsForSession,
+  cancelWorkerBackgroundJobsForTerminalSession,
+  clearPendingApprovals, cancelSftpOpsForSession, sftpBridge,
+  preserveIdleSessionCleanup: sessionIdleManager.scopeCleared,
+  clearOpenedSessionScope: openedSessionOwnership.clearScope,
+});
+const { resolveMcpServerRuntimeCommand, buildMcpServerConfig, cleanupScopedMetadata } = configAndCleanupApi;
 
 function cleanup() {
+  try { disposeWorkerSessionClosed?.dispose?.(); } catch { /* ignore */ }
+  disposeWorkerSessionClosed = null;
   shutdownHost();
 }
 
@@ -1814,13 +2200,24 @@ module.exports = {
   setCommandBlocklist,
   setCommandTimeout,
   getCommandTimeoutMs,
+  setSessionIdleTimeoutMinutes,
+  getSessionIdleTimeoutMinutes,
+  reportOpenedSessionActivity,
   setMaxIterations,
   getMaxIterations,
   setPermissionMode,
   getPermissionMode,
+  setPermissionGrants,
+  getPermissionGrants,
   setChatSessionCancelled,
+  applyChatSessionCancelled,
   checkCommandSafety,
   updateSessionMetadata,
+  updateLiveSessionMetadata,
+  mergeSessionMetadata,
+  updateAttachmentMetadata,
+  handleListAttachments,
+  handleReadAttachment,
   getScopedSessionIds,
   getOrCreateHost,
   buildMcpServerConfig,
@@ -1828,15 +2225,30 @@ module.exports = {
   cancelBackgroundJobsForSession,
   cancelAllPtyExecs,
   cancelPtyExecsForSession,
+  cancelWorkerBackgroundJobsForSession,
+  cancelWorkerBackgroundJobsForTerminalSession,
+  hasActiveWorkerJobForTerminalSession,
   cancelSftpOpsForSession,
   getSessionMeta,
+  forgetClosedTerminalSession,
   cleanupScopedMetadata,
   cleanup,
   shutdownHost,
   setMainWindowGetter,
+  setVaultAgentInvoker,
+  setExternalMcpHooks,
+  disconnectExternalMcpClients,
+  issueExternalMcpAuthToken,
+  revokeExternalMcpAuthToken,
+  getExternalMcpAuthToken,
+  syncLiveSessionsToExternalScope,
+  requestApprovalFromRenderer,
   resolveApprovalFromRenderer,
+  cancelApprovalTimeoutFromRenderer,
   clearPendingApprovals,
   reserveSessionExecution,
   releaseSessionExecution,
   getSessionBusyError,
+  dispatchBuiltinRpc: dispatch,
+  EXTERNAL_MCP_CHAT_SESSION_ID,
 };

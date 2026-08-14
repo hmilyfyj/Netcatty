@@ -6,11 +6,16 @@
 
 import type { CompletionContext } from "./completionEngine";
 import type { FigArg } from "./figSpecLoader";
+import type { AutocompleteCwdSource } from "./terminalAutocompleteLayout";
 
 /** Directory entry returned from IPC */
 export interface DirEntry {
   name: string;
   type: "file" | "directory" | "symlink";
+}
+
+interface ResolvePathOptions {
+  preferRelativeCwd?: boolean;
 }
 
 /** Bridge interface for directory listing */
@@ -107,11 +112,6 @@ export function shouldDoPathCompletion(
           foldersOnly: templates.includes("folders") && !templates.includes("filepaths"),
         };
       }
-      // Generators field often indicates path completion (e.g., cd)
-      if (arg.generators) {
-        const foldersOnly = FOLDER_ONLY_COMMANDS.has(ctx.commandName);
-        return { shouldComplete: true, foldersOnly };
-      }
     }
   }
 
@@ -135,18 +135,20 @@ export function shouldDoPathCompletion(
 export function resolvePathComponents(
   currentWord: string,
   cwd: string | undefined,
+  options: ResolvePathOptions = {},
 ): { dirToList: string; filterPrefix: string; pathPrefix: string; quoteSuffix: string } {
   const quotePrefix = getLeadingQuote(currentWord);
   const quoteSuffix = getTrailingMatchingQuote(currentWord, quotePrefix);
   const unquotedWord = stripWrappingQuotes(currentWord);
+  const preferRelativeCwd = options.preferRelativeCwd === true;
 
   // Handle empty input — list CWD
   if (!unquotedWord || unquotedWord === "." || unquotedWord === "~" || unquotedWord === "..") {
     const dir = unquotedWord === "~"
       ? "~"
       : unquotedWord === ".."
-        ? resolveDirLookup("../", cwd)
-        : (cwd || ".");
+        ? resolveDirLookup("../", cwd, preferRelativeCwd)
+        : resolveDirLookup("", cwd, preferRelativeCwd);
     const visiblePrefix = unquotedWord ? `${quotePrefix}${unquotedWord}/` : quotePrefix;
     return { dirToList: dir, filterPrefix: "", pathPrefix: visiblePrefix, quoteSuffix };
   }
@@ -160,22 +162,26 @@ export function resolvePathComponents(
     const decodedDirPart = decodeShellPathFragment(dirPart);
     const decodedFilterPart = decodeShellPathFragment(filterPart);
 
-    const dirToList = resolveDirLookup(decodedDirPart, cwd);
+    const dirToList = resolveDirLookup(decodedDirPart, cwd, preferRelativeCwd);
 
     return { dirToList, filterPrefix: decodedFilterPart, pathPrefix: quotePrefix + dirPart, quoteSuffix };
   }
 
   // No slash — filter CWD entries by the typed prefix
   return {
-    dirToList: cwd || ".",
+    dirToList: resolveDirLookup("", cwd, preferRelativeCwd),
     filterPrefix: decodeShellPathFragment(unquotedWord),
     pathPrefix: quotePrefix,
     quoteSuffix,
   };
 }
 
-export function normalizePathTokenForLookup(token: string, cwd?: string): string {
-  const { dirToList, filterPrefix } = resolvePathComponents(token, cwd);
+export function normalizePathTokenForLookup(
+  token: string,
+  cwd?: string,
+  options: ResolvePathOptions = {},
+): string {
+  const { dirToList, filterPrefix } = resolvePathComponents(token, cwd, options);
   if (!filterPrefix) return dirToList;
 
   if (!dirToList || dirToList === ".") {
@@ -194,16 +200,21 @@ export async function getPathSuggestions(
   options: {
     sessionId?: string;
     protocol?: string;
+    os?: "linux" | "windows" | "macos";
     cwd?: string;
+    cwdSource?: AutocompleteCwdSource;
     foldersOnly: boolean;
   },
 ): Promise<{ name: string; type: DirEntry["type"] }[]> {
-  const { sessionId, protocol, cwd, foldersOnly } = options;
-  const { dirToList, filterPrefix } = resolvePathComponents(ctx.currentWord, cwd);
+  const { sessionId, protocol, os, cwd, cwdSource, foldersOnly } = options;
+  const { dirToList, filterPrefix } = resolvePathComponents(ctx.currentWord, cwd, {
+    preferRelativeCwd: shouldPreferRemoteShellCwd(protocol, sessionId, os, cwd, cwdSource),
+  });
 
   const entries = await listDirectoryEntries(dirToList, {
     sessionId,
     protocol,
+    os,
     foldersOnly,
     filterPrefix,
     limit: 100,
@@ -220,6 +231,7 @@ export async function listDirectoryEntries(
   options: {
     sessionId?: string;
     protocol?: string;
+    os?: "linux" | "windows" | "macos";
     foldersOnly: boolean;
     filterPrefix?: string;
     limit?: number;
@@ -228,6 +240,7 @@ export async function listDirectoryEntries(
   const {
     sessionId,
     protocol,
+    os,
     foldersOnly,
     filterPrefix = "",
     limit = 100,
@@ -237,28 +250,35 @@ export async function listDirectoryEntries(
   const baseKey = `${protocol || "auto"}:${sessionId || "local"}:${dirPath}:${foldersOnly}`;
   const fullCacheKey = `${baseKey}:all`;
   const filteredCacheKey = `${baseKey}:prefix:${normalizedPrefix}:${maxEntries}`;
+  const bypassCache = shouldBypassCache(protocol, sessionId, os, dirPath);
+  const requestKey = normalizedPrefix ? filteredCacheKey : fullCacheKey;
 
   // Full directory cache can satisfy both full and filtered lookups.
-  const fullCached = fullDirCache.get(fullCacheKey);
-  if (isFresh(fullCached)) {
-    return filterEntries(fullCached.entries, normalizedPrefix, maxEntries);
-  }
-
-  if (normalizedPrefix) {
-    const filteredCached = filteredDirCache.get(filteredCacheKey);
-    if (isFresh(filteredCached)) {
-      return filteredCached.entries;
+  // Relative SSH cwd paths bypass durable cache and in-flight reuse: the shell
+  // cwd can move, so a listing started for "." in directory A must not satisfy
+  // a later lookup after cd into B. Soft-budget timeout + late refresh already
+  // share one promise at the getCompletions call site.
+  if (!bypassCache) {
+    const fullCached = fullDirCache.get(fullCacheKey);
+    if (isFresh(fullCached)) {
+      return filterEntries(fullCached.entries, normalizedPrefix, maxEntries);
     }
-  }
 
-  const inFlightFull = inFlightRequests.get(fullCacheKey);
-  if (inFlightFull) {
-    return filterEntries(await inFlightFull, normalizedPrefix, maxEntries);
-  }
+    if (normalizedPrefix) {
+      const filteredCached = filteredDirCache.get(filteredCacheKey);
+      if (isFresh(filteredCached)) {
+        return filteredCached.entries;
+      }
+    }
 
-  const requestKey = normalizedPrefix ? filteredCacheKey : fullCacheKey;
-  const inFlight = inFlightRequests.get(requestKey);
-  if (inFlight) return inFlight;
+    const inFlightFull = inFlightRequests.get(fullCacheKey);
+    if (inFlightFull) {
+      return filterEntries(await inFlightFull, normalizedPrefix, maxEntries);
+    }
+
+    const inFlight = inFlightRequests.get(requestKey);
+    if (inFlight) return inFlight;
+  }
 
   // Make IPC call
   const promise = (async (): Promise<DirEntry[]> => {
@@ -289,6 +309,9 @@ export async function listDirectoryEntries(
 
       if (result.success) {
         const timestamp = Date.now();
+        if (bypassCache) {
+          return result.entries;
+        }
         if (normalizedPrefix) {
           filteredDirCache.set(requestKey, { entries: result.entries, timestamp });
           evictOldest(filteredDirCache, MAX_FILTERED_CACHE_SIZE);
@@ -304,11 +327,15 @@ export async function listDirectoryEntries(
     } catch {
       return [];
     } finally {
-      inFlightRequests.delete(requestKey);
+      if (!bypassCache) {
+        inFlightRequests.delete(requestKey);
+      }
     }
   })();
 
-  inFlightRequests.set(requestKey, promise);
+  if (!bypassCache) {
+    inFlightRequests.set(requestKey, promise);
+  }
   return promise;
 }
 
@@ -317,12 +344,34 @@ function clampLimit(limit: number): number {
   return Math.max(1, Math.min(200, Math.floor(limit)));
 }
 
-function resolveDirLookup(pathToken: string, cwd: string | undefined): string {
-  if (!pathToken) return cwd || ".";
+function resolveDirLookup(pathToken: string, cwd: string | undefined, preferRelativeCwd = false): string {
+  if (!pathToken) return preferRelativeCwd ? "." : (cwd || ".");
   if (pathToken.startsWith("/")) return normalizePosixLikePath(pathToken);
   if (pathToken === "~" || pathToken.startsWith("~/")) return normalizePosixLikePath(pathToken);
+  if (preferRelativeCwd) return normalizePosixLikePath(pathToken);
   if (cwd) return normalizePosixLikePath(`${cwd}/${pathToken}`);
   return normalizePosixLikePath(pathToken);
+}
+
+export function shouldPreferRemoteShellCwd(
+  protocol: string | undefined,
+  sessionId: string | undefined,
+  os?: "linux" | "windows" | "macos",
+  cwd?: string,
+  cwdSource?: AutocompleteCwdSource,
+): boolean {
+  if (cwdSource === "prompt" && cwd?.startsWith("/")) return false;
+  return Boolean(sessionId && protocol !== "local" && os === "linux");
+}
+
+function shouldBypassCache(
+  protocol: string | undefined,
+  sessionId: string | undefined,
+  os: "linux" | "windows" | "macos" | undefined,
+  dirPath: string,
+): boolean {
+  if (!shouldPreferRemoteShellCwd(protocol, sessionId, os)) return false;
+  return !dirPath.startsWith("/") && dirPath !== "~" && !dirPath.startsWith("~/");
 }
 
 function normalizePosixLikePath(input: string): string {

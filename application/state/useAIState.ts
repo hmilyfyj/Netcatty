@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { localStorageAdapter } from '../../infrastructure/persistence/localStorageAdapter';
 import {
   STORAGE_KEY_AI_PROVIDERS,
@@ -15,11 +15,15 @@ import {
   STORAGE_KEY_AI_SESSIONS,
   STORAGE_KEY_AI_ACTIVE_SESSION_MAP,
   STORAGE_KEY_AI_AGENT_MODEL_MAP,
+  STORAGE_KEY_AI_AGENT_PROVIDER_MAP,
   STORAGE_KEY_AI_WEB_SEARCH,
+  STORAGE_KEY_AI_QUICK_MESSAGES,
 } from '../../infrastructure/config/storageKeys';
+import type { AIQuickMessage } from '../../infrastructure/ai/quickMessages';
+import { sanitizeQuickMessages } from '../../infrastructure/ai/quickMessages';
 import type {
   AIDraft,
-  AIPanelView,
+  AISessionContextCompaction,
   AISession,
   AIPermissionMode,
   AIToolIntegrationMode,
@@ -30,231 +34,50 @@ import type {
   AISessionScope,
   WebSearchConfig,
 } from '../../infrastructure/ai/types';
-import { DEFAULT_COMMAND_BLOCKLIST } from '../../infrastructure/ai/types';
+import {
+  DEFAULT_COMMAND_BLOCKLIST,
+  DEFAULT_COMMAND_TIMEOUT_SECONDS,
+  normalizeCommandTimeoutSeconds,
+} from '../../infrastructure/ai/types';
 import {
   activateDraftView,
-  bumpDraftMutationVersionState,
-  bumpDraftUploadGenerationState,
   clearScopeDraftState,
   ensureDraftForScopeState,
-  getDraftUploadGenerationState,
+  pruneStaleSessionPanelViews,
+  setDraftView,
   setSessionView,
   updateDraftForScope,
 } from './aiDraftState';
-import {
-  pruneInactiveScopedSessions,
-  pruneInactiveScopedTransientState,
-} from './aiScopeCleanup';
 import { convertFilesToUploads } from './useFileUpload';
-
-/** Typed accessor for the Electron IPC bridge exposed on `window.netcatty`. */
-interface AIBridge {
-  aiAcpCleanup?: (chatSessionId: string) => Promise<{ ok: boolean }>;
-  aiMcpSetPermissionMode?: (mode: AIPermissionMode) => Promise<unknown> | unknown;
-  aiMcpSetToolIntegrationMode?: (mode: AIToolIntegrationMode) => Promise<unknown> | unknown;
-  aiMcpSetCommandBlocklist?: (blocklist: string[]) => Promise<unknown> | unknown;
-  aiMcpSetCommandTimeout?: (timeout: number) => Promise<unknown> | unknown;
-  aiMcpSetMaxIterations?: (maxIterations: number) => Promise<unknown> | unknown;
-}
-
-function getAIBridge() {
-  return (window as unknown as { netcatty?: AIBridge }).netcatty;
-}
-
-const AI_STATE_CHANGED_EVENT = 'netcatty:ai-state-changed';
-const AI_STATE_CHANGED_DRAFTS_BY_SCOPE = 'netcatty:ai-drafts-by-scope';
-const AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE = 'netcatty:ai-panel-view-by-scope';
-
-type DraftsByScope = Partial<Record<string, AIDraft>>;
-type PanelViewByScope = Partial<Record<string, AIPanelView>>;
-
-function emitAIStateChanged(key: string) {
-  window.dispatchEvent(new CustomEvent<{ key: string }>(AI_STATE_CHANGED_EVENT, { detail: { key } }));
-}
-
-function cleanupAcpSessions(sessionIds: string[]) {
-  const bridge = getAIBridge();
-  if (!bridge?.aiAcpCleanup || sessionIds.length === 0) return;
-  for (const sessionId of sessionIds) {
-    void bridge.aiAcpCleanup(sessionId).catch(() => {});
-  }
-}
-
-function isScopeKeyActive(scopeKey: string, activeTargetIds: Set<string>) {
-  const separatorIndex = scopeKey.indexOf(':');
-  if (separatorIndex === -1) return true;
-
-  const targetId = scopeKey.slice(separatorIndex + 1);
-  if (!targetId) return true;
-
-  return activeTargetIds.has(targetId);
-}
-
-export function cleanupOrphanedAISessions(activeTargetIds: Set<string>) {
-  const currentSessions = latestAISessionsSnapshot
-    ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
-    ?? [];
-
-  // Sessions shown by a still-live scope must be protected from cleanup
-  // even when their own `scope.targetId` points at a closed terminal —
-  // history can be resumed into a different terminal and we must not
-  // delete it outright while it's actively being used.
-  const preCleanupActiveSessionMap = latestAIActiveSessionMapSnapshot
-    ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
-    ?? {};
-  const activeSessionIds = new Set<string>();
-  for (const [scopeKey, sessionId] of Object.entries(preCleanupActiveSessionMap)) {
-    if (!sessionId) continue;
-    if (!isScopeKeyActive(scopeKey, activeTargetIds)) continue;
-    activeSessionIds.add(sessionId);
-  }
-
-  const nextSessionCleanup = pruneInactiveScopedSessions(
-    currentSessions,
-    activeTargetIds,
-    activeSessionIds,
-  );
-
-  if (nextSessionCleanup.orphanedSessionIds.length > 0) {
-    cleanupAcpSessions(nextSessionCleanup.orphanedSessionIds);
-  }
-
-  if (nextSessionCleanup.sessions !== currentSessions) {
-    setLatestAISessionsSnapshot(nextSessionCleanup.sessions);
-    localStorageAdapter.write(
-      STORAGE_KEY_AI_SESSIONS,
-      pruneSessionsForStorage(nextSessionCleanup.sessions),
-    );
-    emitAIStateChanged(STORAGE_KEY_AI_SESSIONS);
-  }
-
-  const activeSessionIdMap = preCleanupActiveSessionMap;
-  let activeSessionMapChanged = false;
-  const nextActiveSessionIdMap = { ...activeSessionIdMap };
-
-  for (const scopeKey of Object.keys(activeSessionIdMap)) {
-    if (isScopeKeyActive(scopeKey, activeTargetIds)) continue;
-    delete nextActiveSessionIdMap[scopeKey];
-    activeSessionMapChanged = true;
-  }
-
-  if (activeSessionMapChanged) {
-    setLatestAIActiveSessionMapSnapshot(nextActiveSessionIdMap);
-    localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, nextActiveSessionIdMap);
-    emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
-  }
-
-  const currentActiveSessionIdMap = activeSessionMapChanged
-    ? nextActiveSessionIdMap
-    : activeSessionIdMap;
-  const currentDraftsByScope = latestAIDraftsByScopeSnapshot ?? {};
-  const currentPanelViewByScope = latestAIPanelViewByScopeSnapshot ?? {};
-  const prunedScopedTransientState = pruneInactiveScopedTransientState(
-    currentActiveSessionIdMap,
-    currentDraftsByScope,
-    currentPanelViewByScope,
-    activeTargetIds,
-  );
-
-  if (prunedScopedTransientState.activeSessionIdMap !== currentActiveSessionIdMap) {
-    setLatestAIActiveSessionMapSnapshot(prunedScopedTransientState.activeSessionIdMap);
-    localStorageAdapter.write(
-      STORAGE_KEY_AI_ACTIVE_SESSION_MAP,
-      prunedScopedTransientState.activeSessionIdMap,
-    );
-    emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
-  }
-
-  if (prunedScopedTransientState.draftsByScope !== currentDraftsByScope) {
-    for (const scopeKey of Object.keys(currentDraftsByScope)) {
-      if (scopeKey in prunedScopedTransientState.draftsByScope) continue;
-      bumpDraftMutationVersion(scopeKey);
-      bumpDraftUploadGeneration(scopeKey);
-    }
-    setLatestAIDraftsByScopeSnapshot(prunedScopedTransientState.draftsByScope);
-    emitAIStateChanged(AI_STATE_CHANGED_DRAFTS_BY_SCOPE);
-  }
-
-  if (prunedScopedTransientState.panelViewByScope !== currentPanelViewByScope) {
-    for (const scopeKey of Object.keys(currentPanelViewByScope)) {
-      if (scopeKey in prunedScopedTransientState.panelViewByScope) continue;
-      bumpDraftMutationVersion(scopeKey);
-    }
-    setLatestAIPanelViewByScopeSnapshot(prunedScopedTransientState.panelViewByScope);
-    emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
-  }
-}
-
-
-/** Maximum number of sessions to keep in localStorage. */
-const MAX_STORED_SESSIONS = 50;
-/** Maximum number of messages per session when persisting to localStorage. */
-const MAX_SESSION_MESSAGES = 200;
-
-/**
- * Prune sessions before writing to localStorage to prevent hitting the
- * ~5-10 MB storage quota. Only affects what is persisted — the in-memory
- * state retains all messages until the session is reloaded.
- *
- * - Keeps only the MAX_STORED_SESSIONS most-recently-updated sessions.
- * - Trims each session's messages to the last MAX_SESSION_MESSAGES.
- */
-function pruneSessionsForStorage(sessions: AISession[]): AISession[] {
-  // Sort by updatedAt descending so we keep the newest
-  const sorted = [...sessions].sort((a, b) => b.updatedAt - a.updatedAt);
-  const limited = sorted.slice(0, MAX_STORED_SESSIONS);
-  return limited.map(s => {
-    if (s.messages.length > MAX_SESSION_MESSAGES) {
-      return { ...s, messages: s.messages.slice(-MAX_SESSION_MESSAGES) };
-    }
-    return s;
-  });
-}
-
-let latestAISessionsSnapshot: AISession[] | null = null;
-let latestAIActiveSessionMapSnapshot: Record<string, string | null> | null = null;
-let latestAIDraftsByScopeSnapshot: DraftsByScope | null = null;
-let latestAIPanelViewByScopeSnapshot: PanelViewByScope | null = null;
-let latestAIDraftMutationVersionByScopeSnapshot: Record<string, number> = {};
-let latestAIDraftUploadGenerationByScopeSnapshot: Record<string, number> = {};
-
-function setLatestAISessionsSnapshot(sessions: AISession[]) {
-  latestAISessionsSnapshot = sessions;
-}
-
-function setLatestAIActiveSessionMapSnapshot(activeSessionIdMap: Record<string, string | null>) {
-  latestAIActiveSessionMapSnapshot = activeSessionIdMap;
-}
-
-function setLatestAIDraftsByScopeSnapshot(draftsByScope: DraftsByScope) {
-  latestAIDraftsByScopeSnapshot = draftsByScope;
-}
-
-function setLatestAIPanelViewByScopeSnapshot(panelViewByScope: PanelViewByScope) {
-  latestAIPanelViewByScopeSnapshot = panelViewByScope;
-}
-
-function bumpDraftMutationVersion(scopeKey: string) {
-  latestAIDraftMutationVersionByScopeSnapshot = bumpDraftMutationVersionState(
-    latestAIDraftMutationVersionByScopeSnapshot,
-    scopeKey,
-  );
-}
-
-function getDraftUploadGeneration(scopeKey: string) {
-  return getDraftUploadGenerationState(
-    latestAIDraftUploadGenerationByScopeSnapshot,
-    scopeKey,
-  );
-}
-
-function bumpDraftUploadGeneration(scopeKey: string) {
-  latestAIDraftUploadGenerationByScopeSnapshot = bumpDraftUploadGenerationState(
-    latestAIDraftUploadGenerationByScopeSnapshot,
-    scopeKey,
-  );
-}
-
+import { removeProviderReferences } from './aiProviderCleanup';
+import { publishAISessionsSnapshot } from './aiSessionsStore';
+import {
+  AI_STATE_CHANGED_DRAFTS_BY_SCOPE,
+  AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE,
+  bumpDraftMutationVersion,
+  bumpDraftUploadGeneration,
+  cleanupDeletedAIChatSessions,
+  cleanupOrphanedAISessions,
+  getAIBridge,
+  getDraftUploadGeneration,
+  latestAIActiveSessionMapSnapshot,
+  latestAIDraftsByScopeSnapshot,
+  latestAIPanelViewByScopeSnapshot,
+  latestAISessionsSnapshot,
+  pruneSessionsForStorage,
+  setLatestAIActiveSessionMapSnapshot,
+  setLatestAIDraftsByScopeSnapshot,
+  setLatestAIPanelViewByScopeSnapshot,
+  setLatestAISessionsSnapshot,
+  type DraftsByScope,
+  type PanelViewByScope,
+} from './aiStateSnapshots';
+import { AI_STATE_CHANGED_EVENT, emitAIStateChanged } from './aiStateEvents';
+import {
+  handoffDissolvedWorkspaceAIScope,
+  retargetWorkspaceActiveChatAfterMemberLoss,
+  seedWorkspaceAIActiveSessionFromMembers,
+} from '../../domain/workspaceAiScopeHandoff';
 export function useAIState() {
   // ── Provider Config ──
   const [providers, setProvidersRaw] = useState<ProviderConfig[]>(() =>
@@ -270,7 +93,7 @@ export function useAIState() {
   // ── Permission Model ──
   const [globalPermissionMode, setGlobalPermissionModeRaw] = useState<AIPermissionMode>(() => {
     const stored = localStorageAdapter.readString(STORAGE_KEY_AI_PERMISSION_MODE);
-    if (stored === 'observer' || stored === 'confirm' || stored === 'autonomous') return stored;
+    if (stored === 'observer' || stored === 'confirm' || stored === 'auto') return stored;
     return 'confirm';
   });
   const [toolIntegrationMode, setToolIntegrationModeRaw] = useState<AIToolIntegrationMode>(() => {
@@ -294,7 +117,9 @@ export function useAIState() {
     localStorageAdapter.read<string[]>(STORAGE_KEY_AI_COMMAND_BLOCKLIST) ?? [...DEFAULT_COMMAND_BLOCKLIST]
   );
   const [commandTimeout, setCommandTimeoutRaw] = useState<number>(() =>
-    localStorageAdapter.readNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT) ?? 60
+    normalizeCommandTimeoutSeconds(
+      localStorageAdapter.readNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT) ?? DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    )
   );
   const [maxIterations, setMaxIterationsRaw] = useState<number>(() =>
     localStorageAdapter.readNumber(STORAGE_KEY_AI_MAX_ITERATIONS) ?? 20
@@ -302,7 +127,9 @@ export function useAIState() {
 
   // ── Sessions ──
   const [sessions, setSessionsRaw] = useState<AISession[]>(() =>
-    localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS) ?? []
+    latestAISessionsSnapshot
+      ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
+      ?? []
   );
   // Ref that always holds the latest sessions for use inside debounced callbacks
   const sessionsRef = useRef(sessions);
@@ -311,7 +138,9 @@ export function useAIState() {
   }, [sessions]);
   // Per-scope active session: keyed by `${scopeType}:${scopeTargetId}`
   const [activeSessionIdMap, setActiveSessionIdMapRaw] = useState<Record<string, string | null>>(() =>
-    localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP) ?? {}
+    latestAIActiveSessionMapSnapshot
+      ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
+      ?? {}
   );
   // Per-scope draft/view state is intentionally memory-only so a relaunch
   // does not restore stale composer input or panel intent against new history.
@@ -326,10 +155,33 @@ export function useAIState() {
   const [agentModelMap, setAgentModelMapRaw] = useState<Record<string, string>>(() =>
     localStorageAdapter.read<Record<string, string>>(STORAGE_KEY_AI_AGENT_MODEL_MAP) ?? {}
   );
+  const agentModelMapRef = useRef(agentModelMap);
+  useEffect(() => {
+    agentModelMapRef.current = agentModelMap;
+  }, [agentModelMap]);
+  // Per-agent provider override: remembers which provider config each agent
+  // should bind to. Falls back to the global `activeProviderId` when an agent
+  // has no entry. Used so that e.g. Catty Agent can stay on DeepSeek while
+  // a Claude/Codex run continues on its existing provider.
+  const [agentProviderMap, setAgentProviderMapRaw] = useState<Record<string, string>>(() =>
+    localStorageAdapter.read<Record<string, string>>(STORAGE_KEY_AI_AGENT_PROVIDER_MAP) ?? {}
+  );
+  // Mirror for non-functional reads inside removeProvider — needed to know
+  // which agents were bound to the deleted provider so we can also drop
+  // their saved model ids (those ids belonged to the now-missing provider).
+  const agentProviderMapRef = useRef(agentProviderMap);
+  useEffect(() => {
+    agentProviderMapRef.current = agentProviderMap;
+  }, [agentProviderMap]);
 
   // ── Web Search Config ──
   const [webSearchConfig, setWebSearchConfigRaw] = useState<WebSearchConfig | null>(() =>
     localStorageAdapter.read<WebSearchConfig>(STORAGE_KEY_AI_WEB_SEARCH) ?? null
+  );
+
+  // ── Quick Messages (slash prompts) ──
+  const [quickMessages, setQuickMessagesRaw] = useState<AIQuickMessage[]>(() =>
+    sanitizeQuickMessages(localStorageAdapter.read<unknown>(STORAGE_KEY_AI_QUICK_MESSAGES)),
   );
 
   useEffect(() => {
@@ -349,7 +201,7 @@ export function useAIState() {
   }, [panelViewByScope]);
 
   useEffect(() => {
-    const validSessionIds = new Set(sessions.map((session) => session.id));
+    const validSessionIds = new Set<string>(sessions.map((session) => session.id));
     let changed = false;
     const nextActiveSessionIdMap: Record<string, string | null> = {};
 
@@ -361,12 +213,22 @@ export function useAIState() {
       }
     }
 
-    if (!changed) return;
+    if (changed) {
+      setLatestAIActiveSessionMapSnapshot(nextActiveSessionIdMap);
+      localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, nextActiveSessionIdMap);
+      setActiveSessionIdMapRaw(nextActiveSessionIdMap);
+      emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+    }
 
-    setLatestAIActiveSessionMapSnapshot(nextActiveSessionIdMap);
-    localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, nextActiveSessionIdMap);
-    setActiveSessionIdMapRaw(nextActiveSessionIdMap);
-    emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+    setPanelViewByScopeRaw((prev) => {
+      const next = pruneStaleSessionPanelViews(prev, validSessionIds);
+      if (next === prev) {
+        return prev;
+      }
+      setLatestAIPanelViewByScopeSnapshot(next);
+      emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
+      return next;
+    });
   }, [sessions, activeSessionIdMap]);
 
   const setActiveSessionId = useCallback((scopeKey: string, id: string | null) => {
@@ -413,6 +275,21 @@ export function useAIState() {
     });
   }, []);
 
+  const setAgentProvider = useCallback((agentId: string, providerId: string) => {
+    setAgentProviderMapRaw(prev => {
+      // Empty string clears the per-agent override and lets the agent fall
+      // back to the global `activeProviderId`.
+      const next = { ...prev };
+      if (providerId) {
+        next[agentId] = providerId;
+      } else {
+        delete next[agentId];
+      }
+      localStorageAdapter.write(STORAGE_KEY_AI_AGENT_PROVIDER_MAP, next);
+      return next;
+    });
+  }, []);
+
   const setWebSearchConfig = useCallback((config: WebSearchConfig | null) => {
     setWebSearchConfigRaw(config);
     if (config) {
@@ -420,6 +297,16 @@ export function useAIState() {
     } else {
       localStorageAdapter.remove(STORAGE_KEY_AI_WEB_SEARCH);
     }
+  }, []);
+
+  const setQuickMessages = useCallback((value: AIQuickMessage[] | ((prev: AIQuickMessage[]) => AIQuickMessage[])) => {
+    setQuickMessagesRaw((prev) => {
+      const nextRaw = typeof value === 'function' ? value(prev) : value;
+      const next = sanitizeQuickMessages(nextRaw);
+      localStorageAdapter.write(STORAGE_KEY_AI_QUICK_MESSAGES, next);
+      emitAIStateChanged(STORAGE_KEY_AI_QUICK_MESSAGES);
+      return next;
+    });
   }, []);
 
   // ── Persist helpers ──
@@ -480,23 +367,24 @@ export function useAIState() {
   const setCommandBlocklist = useCallback((value: string[]) => {
     setCommandBlocklistRaw(value);
     localStorageAdapter.write(STORAGE_KEY_AI_COMMAND_BLOCKLIST, value);
-    // Sync to MCP Server bridge so ACP agents also respect the blocklist
+    // Sync to MCP Server bridge so SDK agents also respect the blocklist
     const bridge = getAIBridge();
     bridge?.aiMcpSetCommandBlocklist?.(value);
   }, []);
 
   const setCommandTimeout = useCallback((value: number) => {
-    setCommandTimeoutRaw(value);
-    localStorageAdapter.writeNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT, value);
+    const normalizedValue = normalizeCommandTimeoutSeconds(value);
+    setCommandTimeoutRaw(normalizedValue);
+    localStorageAdapter.writeNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT, normalizedValue);
     // Sync to MCP Server bridge
     const bridge = getAIBridge();
-    bridge?.aiMcpSetCommandTimeout?.(value);
+    bridge?.aiMcpSetCommandTimeout?.(normalizedValue);
   }, []);
 
   const setMaxIterations = useCallback((value: number) => {
     setMaxIterationsRaw(value);
     localStorageAdapter.writeNumber(STORAGE_KEY_AI_MAX_ITERATIONS, value);
-    // Sync to MCP Server bridge (used by ACP agent path)
+    // Sync to MCP Server bridge (used by SDK agent path)
     const bridge = getAIBridge();
     bridge?.aiMcpSetMaxIterations?.(value);
   }, []);
@@ -524,7 +412,7 @@ export function useAIState() {
             break;
           case STORAGE_KEY_AI_PERMISSION_MODE: {
             const mode = localStorageAdapter.readString(STORAGE_KEY_AI_PERMISSION_MODE);
-            if (mode === 'observer' || mode === 'confirm' || mode === 'autonomous') {
+            if (mode === 'observer' || mode === 'confirm' || mode === 'auto') {
               setGlobalPermissionModeRaw(mode);
               getAIBridge()?.aiMcpSetPermissionMode?.(mode);
             }
@@ -563,13 +451,14 @@ export function useAIState() {
             break;
           }
           case STORAGE_KEY_AI_COMMAND_TIMEOUT: {
-            const timeout = localStorageAdapter.readNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT) ?? 60;
+            const timeout = localStorageAdapter.readNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT) ?? DEFAULT_COMMAND_TIMEOUT_SECONDS;
             if (!Number.isFinite(timeout)) {
               console.warn('[useAIState] Cross-window sync: AI_COMMAND_TIMEOUT is not a finite number, skipping');
               break;
             }
-            setCommandTimeoutRaw(timeout);
-            getAIBridge()?.aiMcpSetCommandTimeout?.(timeout);
+            const normalizedTimeout = normalizeCommandTimeoutSeconds(timeout);
+            setCommandTimeoutRaw(normalizedTimeout);
+            getAIBridge()?.aiMcpSetCommandTimeout?.(normalizedTimeout);
             break;
           }
           case STORAGE_KEY_AI_MAX_ITERATIONS: {
@@ -600,6 +489,9 @@ export function useAIState() {
           case STORAGE_KEY_AI_AGENT_MODEL_MAP:
             setAgentModelMapRaw(localStorageAdapter.read<Record<string, string>>(STORAGE_KEY_AI_AGENT_MODEL_MAP) ?? {});
             break;
+          case STORAGE_KEY_AI_AGENT_PROVIDER_MAP:
+            setAgentProviderMapRaw(localStorageAdapter.read<Record<string, string>>(STORAGE_KEY_AI_AGENT_PROVIDER_MAP) ?? {});
+            break;
           case STORAGE_KEY_AI_ACTIVE_SESSION_MAP: {
             const nextActiveSessionIdMap =
               localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP) ?? {};
@@ -610,6 +502,11 @@ export function useAIState() {
           case STORAGE_KEY_AI_WEB_SEARCH:
             setWebSearchConfigRaw(localStorageAdapter.read<WebSearchConfig>(STORAGE_KEY_AI_WEB_SEARCH) ?? null);
             break;
+          case STORAGE_KEY_AI_QUICK_MESSAGES: {
+            const messages = localStorageAdapter.read<unknown>(STORAGE_KEY_AI_QUICK_MESSAGES);
+            setQuickMessagesRaw(sanitizeQuickMessages(messages));
+            break;
+          }
         }
       } catch (err) {
         console.warn('[useAIState] Cross-window sync: failed to process storage event for key', e.key, err);
@@ -656,13 +553,15 @@ export function useAIState() {
     const bridge = getAIBridge();
     const initialBlocklist = localStorageAdapter.read<string[]>(STORAGE_KEY_AI_COMMAND_BLOCKLIST) ?? [...DEFAULT_COMMAND_BLOCKLIST];
     bridge?.aiMcpSetCommandBlocklist?.(initialBlocklist);
-    const initialTimeout = localStorageAdapter.readNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT) ?? 60;
+    const initialTimeout = normalizeCommandTimeoutSeconds(
+      localStorageAdapter.readNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT) ?? DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    );
     bridge?.aiMcpSetCommandTimeout?.(initialTimeout);
     const initialMaxIter = localStorageAdapter.readNumber(STORAGE_KEY_AI_MAX_ITERATIONS) ?? 20;
     bridge?.aiMcpSetMaxIterations?.(initialMaxIter);
     const storedPermMode = localStorageAdapter.readString(STORAGE_KEY_AI_PERMISSION_MODE);
     const initialPermMode: AIPermissionMode =
-      storedPermMode === 'observer' || storedPermMode === 'confirm' || storedPermMode === 'autonomous'
+      storedPermMode === 'observer' || storedPermMode === 'confirm' || storedPermMode === 'auto'
         ? storedPermMode
         : 'confirm';
     bridge?.aiMcpSetPermissionMode?.(initialPermMode);
@@ -727,7 +626,7 @@ export function useAIState() {
   }, [defaultAgentId, persistSessions, setActiveSessionId]);
 
   const deleteSession = useCallback((sessionId: string, scopeKey?: string) => {
-    cleanupAcpSessions([sessionId]);
+    cleanupDeletedAIChatSessions([sessionId]);
     if (persistTimerRef.current) {
       clearTimeout(persistTimerRef.current);
       persistTimerRef.current = null;
@@ -749,6 +648,19 @@ export function useAIState() {
         }
         return prev;
       });
+      setPanelViewByScopeRaw((prev) => {
+        const currentPanelView = prev[scopeKey];
+        if (currentPanelView?.mode !== 'session' || currentPanelView.sessionId !== sessionId) {
+          return prev;
+        }
+        const next = setDraftView(prev, scopeKey);
+        if (next === prev) {
+          return prev;
+        }
+        setLatestAIPanelViewByScopeSnapshot(next);
+        emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
+        return next;
+      });
     }
   }, [persistSessions]);
 
@@ -756,7 +668,7 @@ export function useAIState() {
     const removedSessionIds = sessionsRef.current
       .filter(s => s.scope.type === scopeType && s.scope.targetId === targetId)
       .map(s => s.id);
-    cleanupAcpSessions(removedSessionIds);
+    cleanupDeletedAIChatSessions(removedSessionIds);
     if (persistTimerRef.current) {
       clearTimeout(persistTimerRef.current);
       persistTimerRef.current = null;
@@ -858,13 +770,14 @@ export function useAIState() {
     });
   }, [debouncedPersistSessions]);
 
-  const clearSessionMessages = useCallback((sessionId: string) => {
-    if (persistTimerRef.current) {
-      clearTimeout(persistTimerRef.current);
-      persistTimerRef.current = null;
-    }
+  const persistContextCompaction = useCallback((
+    sessionId: string,
+    contextCompaction: AISessionContextCompaction,
+  ) => {
     setSessionsRaw(prev => {
-      const next = prev.map(s => s.id === sessionId ? { ...s, messages: [], updatedAt: Date.now() } : s);
+      const next = prev.map(s => s.id === sessionId
+        ? { ...s, contextCompaction, updatedAt: Date.now() }
+        : s);
       setLatestAISessionsSnapshot(next);
       persistSessions(next);
       return next;
@@ -1060,6 +973,119 @@ export function useAIState() {
     setPanelViewByScopeRaw(latestAIPanelViewByScopeSnapshot ?? {});
   }, []);
 
+  const seedWorkspaceActiveSessionFromMembers = useCallback((input: {
+    workspaceId: string;
+    memberTerminalIds: readonly string[];
+    preferredTerminalId?: string | null;
+  }) => {
+    const currentMap =
+      latestAIActiveSessionMapSnapshot
+      ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
+      ?? {};
+    const currentPanelViewByScope = latestAIPanelViewByScopeSnapshot ?? {};
+    const seeded = seedWorkspaceAIActiveSessionFromMembers({
+      activeSessionIdMap: currentMap,
+      panelViewByScope: currentPanelViewByScope,
+      workspaceId: input.workspaceId,
+      memberTerminalIds: input.memberTerminalIds,
+      preferredTerminalId: input.preferredTerminalId,
+    });
+    if (!seeded) return;
+    setLatestAIActiveSessionMapSnapshot(seeded.activeSessionIdMap);
+    localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, seeded.activeSessionIdMap);
+    emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+    setActiveSessionIdMapRaw(seeded.activeSessionIdMap);
+    if (seeded.panelViewChanged) {
+      setLatestAIPanelViewByScopeSnapshot(seeded.panelViewByScope);
+      emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
+      setPanelViewByScopeRaw(seeded.panelViewByScope);
+    }
+  }, []);
+
+  const handoffDissolvedWorkspaceScope = useCallback((input: {
+    workspaceId: string;
+    terminalIds: readonly string[];
+    preferredTerminalId?: string | null;
+  }) => {
+    const currentMap =
+      latestAIActiveSessionMapSnapshot
+      ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
+      ?? {};
+    const currentSessions =
+      latestAISessionsSnapshot
+      ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
+      ?? [];
+    const currentPanelViewByScope = latestAIPanelViewByScopeSnapshot ?? {};
+    const result = handoffDissolvedWorkspaceAIScope({
+      activeSessionIdMap: currentMap,
+      sessions: currentSessions,
+      workspaceId: input.workspaceId,
+      terminalIds: input.terminalIds,
+      preferredTerminalId: input.preferredTerminalId,
+      panelViewByScope: currentPanelViewByScope,
+    });
+    if (!result.changed) return;
+
+    if (result.activeSessionIdMap !== currentMap) {
+      setLatestAIActiveSessionMapSnapshot(result.activeSessionIdMap);
+      localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, result.activeSessionIdMap);
+      emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+      setActiveSessionIdMapRaw(result.activeSessionIdMap);
+    }
+
+    if (result.sessions !== currentSessions) {
+      sessionsRef.current = result.sessions;
+      setLatestAISessionsSnapshot(result.sessions);
+      persistSessions(result.sessions);
+      setSessionsRaw(result.sessions);
+    }
+
+    if (result.panelViewByScope !== currentPanelViewByScope) {
+      setLatestAIPanelViewByScopeSnapshot(result.panelViewByScope);
+      emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
+      setPanelViewByScopeRaw(result.panelViewByScope);
+    }
+  }, [persistSessions]);
+
+  const retargetWorkspaceActiveChatForMemberLoss = useCallback((input: {
+    workspaceId: string;
+    previousMemberTerminalIds: readonly string[];
+    currentMemberTerminalIds: readonly string[];
+    preferredTerminalId?: string | null;
+  }) => {
+    const currentMap =
+      latestAIActiveSessionMapSnapshot
+      ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
+      ?? {};
+    const currentSessions =
+      latestAISessionsSnapshot
+      ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
+      ?? [];
+    const result = retargetWorkspaceActiveChatAfterMemberLoss({
+      activeSessionIdMap: currentMap,
+      sessions: currentSessions,
+      workspaceId: input.workspaceId,
+      previousMemberTerminalIds: input.previousMemberTerminalIds,
+      currentMemberTerminalIds: input.currentMemberTerminalIds,
+      preferredTerminalId: input.preferredTerminalId,
+    });
+    if (!result.changed) return;
+
+    if (result.activeSessionIdMap !== currentMap) {
+      setLatestAIActiveSessionMapSnapshot(result.activeSessionIdMap);
+      localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, result.activeSessionIdMap);
+      emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+      setActiveSessionIdMapRaw(result.activeSessionIdMap);
+    }
+
+    if (result.sessions !== currentSessions) {
+      sessionsRef.current = result.sessions;
+      setLatestAISessionsSnapshot(result.sessions);
+      persistSessions(result.sessions);
+      setSessionsRaw(result.sessions);
+    }
+  }, [persistSessions]);
+
   // ── Provider CRUD helpers ──
   const addProvider = useCallback((provider: ProviderConfig) => {
     setProviders(prev => [...prev, provider]);
@@ -1071,7 +1097,6 @@ export function useAIState() {
 
   const removeProvider = useCallback((id: string) => {
     setProviders(prev => prev.filter(p => p.id !== id));
-    // Use the raw setter to avoid stale closure over setActiveProviderId
     setActiveProviderIdRaw(prevId => {
       if (prevId === id) {
         const next = '';
@@ -1080,13 +1105,36 @@ export function useAIState() {
       }
       return prevId;
     });
+    const cleanup = removeProviderReferences(
+      id,
+      agentProviderMapRef.current,
+      agentModelMapRef.current,
+    );
+    if (cleanup.providerMapChanged) {
+      localStorageAdapter.write(STORAGE_KEY_AI_AGENT_PROVIDER_MAP, cleanup.agentProviderMap);
+      setAgentProviderMapRaw(cleanup.agentProviderMap);
+    }
+    if (cleanup.modelMapChanged) {
+      localStorageAdapter.write(STORAGE_KEY_AI_AGENT_MODEL_MAP, cleanup.agentModelMap);
+      setAgentModelMapRaw(cleanup.agentModelMap);
+    }
   }, [setProviders]);
 
   // ── Computed ──
   const activeProvider = providers.find(p => p.id === activeProviderId) ?? null;
 
-  return {
-    // Provider config
+  // Stream/message updates publish here so AIConfig Context consumers do not
+  // re-render on every token. AIChatPanelsHost reads aiSessionsStore instead.
+  useLayoutEffect(() => {
+    publishAISessionsSnapshot({
+      sessions,
+      activeSessionIdMap,
+      draftsByScope,
+      panelViewByScope,
+    });
+  }, [sessions, activeSessionIdMap, draftsByScope, panelViewByScope]);
+
+  return useMemo(() => ({
     providers,
     setProviders,
     addProvider,
@@ -1097,42 +1145,32 @@ export function useAIState() {
     activeModelId,
     setActiveModelId,
     activeProvider,
-
-    // Permission model
     globalPermissionMode,
     setGlobalPermissionMode,
     toolIntegrationMode,
     setToolIntegrationMode,
     hostPermissions,
     setHostPermissions,
-
-    // External agents
     externalAgents,
     setExternalAgents,
     defaultAgentId,
     setDefaultAgentId,
-
-    // Safety
     commandBlocklist,
     setCommandBlocklist,
     commandTimeout,
     setCommandTimeout,
     maxIterations,
     setMaxIterations,
-
-    // Per-agent model memory
     agentModelMap,
     setAgentModel,
-
-    // Web search
+    agentProviderMap,
+    setAgentProvider,
     webSearchConfig,
     setWebSearchConfig,
-
-    // Sessions (per-scope active session)
-    sessions,
-    activeSessionIdMap,
-    draftsByScope,
-    panelViewByScope,
+    quickMessages,
+    setQuickMessages,
+    // sessions / activeSessionIdMap / draftsByScope / panelViewByScope live in
+    // aiSessionsStore so streaming updates do not rebuild this config object.
     setActiveSessionId,
     ensureDraftForScope,
     updateDraft,
@@ -1149,7 +1187,66 @@ export function useAIState() {
     addMessageToSession,
     updateLastMessage,
     updateMessageById,
-    clearSessionMessages,
+    persistContextCompaction,
     cleanupOrphanedSessions,
-  };
+    seedWorkspaceActiveSessionFromMembers,
+    handoffDissolvedWorkspaceScope,
+    retargetWorkspaceActiveChatForMemberLoss,
+  }), [
+    providers,
+    setProviders,
+    addProvider,
+    updateProvider,
+    removeProvider,
+    activeProviderId,
+    setActiveProviderId,
+    activeModelId,
+    setActiveModelId,
+    activeProvider,
+    globalPermissionMode,
+    setGlobalPermissionMode,
+    toolIntegrationMode,
+    setToolIntegrationMode,
+    hostPermissions,
+    setHostPermissions,
+    externalAgents,
+    setExternalAgents,
+    defaultAgentId,
+    setDefaultAgentId,
+    commandBlocklist,
+    setCommandBlocklist,
+    commandTimeout,
+    setCommandTimeout,
+    maxIterations,
+    setMaxIterations,
+    agentModelMap,
+    setAgentModel,
+    agentProviderMap,
+    setAgentProvider,
+    webSearchConfig,
+    setWebSearchConfig,
+    quickMessages,
+    setQuickMessages,
+    setActiveSessionId,
+    ensureDraftForScope,
+    updateDraft,
+    showDraftView,
+    showSessionView,
+    clearDraftForScope,
+    addDraftFiles,
+    removeDraftFile,
+    createSession,
+    deleteSession,
+    deleteSessionsByTarget,
+    updateSessionTitle,
+    updateSessionExternalSessionId,
+    addMessageToSession,
+    updateLastMessage,
+    updateMessageById,
+    persistContextCompaction,
+    cleanupOrphanedSessions,
+    seedWorkspaceActiveSessionFromMembers,
+    handoffDissolvedWorkspaceScope,
+    retargetWorkspaceActiveChatForMemberLoss,
+  ]);
 }

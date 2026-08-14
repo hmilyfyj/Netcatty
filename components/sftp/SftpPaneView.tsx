@@ -1,20 +1,23 @@
-import React, { memo, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, useTransition } from "react";
 import { useI18n } from "../../application/i18n/I18nProvider";
 import { logger } from "../../lib/logger";
 import { useRenderTracker } from "../../lib/useRenderTracker";
 import { cn } from "../../lib/utils";
 import { SftpPaneDialogs } from "./SftpPaneDialogs";
+import { SftpClipboardUploadDialog } from "./SftpClipboardUploadDialog";
 import { SftpPaneEmptyState } from "./SftpPaneEmptyState";
 import { SftpPaneFileList } from "./SftpPaneFileList";
 import { SftpPaneToolbar } from "./SftpPaneToolbar";
 import { SftpPaneTreeView } from "./SftpPaneTreeView";
 import {
   useActiveTabId,
+  useSftpConnectedHosts,
   useSftpDrag,
   useSftpHosts,
   useSftpPaneCallbacks,
   useSftpUpdateHosts,
-} from "./index";
+  useSftpWritableHosts,
+} from "./SftpContext";
 import type { SftpPane } from "../../application/state/sftp/types";
 import { joinPath } from "../../application/state/sftp/utils";
 import type { Host } from "../../domain/models";
@@ -22,15 +25,17 @@ import { useSftpPaneDialogs } from "./hooks/useSftpPaneDialogs";
 import { useSftpPaneDragAndSelect } from "./hooks/useSftpPaneDragAndSelect";
 import { useSftpPaneFiles } from "./hooks/useSftpPaneFiles";
 import { useSftpPanePath } from "./hooks/useSftpPanePath";
-import { useSftpPaneSorting } from "./hooks/useSftpPaneSorting";
+import { useSftpPaneSorting, type UseSftpPaneSortingResult } from "../../application/state/sftp/useSftpPaneSorting";
 import { useSftpPaneVirtualList } from "./hooks/useSftpPaneVirtualList";
-import { useSftpDialogActionHandler } from "./hooks/useSftpDialogAction";
+import { sftpPaneViewModeStore } from "../../application/state/sftp/sftpPaneViewModeStore";
+import { useSftpDialogActionHandler } from "../../application/state/sftp/sftpDialogActionStore";
 import { useSftpBookmarks } from "./hooks/useSftpBookmarks";
-import { useLocalSftpBookmarks } from "./hooks/useLocalSftpBookmarks";
+import { useLocalSftpBookmarks } from "../../application/state/sftp/localSftpBookmarks";
 import { useGlobalSftpBookmarks } from "./hooks/useGlobalSftpBookmarks";
-import { useSftpHostViewMode } from "./hooks/useSftpHostViewMode";
+import { useSftpHostViewMode } from "../../application/state/sftp/sftpHostViewModeStore";
 import { sftpListOrderStore } from "./hooks/useSftpListOrderStore";
-import { sftpTreeSelectionStore } from "./hooks/useSftpTreeSelectionStore";
+import { sftpTreeSelectionStore } from "../../application/state/sftp/sftpTreeSelectionStore";
+import { sftpClipboardUploadStore } from "./clipboardUpload";
 
 interface TreeReloadRequest {
   token: number;
@@ -74,6 +79,9 @@ interface SftpPaneViewProps {
   showEmptyHeader?: boolean;
   onToggleShowHiddenFiles?: () => void;
   onGoToTerminalCwd?: () => void;
+  onLocatePathInTerminal?: () => void;
+  followTerminalCwd?: boolean;
+  onToggleFollowTerminalCwd?: () => void;
   /** When true, treat this pane as always active (used by SftpSidePanel which manages visibility itself) */
   forceActive?: boolean;
 }
@@ -88,6 +96,9 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
   showEmptyHeader = true,
   onToggleShowHiddenFiles,
   onGoToTerminalCwd,
+  onLocatePathInTerminal,
+  followTerminalCwd,
+  onToggleFollowTerminalCwd,
   forceActive,
 }) => {
   const activeTabId = useActiveTabId(side);
@@ -96,6 +107,8 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
   const callbacks = useSftpPaneCallbacks(side);
   const { draggedFiles, onDragStart, onDragEnd } = useSftpDrag();
   const hosts = useSftpHosts();
+  const connectedHosts = useSftpConnectedHosts();
+  const writableHosts = useSftpWritableHosts();
 
   const { t } = useI18n();
   const hostId = pane.connection?.hostId;
@@ -111,6 +124,17 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
     if (viewMode === 'tree' && !treeEverMounted) setTreeEverMounted(true);
   }, [viewMode, treeEverMounted]);
   const filterInputRef = useRef<HTMLInputElement>(null);
+  const clipboardUploadRequestSnapshot = useSyncExternalStore(
+    sftpClipboardUploadStore.subscribe,
+    sftpClipboardUploadStore.getSnapshot,
+    sftpClipboardUploadStore.getSnapshot,
+  );
+  const clipboardUploadRequest =
+    clipboardUploadRequestSnapshot?.scopeId === dialogActionScopeId
+    && clipboardUploadRequestSnapshot.side === side
+    && isActive
+      ? clipboardUploadRequestSnapshot
+      : null;
 
   const requestTreeReload = useCallback((paths?: string[], full = false) => {
     setTreeReloadRequest((prev) => ({
@@ -136,17 +160,27 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
     draggedFilesCount: draggedFiles?.length ?? 0,
   });
 
-  const { sortField, sortOrder, columnWidths, handleSort, handleResizeStart } = useSftpPaneSorting();
+  const {
+    sortField,
+    sortOrder,
+    directoriesFirst,
+    columnWidths,
+    visibleColumns,
+    handleSort,
+    handleResizeStart,
+    toggleColumnVisibility,
+    toggleDirectoriesFirst,
+  } = useSftpPaneSorting();
 
   // Bookmark support
   const updateHosts = useSftpUpdateHosts();
   const currentHost = useMemo(
-    () => hosts.find((h) => h.id === pane.connection?.hostId),
-    [hosts, pane.connection?.hostId],
+    () => writableHosts.find((h) => h.id === pane.connection?.hostId),
+    [writableHosts, pane.connection?.hostId],
   );
   const onUpdateHost = useCallback(
-    (updated: Host) => updateHosts(hosts.map((h) => (h.id === updated.id ? updated : h))),
-    [hosts, updateHosts],
+    (updated: Host) => updateHosts(writableHosts.map((h) => (h.id === updated.id ? updated : h))),
+    [updateHosts, writableHosts],
   );
   const remoteBookmarks = useSftpBookmarks({
     host: currentHost,
@@ -195,6 +229,7 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
     enableListView: viewMode === 'list',
     sortField,
     sortOrder,
+    directoriesFirst,
   });
   const {
     isEditingPath,
@@ -271,6 +306,22 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
   });
   const handleUploadExternalFiles = useCallback(async (dataTransfer: DataTransfer, targetPath?: string) => {
     await callbacks.onUploadExternalFiles?.(dataTransfer, targetPath);
+    const affectedPath = targetPath ?? pane.connection?.currentPath;
+    if (affectedPath && affectedPath !== pane.connection?.currentPath) {
+      requestTreeReload([affectedPath]);
+    }
+  }, [callbacks, pane.connection?.currentPath, requestTreeReload]);
+
+  const handleUploadExternalFileList = useCallback(async (fileList: FileList, targetPath?: string) => {
+    await callbacks.onUploadExternalFileList?.(fileList, targetPath);
+    const affectedPath = targetPath ?? pane.connection?.currentPath;
+    if (affectedPath && affectedPath !== pane.connection?.currentPath) {
+      requestTreeReload([affectedPath]);
+    }
+  }, [callbacks, pane.connection?.currentPath, requestTreeReload]);
+
+  const handleUploadExternalFolder = useCallback(async (targetPath?: string) => {
+    await callbacks.onUploadExternalFolder?.(targetPath);
     const affectedPath = targetPath ?? pane.connection?.currentPath;
     if (affectedPath && affectedPath !== pane.connection?.currentPath) {
       requestTreeReload([affectedPath]);
@@ -362,9 +413,30 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
 
   useSftpDialogActionHandler(side, dialogActionScopeId, dialogActionHandlers, isActive);
 
-  const handleSortWithTransition = (field: typeof sortField) => {
+  const handleSortWithTransition = useCallback((field: typeof sortField) => {
     startTransition(() => handleSort(field));
-  };
+  }, [handleSort, startTransition]);
+  const sortingControls = useMemo<UseSftpPaneSortingResult>(() => ({
+    sortField,
+    sortOrder,
+    directoriesFirst,
+    columnWidths,
+    visibleColumns,
+    handleSort: handleSortWithTransition,
+    handleResizeStart,
+    toggleColumnVisibility,
+    toggleDirectoriesFirst,
+  }), [
+    columnWidths,
+    directoriesFirst,
+    handleResizeStart,
+    handleSortWithTransition,
+    sortField,
+    sortOrder,
+    toggleColumnVisibility,
+    toggleDirectoriesFirst,
+    visibleColumns,
+  ]);
 
   const handleRefresh = useCallback(() => {
     callbacks.onRefresh();
@@ -389,11 +461,13 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
   }, [saveHostViewMode]);
 
   useEffect(() => {
+    sftpPaneViewModeStore.set(pane.id, viewMode);
     if (viewMode === 'list') {
       sftpTreeSelectionStore.clearPane(pane.id);
-      return;
+    } else {
+      sftpListOrderStore.clearPane(pane.id);
     }
-    sftpListOrderStore.clearPane(pane.id);
+    return () => sftpPaneViewModeStore.clear(pane.id);
   }, [pane.id, viewMode]);
 
   // When connecting to a host, restore its saved view mode preference
@@ -435,6 +509,7 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
         hostSearch={hostSearch}
         setHostSearch={setHostSearch}
         hosts={hosts}
+        connectedHosts={connectedHosts}
         onConnect={callbacks.onConnect}
       />
     );
@@ -443,6 +518,9 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
   return (
     <div
       ref={paneContainerRef}
+      data-section="terminal-sftp-pane"
+      data-sftp-pane-side={side}
+      data-sftp-view-mode={viewMode}
       className={cn(
         "absolute inset-0 flex flex-col transition-colors",
         isDragOverPane && "bg-primary/5",
@@ -475,7 +553,6 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
         handlePathKeyDown={handlePathKeyDown}
         handlePathDoubleClick={handlePathDoubleClick}
         handlePathSubmit={handlePathSubmit}
-        startTransition={startTransition}
         getNextUntitledName={getNextUntitledName}
         setNewFileName={setNewFileName}
         setFileNameError={setFileNameError}
@@ -492,12 +569,19 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
         showHiddenFiles={pane.showHiddenFiles}
         onToggleShowHiddenFiles={onToggleShowHiddenFiles}
         onGoToTerminalCwd={onGoToTerminalCwd}
+        onLocatePathInTerminal={onLocatePathInTerminal}
+        followTerminalCwd={followTerminalCwd}
+        onToggleFollowTerminalCwd={onToggleFollowTerminalCwd}
         viewMode={viewMode}
         onSetViewMode={handleSetViewMode}
+        onListDrives={callbacks.onListDrives}
       />
 
       {treeEverMounted && (
-        <div className={viewMode === 'tree' ? 'flex-1 min-h-0 flex flex-col' : 'hidden'}>
+        <div
+          className={viewMode === 'tree' ? 'flex-1 min-h-0 flex flex-col' : 'hidden'}
+          data-section="terminal-sftp-tree"
+        >
           <SftpPaneTreeView
             pane={pane}
             side={side}
@@ -514,6 +598,7 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
             openDeleteConfirm={openDeleteConfirm}
             onCopyToOtherPane={callbacks.onCopyToOtherPane}
             onReceiveFromOtherPane={callbacks.onReceiveFromOtherPane}
+            onOpenFileWithSystemDefault={callbacks.onOpenFileWithSystemDefault}
             onOpenFileWith={callbacks.onOpenFileWith}
             onEditFile={callbacks.onEditFile}
             onDownloadFile={callbacks.onDownloadFile}
@@ -522,60 +607,61 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
             openNewFolderDialog={openNewFolderDialogAtPath}
             openNewFileDialog={openNewFileDialogAtPath}
             onUploadExternalFiles={handleUploadExternalFiles}
-            columnWidths={columnWidths}
-            handleSort={handleSortWithTransition}
-            handleResizeStart={handleResizeStart}
-            sortField={sortField}
-            sortOrder={sortOrder}
+            onUploadExternalFileList={handleUploadExternalFileList}
+            onUploadExternalFolder={handleUploadExternalFolder}
+            sorting={sortingControls}
             reloadRequest={treeReloadRequest}
           />
         </div>
       )}
-      <div className={viewMode === 'list' ? 'flex-1 min-h-0 flex flex-col' : 'hidden'}>
-      <SftpPaneFileList
-        t={t}
-        pane={pane}
-        side={side}
-        isPaneFocused={isPaneFocused}
-        columnWidths={columnWidths}
-        sortField={sortField}
-        sortOrder={sortOrder}
-        handleSort={handleSortWithTransition}
-        handleResizeStart={handleResizeStart}
-        fileListRef={fileListRef}
-        handleFileListScroll={handleFileListScroll}
-        shouldVirtualize={shouldVirtualize}
-        totalHeight={totalHeight}
-        sortedDisplayFiles={sortedDisplayFiles}
-        isDragOverPane={isDragOverPane}
-        draggedFiles={draggedFiles}
-        onRefresh={handleRefresh}
-        onNavigateTo={callbacks.onNavigateTo}
-        onClearSelection={callbacks.onClearSelection}
-        setShowNewFolderDialog={setShowNewFolderDialog}
-        setShowNewFileDialog={setShowNewFileDialog}
-        getNextUntitledName={getNextUntitledName}
-        setNewFileName={setNewFileName}
-        setFileNameError={setFileNameError}
-        dragOverEntry={dragOverEntry}
-        handleRowSelect={handleRowSelect}
-        handleRowOpen={handleRowOpen}
-        handleFileDragStart={handleFileDragStart}
-        onDragEnd={onDragEnd}
-        handleEntryDragOver={handleEntryDragOver}
-        handleRowDragLeave={handleRowDragLeave}
-        handleEntryDrop={handleEntryDrop}
-        onCopyToOtherPane={callbacks.onCopyToOtherPane}
-        onMoveEntriesToPath={handleMoveEntriesToPath}
-        onOpenFileWith={callbacks.onOpenFileWith}
-        onEditFile={callbacks.onEditFile}
-        onDownloadFile={callbacks.onDownloadFile}
-        onEditPermissions={callbacks.onEditPermissions}
-        openRenameDialog={openRenameDialog}
-        openDeleteConfirm={openDeleteConfirm}
-        rowHeight={rowHeight}
-        visibleRows={visibleRows}
-      />
+      <div
+        className={viewMode === 'list' ? 'flex-1 min-h-0 flex flex-col' : 'hidden'}
+      >
+        <SftpPaneFileList
+          t={t}
+          pane={pane}
+          side={side}
+          isPaneFocused={isPaneFocused}
+          sorting={sortingControls}
+          fileListRef={fileListRef}
+          handleFileListScroll={handleFileListScroll}
+          shouldVirtualize={shouldVirtualize}
+          totalHeight={totalHeight}
+          sortedDisplayFiles={sortedDisplayFiles}
+          isDragOverPane={isDragOverPane}
+          draggedFiles={draggedFiles}
+          onRefresh={handleRefresh}
+          onNavigateTo={callbacks.onNavigateTo}
+          onClearSelection={callbacks.onClearSelection}
+          setShowNewFolderDialog={setShowNewFolderDialog}
+          setShowNewFileDialog={setShowNewFileDialog}
+          getNextUntitledName={getNextUntitledName}
+          setNewFileName={setNewFileName}
+          setFileNameError={setFileNameError}
+          dragOverEntry={dragOverEntry}
+          handleRowSelect={handleRowSelect}
+          handleRowOpen={handleRowOpen}
+          handleFileDragStart={handleFileDragStart}
+          onDragEnd={onDragEnd}
+          handleEntryDragOver={handleEntryDragOver}
+          handleRowDragLeave={handleRowDragLeave}
+          handleEntryDrop={handleEntryDrop}
+          onCopyToOtherPane={callbacks.onCopyToOtherPane}
+          onMoveEntriesToPath={handleMoveEntriesToPath}
+          onOpenFileWithSystemDefault={callbacks.onOpenFileWithSystemDefault}
+          onOpenFileWith={callbacks.onOpenFileWith}
+          onEditFile={callbacks.onEditFile}
+          onDownloadFile={callbacks.onDownloadFile}
+          onDownloadFiles={callbacks.onDownloadFiles}
+          onEditPermissions={callbacks.onEditPermissions}
+          onUploadExternalFileList={handleUploadExternalFileList}
+          onUploadExternalFolder={handleUploadExternalFolder}
+          isLocal={!!pane.connection?.isLocal}
+          openRenameDialog={openRenameDialog}
+          openDeleteConfirm={openDeleteConfirm}
+          rowHeight={rowHeight}
+          visibleRows={visibleRows}
+        />
       </div>
 
       <SftpPaneDialogs
@@ -614,11 +700,22 @@ const SftpPaneViewInner: React.FC<SftpPaneViewProps> = ({
         showHostPicker={showHostPicker}
         setShowHostPicker={setShowHostPicker}
         hosts={hosts}
+        connectedHosts={connectedHosts}
         side={side}
         hostSearch={hostSearch}
         setHostSearch={setHostSearch}
         onConnect={callbacks.onConnect}
         onDisconnect={callbacks.onDisconnect}
+      />
+
+      <SftpClipboardUploadDialog
+        request={clipboardUploadRequest}
+        currentPath={pane.connection?.currentPath}
+        onUploaded={(targetPath) => {
+          if (targetPath && targetPath !== pane.connection?.currentPath) {
+            requestTreeReload([targetPath]);
+          }
+        }}
       />
     </div>
   );
@@ -635,6 +732,11 @@ const sftpPaneViewAreEqual = (
   if (prev.showHeader !== next.showHeader) return false;
   if (prev.showEmptyHeader !== next.showEmptyHeader) return false;
   if (prev.sftpDefaultViewMode !== next.sftpDefaultViewMode) return false;
+  if (prev.followTerminalCwd !== next.followTerminalCwd) return false;
+  if (prev.onToggleFollowTerminalCwd !== next.onToggleFollowTerminalCwd) return false;
+  if (prev.onGoToTerminalCwd !== next.onGoToTerminalCwd) return false;
+  if (prev.onLocatePathInTerminal !== next.onLocatePathInTerminal) return false;
+  if (prev.onToggleShowHiddenFiles !== next.onToggleShowHiddenFiles) return false;
 
   return true;
 };

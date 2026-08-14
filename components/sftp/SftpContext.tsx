@@ -7,6 +7,8 @@
  */
 
 import React, { createContext, useContext, useMemo, useSyncExternalStore } from "react";
+import type { SftpConnectedHostEntry } from "../../domain/sftpConnectedHosts";
+import type { SftpConnectOptions } from "../../application/state/sftp/useSftpConnections";
 import { Host, SftpFileEntry, SftpFilenameEncoding } from "../../types";
 
 export interface SftpTransferSource {
@@ -17,10 +19,16 @@ export interface SftpTransferSource {
     targetPath?: string;
 }
 
+export type SftpConnectTarget = Host | "local";
+export type SftpConnectHostOptions = Pick<SftpConnectOptions, "sourceSessionId">;
+
 // Types for the context
 export interface SftpPaneCallbacks {
-    onConnect: (host: Host | "local") => void;
-    onDisconnect: () => void;
+    onConnect: (host: SftpConnectTarget, options?: SftpConnectHostOptions) => void;
+    /** Resolves true if disconnect completed, false if the user canceled the
+     * dirty-editor prompt. Callers that follow up with a replacement connect
+     * must gate on the result. */
+    onDisconnect: () => Promise<boolean>;
     onPrepareSelection: () => void;
     onNavigateTo: (path: string) => void;
     onNavigateUp: () => void;
@@ -47,11 +55,18 @@ export interface SftpPaneCallbacks {
     // File operations
     onEditFile?: (entry: SftpFileEntry, fullPath?: string) => void;
     onOpenFile?: (entry: SftpFileEntry, fullPath?: string) => void;
+    onOpenFileWithSystemDefault?: (entry: SftpFileEntry, fullPath?: string) => void;
     onOpenFileWith?: (entry: SftpFileEntry, fullPath?: string) => void;  // Always show opener dialog
     onDownloadFile?: (entry: SftpFileEntry, fullPath?: string) => void;  // Download to local filesystem
+    onDownloadFiles?: (entries: SftpFileEntry[]) => void;  // Batch download — picks one target directory for remote panes
     // External file upload (supports folders via DataTransfer)
     onUploadExternalFiles?: (dataTransfer: DataTransfer, targetPath?: string) => Promise<void>;
+    // External file upload from <input type="file" multiple> picker (FileList).
+    onUploadExternalFileList?: (fileList: FileList, targetPath?: string) => Promise<void>;
+    // External folder upload from native directory picker.
+    onUploadExternalFolder?: (targetPath?: string) => Promise<void>;
     onListDirectory: (path: string) => Promise<SftpFileEntry[]>;
+    onListDrives: () => Promise<string[]>;
 }
 
 export interface SftpDragCallbacks {
@@ -95,42 +110,53 @@ export const useActiveTabId = (side: "left" | "right"): string | null => {
     );
 };
 
-// Hook to check if a specific pane is active (for CSS control)
-export const useIsPaneActive = (side: "left" | "right", paneId: string): boolean => {
-    const activeTabId = useActiveTabId(side);
-    return activeTabId === paneId || (activeTabId === null && paneId !== null);
-};
-
-export interface SftpContextValue {
+export interface SftpHostsContextValue {
     // Hosts list for connection picker
     hosts: Host[];
+    // Live terminal sessions that can be reused for SFTP (shown in picker).
+    connectedHosts: SftpConnectedHostEntry[];
+    // Raw hosts list for bookmark persistence and other host writes.
+    writableHosts: Host[];
     // Host updater for bookmark persistence
     updateHosts: (hosts: Host[]) => void;
+}
 
-    // Callbacks for each side
+export interface SftpPaneCallbacksContextValue {
     leftCallbacks: SftpPaneCallbacks;
     rightCallbacks: SftpPaneCallbacks;
 }
+
+/** @deprecated Prefer useSftpHosts / useSftpPaneCallbacks to avoid cross-churn. */
+export type SftpContextValue = SftpHostsContextValue & SftpPaneCallbacksContextValue;
 
 export interface SftpDragContextValue {
     draggedFiles: (SftpTransferSource & { side: "left" | "right" })[] | null;
     dragCallbacks: SftpDragCallbacks;
 }
 
-const SftpContext = createContext<SftpContextValue | null>(null);
+const SftpHostsContext = createContext<SftpHostsContextValue | null>(null);
+const SftpPaneCallbacksContext = createContext<SftpPaneCallbacksContextValue | null>(null);
 const SftpDragContext = createContext<SftpDragContextValue | null>(null);
 
-export const useSftpContext = () => {
-    const context = useContext(SftpContext);
-    if (!context) {
+/** @deprecated Prefer selective hooks; this re-renders on hosts OR callbacks churn. */
+export const useSftpContext = (): SftpContextValue => {
+    const hosts = useContext(SftpHostsContext);
+    const callbacks = useContext(SftpPaneCallbacksContext);
+    if (!hosts || !callbacks) {
         throw new Error("useSftpContext must be used within SftpContextProvider");
     }
-    return context;
+    return useMemo(
+        () => ({ ...hosts, ...callbacks }),
+        [hosts, callbacks],
+    );
 };
 
 // Hook to get callbacks for a specific side
 export const useSftpPaneCallbacks = (side: "left" | "right"): SftpPaneCallbacks => {
-    const context = useSftpContext();
+    const context = useContext(SftpPaneCallbacksContext);
+    if (!context) {
+        throw new Error("useSftpPaneCallbacks must be used within SftpContextProvider");
+    }
     return side === "left" ? context.leftCallbacks : context.rightCallbacks;
 };
 
@@ -151,18 +177,44 @@ export const useSftpDrag = () => {
 
 // Hook to get hosts
 export const useSftpHosts = () => {
-    const context = useSftpContext();
+    const context = useContext(SftpHostsContext);
+    if (!context) {
+        throw new Error("useSftpHosts must be used within SftpContextProvider");
+    }
     return context.hosts;
+};
+
+// Hook to get currently connected terminal hosts for the picker
+export const useSftpConnectedHosts = () => {
+    const context = useContext(SftpHostsContext);
+    if (!context) {
+        throw new Error("useSftpConnectedHosts must be used within SftpContextProvider");
+    }
+    return context.connectedHosts;
+};
+
+// Hook to get raw hosts for writeback
+export const useSftpWritableHosts = () => {
+    const context = useContext(SftpHostsContext);
+    if (!context) {
+        throw new Error("useSftpWritableHosts must be used within SftpContextProvider");
+    }
+    return context.writableHosts;
 };
 
 // Hook to get host updater
 export const useSftpUpdateHosts = () => {
-    const context = useSftpContext();
+    const context = useContext(SftpHostsContext);
+    if (!context) {
+        throw new Error("useSftpUpdateHosts must be used within SftpContextProvider");
+    }
     return context.updateHosts;
 };
 
 interface SftpContextProviderProps {
     hosts: Host[];
+    connectedHosts?: SftpConnectedHostEntry[];
+    writableHosts?: Host[];
     updateHosts: (hosts: Host[]) => void;
     draggedFiles: (SftpTransferSource & { side: "left" | "right" })[] | null;
     dragCallbacks: SftpDragCallbacks;
@@ -173,6 +225,8 @@ interface SftpContextProviderProps {
 
 export const SftpContextProvider: React.FC<SftpContextProviderProps> = ({
     hosts,
+    connectedHosts = [],
+    writableHosts,
     updateHosts,
     draggedFiles,
     dragCallbacks,
@@ -180,15 +234,24 @@ export const SftpContextProvider: React.FC<SftpContextProviderProps> = ({
     rightCallbacks,
     children,
 }) => {
-    // Memoize the main context value (no drag state, so drag changes won't cause re-renders here)
-    const value = useMemo<SftpContextValue>(
+    // Hosts and pane callbacks are separate so hosts churn does not invalidate
+    // callback consumers (and callback identity churn does not invalidate hosts).
+    const hostsValue = useMemo<SftpHostsContextValue>(
         () => ({
             hosts,
+            connectedHosts,
+            writableHosts: writableHosts ?? hosts,
             updateHosts,
+        }),
+        [hosts, connectedHosts, writableHosts, updateHosts],
+    );
+
+    const callbacksValue = useMemo<SftpPaneCallbacksContextValue>(
+        () => ({
             leftCallbacks,
             rightCallbacks,
         }),
-        [hosts, updateHosts, leftCallbacks, rightCallbacks],
+        [leftCallbacks, rightCallbacks],
     );
 
     // Memoize drag context separately so only drag consumers re-render on drag state changes
@@ -201,8 +264,10 @@ export const SftpContextProvider: React.FC<SftpContextProviderProps> = ({
     );
 
     return (
-        <SftpContext.Provider value={value}>
-            <SftpDragContext.Provider value={dragValue}>{children}</SftpDragContext.Provider>
-        </SftpContext.Provider>
+        <SftpHostsContext.Provider value={hostsValue}>
+            <SftpPaneCallbacksContext.Provider value={callbacksValue}>
+                <SftpDragContext.Provider value={dragValue}>{children}</SftpDragContext.Provider>
+            </SftpPaneCallbacksContext.Provider>
+        </SftpHostsContext.Provider>
     );
 };

@@ -1,8 +1,8 @@
 /**
  * Context-aware completion engine.
  * Combines multiple data sources:
- * 1. Command history (highest priority)
- * 2. @withfig/autocomplete specs (subcommands, options, args)
+ * 1. Context-aware path completions and @withfig/autocomplete specs
+ * 2. Command history
  * 3. Fuzzy history matching (fallback)
  *
  * Parses the current command line to determine context (command, subcommand,
@@ -30,9 +30,12 @@ import {
   getPathSuggestions,
   resolvePathComponents,
 } from "./remotePathCompleter";
+import { getSnippetSuggestions } from "./snippetCompleter";
+import type { AutocompleteHistoryScope, Snippet } from "../../../domain/models";
+import type { AutocompleteCwdSource } from "./terminalAutocompleteLayout";
 
 /** Source indicator for where a suggestion came from */
-export type SuggestionSource = "history" | "command" | "subcommand" | "option" | "arg" | "path";
+export type SuggestionSource = "history" | "command" | "subcommand" | "option" | "arg" | "path" | "snippet" | "plugin";
 
 export interface CompletionSuggestion {
   /** The text to insert */
@@ -49,6 +52,10 @@ export interface CompletionSuggestion {
   frequency?: number;
   /** For path suggestions: file type */
   fileType?: "file" | "directory" | "symlink";
+  /** For snippet suggestions: the source snippet (used by the accept path). */
+  snippet?: Snippet;
+  /** For plugin suggestions: the owning Provider contribution. */
+  providerId?: string;
 }
 
 export interface CompletionContext {
@@ -64,6 +71,94 @@ export interface CompletionContext {
   commandName: string;
   /** Whether the current position is after a recognized option that expects an argument */
   isOptionArg: boolean;
+}
+
+/**
+ * Soft wait for remote/local path listings. History, fig specs, and snippets are
+ * local and should paint without waiting on high-latency SSH exec (#2830).
+ * Timed-out listings still finish in the background: cacheable paths warm the
+ * shared cache, and cache-bypassed relative SSH paths notify via onLateResult
+ * so the UI can merge path suggestions when the listing finally resolves.
+ */
+export const PATH_COMPLETION_BUDGET_MS = 150;
+
+type PathSuggestionEntry = { name: string; type: "file" | "directory" | "symlink" };
+
+/** @internal Exported for unit tests covering the soft path-listing budget. */
+export async function getPathSuggestionsWithinBudget(
+  pathPromise: Promise<PathSuggestionEntry[]>,
+  budgetMs: number,
+  onLateResult?: (entries: PathSuggestionEntry[]) => void,
+): Promise<PathSuggestionEntry[]> {
+  if (!Number.isFinite(budgetMs) || budgetMs < 0) {
+    return pathPromise;
+  }
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const raced = await Promise.race([
+      // Settle rejections here so a late failure after timeout cannot surface
+      // as an unhandled rejection from the losing Promise.race branch.
+      pathPromise.then(
+        (entries) => ({ kind: "entries" as const, entries }),
+        () => ({ kind: "entries" as const, entries: [] as PathSuggestionEntry[] }),
+      ),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timeoutId = setTimeout(() => resolve({ kind: "timeout" }), budgetMs);
+      }),
+    ]);
+    if (raced.kind === "entries") return raced.entries;
+    // Keep the listing in flight. Cacheable paths warm the shared cache for a
+    // later keystroke; bypassed relative SSH paths have no cache, so surface
+    // the late result to the caller instead of discarding it.
+    void pathPromise.then(
+      (entries) => {
+        if (entries.length > 0) onLateResult?.(entries);
+      },
+      () => {},
+    );
+    return [];
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
+}
+
+function buildPathCompletionSuggestions(
+  ctx: CompletionContext,
+  pathEntries: PathSuggestionEntry[],
+  cwd: string | undefined,
+): CompletionSuggestion[] {
+  if (pathEntries.length === 0) return [];
+  const { pathPrefix, quoteSuffix } = resolvePathComponents(ctx.currentWord, cwd);
+  const isQuotedPath = ctx.currentWord.startsWith('"') || ctx.currentWord.startsWith("'");
+  const suggestions: CompletionSuggestion[] = [];
+  for (const entry of pathEntries) {
+    const insertName = isQuotedPath || !/[\\$'"|!<>;#~` ]/.test(entry.name)
+      ? entry.name
+      : shellEscape(entry.name);
+    const suffix = entry.type === "directory" ? "/" : "";
+    const fullPath = pathPrefix + insertName + suffix + quoteSuffix;
+    suggestions.push({
+      text: rebuildCommand(ctx.tokens, ctx.wordIndex, fullPath),
+      displayText: entry.name + suffix,
+      source: "path",
+      score: 750,
+      fileType: entry.type,
+    });
+  }
+  return suggestions;
+}
+
+interface SpecSuggestionResult {
+  suggestions: CompletionSuggestion[];
+  pathArgs?: FigSubcommand["args"];
+}
+
+export function shellEscape(name: string): string {
+  if (!name) return name;
+  if (/[\\$'"|!<>;#~` ]/.test(name)) {
+    return `'${name.replace(/'/g, "'\\''")}'`;
+  }
+  return name;
 }
 
 /**
@@ -147,6 +242,7 @@ export async function getCompletions(
   input: string,
   options: {
     hostId?: string;
+    hostGroup?: string;
     os?: "linux" | "windows" | "macos";
     maxResults?: number;
     /** Session ID for remote path completion */
@@ -155,25 +251,49 @@ export async function getCompletions(
     protocol?: string;
     /** Current working directory (from OSC 7) */
     cwd?: string;
+    cwdSource?: AutocompleteCwdSource;
+    /** Custom snippets to surface at the command position */
+    snippets?: Snippet[];
+    /** Which history pool to query (default: current host only). */
+    historyScope?: AutocompleteHistoryScope;
+    /**
+     * Soft budget for path listings (ms). Local suggestions return when this
+     * elapses even if remote `find` is still running. Use `Infinity` in tests
+     * that need the full remote listing.
+     */
+    pathBudgetMs?: number;
+    /**
+     * Invoked when a path listing finishes after the soft budget elapsed.
+     * Needed for cache-bypassed relative SSH cwd lookups, which cannot warm
+     * the shared directory cache for a later keystroke.
+     */
+    onLatePathSuggestions?: (suggestions: CompletionSuggestion[]) => void;
   } = {},
 ): Promise<CompletionSuggestion[]> {
-  const { hostId, maxResults = 15 } = options;
+  const { hostId, maxResults = 15, historyScope = "host" } = options;
+  const pathBudgetMs = options.pathBudgetMs ?? PATH_COMPLETION_BUDGET_MS;
 
   if (!input || input.trim().length === 0) return [];
 
   const ctx = parseCommandLine(input);
+  const specResult: SpecSuggestionResult = ctx.commandName && ctx.wordIndex >= 0
+    ? await getSpecSuggestions(ctx)
+    : { suggestions: [] };
   const suggestions: CompletionSuggestion[] = [];
   const seenSuggestionTexts = new Set<string>();
   const pathCheck = ctx.commandName && ctx.wordIndex >= 1
-    ? shouldDoPathCompletion(ctx, undefined)
+    ? shouldDoPathCompletion(ctx, specResult.pathArgs)
     : { shouldComplete: false, foldersOnly: false };
   const preferPathSuggestions = pathCheck.shouldComplete;
   const resultLimit = preferPathSuggestions ? Math.max(maxResults, 24) : maxResults;
 
+  // History queries honor historyScope; snippets still stay host-scoped.
+  const historyHostId = historyScope === "global" ? undefined : hostId;
+
   // 1. History suggestions (full command line prefix match)
   // Cap history to leave room for spec suggestions in the popup
   const historyOpts: HistoryQueryOptions = {
-    hostId,
+    hostId: historyHostId,
     limit: preferPathSuggestions ? 0 : 5,
   };
 
@@ -198,7 +318,7 @@ export async function getCompletions(
       commandName: ctx.commandName,
       excludeCommand: input,
       argumentPrefix: normalizeHistoryPathPrefix(ctx.currentWord),
-      hostId,
+      hostId: historyHostId,
       limit: 5,
     });
     for (let index = 0; index < recentHistory.length; index++) {
@@ -218,44 +338,39 @@ export async function getCompletions(
 
   const canQueryPaths = options.protocol === "local" || options.sessionId !== undefined;
 
-  const specPromise = ctx.commandName && ctx.wordIndex >= 0
-    ? getSpecSuggestions(ctx)
-    : Promise.resolve([]);
-  const pathPromise = canQueryPaths && pathCheck.shouldComplete
-    ? getPathSuggestions(ctx, {
-      sessionId: options.sessionId,
-      protocol: options.protocol,
-      cwd: options.cwd,
-      foldersOnly: pathCheck.foldersOnly,
-    })
-    : Promise.resolve([]);
+  const pathEntries = canQueryPaths && pathCheck.shouldComplete
+    ? await getPathSuggestionsWithinBudget(
+      getPathSuggestions(ctx, {
+        sessionId: options.sessionId,
+        protocol: options.protocol,
+        os: options.os,
+        cwd: options.cwd,
+        cwdSource: options.cwdSource,
+        foldersOnly: pathCheck.foldersOnly,
+      }),
+      pathBudgetMs,
+      (lateEntries) => {
+        if (!options.onLatePathSuggestions) return;
+        const latePathSuggestions = buildPathCompletionSuggestions(
+          ctx,
+          lateEntries,
+          options.cwd,
+        );
+        if (latePathSuggestions.length > 0) {
+          options.onLatePathSuggestions(latePathSuggestions);
+        }
+      },
+    )
+    : [];
 
-  const [specSugs, pathEntries] = await Promise.all([specPromise, pathPromise]);
-
-  for (const suggestion of specSugs) {
+  for (const suggestion of specResult.suggestions) {
     suggestions.push(suggestion);
     seenSuggestionTexts.add(suggestion.text);
   }
 
-  if (pathEntries.length > 0) {
-    const { pathPrefix, quoteSuffix } = resolvePathComponents(ctx.currentWord, options.cwd);
-    const isQuotedPath = ctx.currentWord.startsWith('"') || ctx.currentWord.startsWith("'");
-    for (const entry of pathEntries) {
-      const insertName = isQuotedPath || !entry.name.includes(" ")
-        ? entry.name
-        : entry.name.replace(/ /g, "\\ ");
-      const suffix = entry.type === "directory" ? "/" : "";
-      const fullPath = pathPrefix + insertName + suffix + quoteSuffix;
-      const suggestion = {
-        text: rebuildCommand(ctx.tokens, ctx.wordIndex, fullPath),
-        displayText: entry.name + suffix,
-        source: "path",
-        score: 750,
-        fileType: entry.type,
-      } satisfies CompletionSuggestion;
-      suggestions.push(suggestion);
-      seenSuggestionTexts.add(suggestion.text);
-    }
+  for (const suggestion of buildPathCompletionSuggestions(ctx, pathEntries, options.cwd)) {
+    suggestions.push(suggestion);
+    seenSuggestionTexts.add(suggestion.text);
   }
 
   // 3. Fuzzy history fallback (if prefix match yields few results)
@@ -275,6 +390,19 @@ export async function getCompletions(
       } satisfies CompletionSuggestion;
       suggestions.push(suggestion);
       seenSuggestionTexts.add(suggestion.text);
+    }
+  }
+
+  // Snippets: only at the command position (typing the command name).
+  // Push without the early seen-text skip: snippets score above history, so if
+  // a snippet's label collides with an existing history entry's text, the
+  // score-sort + final dedup below keeps the snippet (the higher-scored one).
+  if (options.snippets && options.snippets.length > 0 && ctx.wordIndex === 0) {
+    for (const snippetSuggestion of getSnippetSuggestions(input, options.snippets, {
+      hostId,
+      hostGroup: options.hostGroup,
+    })) {
+      suggestions.push(snippetSuggestion);
     }
   }
 
@@ -305,26 +433,26 @@ function normalizeHistoryPathPrefix(token: string): string {
 /**
  * Get suggestions from Fig spec + return resolved args (for path detection reuse).
  */
-async function getSpecSuggestions(ctx: CompletionContext): Promise<CompletionSuggestion[]> {
+async function getSpecSuggestions(ctx: CompletionContext): Promise<SpecSuggestionResult> {
   const suggestions: CompletionSuggestion[] = [];
 
   const specAvailable = await hasSpec(ctx.commandName);
   if (!specAvailable) {
     if (ctx.wordIndex === 0 && ctx.currentWord.length >= 1) {
-      return await getCommandNameSuggestions(ctx.currentWord);
+      return { suggestions: await getCommandNameSuggestions(ctx.currentWord) };
     }
-    return [];
+    return { suggestions };
   }
 
   const spec = await loadSpec(ctx.commandName);
-  if (!spec) return [];
+  if (!spec) return { suggestions };
 
   // If we're still typing the command name (partial match, not yet complete)
   if (ctx.wordIndex === 0) {
     const typedLower = ctx.currentWord.toLowerCase();
     const specNames = resolveNames(spec.name);
     const isExactMatch = specNames.some((n) => n.toLowerCase() === typedLower);
-    if (!isExactMatch) return [];
+    if (!isExactMatch) return { suggestions };
 
     // Show subcommands as preview (user typed full command but no space yet)
     if (spec.subcommands) {
@@ -340,11 +468,11 @@ async function getSpecSuggestions(ctx: CompletionContext): Promise<CompletionSug
         if (suggestions.length >= 10) break;
       }
     }
-    return suggestions;
+    return { suggestions };
   }
 
   // Navigate the spec tree based on typed tokens
-  let resolved = resolveSpecContext(spec, ctx.tokens.slice(1, ctx.wordIndex));
+  const resolved = resolveSpecContext(spec, ctx.tokens.slice(1, ctx.wordIndex));
   const currentToken = ctx.currentWord;
 
   // Check if currentToken exactly matches a subcommand — if so, navigate into it
@@ -379,7 +507,7 @@ async function getSpecSuggestions(ctx: CompletionContext): Promise<CompletionSug
         childResolved.options?.length ? childResolved.options : childResolved.fallbackOptions,
         15,
       );
-      return suggestions;
+      return { suggestions };
     }
   }
 
@@ -434,7 +562,10 @@ async function getSpecSuggestions(ctx: CompletionContext): Promise<CompletionSug
     }
   }
 
-  return suggestions;
+  return {
+    suggestions,
+    pathArgs: resolved.args,
+  };
 }
 
 /**

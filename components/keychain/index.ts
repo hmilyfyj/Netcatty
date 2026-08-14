@@ -6,8 +6,7 @@
 
 // Utilities and types
 export {
-copyToClipboard,detectKeyType,generateMockKeyPair,getKeyIcon,
-getKeyTypeDisplay,isMacOS,type FilterTab,type PanelMode
+isMacOS,shouldShowIdentitySection,shouldShowKeySection,shouldShowSearchNoResults,type PanelMode
 } from './utils';
 
 // Card components

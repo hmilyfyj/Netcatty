@@ -1,12 +1,58 @@
-import React, { useCallback, useEffect, useState } from "react";
-import { Check, ChevronDown, ChevronRight, Eye, EyeOff } from "lucide-react";
-import type { ProviderConfig, ProviderAdvancedParams } from "../../../../infrastructure/ai/types";
-import { PROVIDER_PRESETS } from "../../../../infrastructure/ai/types";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Check, ChevronDown, ChevronRight, Eye, EyeOff, Pencil, Upload, RotateCcw, X, RefreshCw } from "lucide-react";
+import type { ProviderConfig, ProviderAdvancedParams, ProviderStyle } from "../../../../infrastructure/ai/types";
+import { PROVIDER_PRESETS, resolveProviderStyle } from "../../../../infrastructure/ai/types";
+import { sanitizeContextWindow } from "../../../../infrastructure/ai/contextCompaction";
+import {
+  probeProviderConnection,
+  validateProviderProbeInputs,
+  type ProviderProbeHealth,
+} from "../../../../infrastructure/ai/providerConnectionProbe";
 import { encryptField, decryptField } from "../../../../infrastructure/persistence/secureFieldAdapter";
 import { useI18n } from "../../../../application/i18n/I18nProvider";
 import { Button } from "../../../ui/button";
+import { cn } from "../../../../lib/utils";
+import type { BuiltinProviderIcon } from "./types";
+import { BUILTIN_PROVIDER_ICONS, getFetchBridge } from "./types";
 import type { ProviderFormState } from "./types";
 import { ModelSelector } from "./ModelSelector";
+import { mergeModelContextWindow } from "./modelMetadata";
+import { ProviderIconBadge } from "./ProviderIconBadge";
+
+const ICON_PIXEL_SIZE = 64;
+const ICON_WEBP_QUALITY = 0.85;
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+async function compressIconFileToDataUrl(file: File): Promise<string> {
+  if (file.size > MAX_UPLOAD_BYTES) {
+    throw new Error("Image too large; please use an image under 5 MB.");
+  }
+  const sourceUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const el = new Image();
+    el.onload = () => resolve(el);
+    el.onerror = () => reject(new Error("Failed to decode image"));
+    el.src = sourceUrl;
+  });
+  const canvas = document.createElement("canvas");
+  canvas.width = ICON_PIXEL_SIZE;
+  canvas.height = ICON_PIXEL_SIZE;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2D context unavailable");
+  ctx.clearRect(0, 0, ICON_PIXEL_SIZE, ICON_PIXEL_SIZE);
+  const scale = Math.min(ICON_PIXEL_SIZE / img.width, ICON_PIXEL_SIZE / img.height);
+  const w = img.width * scale;
+  const h = img.height * scale;
+  ctx.drawImage(img, (ICON_PIXEL_SIZE - w) / 2, (ICON_PIXEL_SIZE - h) / 2, w, h);
+  return canvas.toDataURL("image/webp", ICON_WEBP_QUALITY);
+}
+
+const STYLE_OPTIONS: ReadonlyArray<ProviderStyle> = ["anthropic", "openai", "google"];
 
 export const ProviderConfigForm: React.FC<{
   provider: ProviderConfig;
@@ -14,20 +60,75 @@ export const ProviderConfigForm: React.FC<{
   onCancel: () => void;
 }> = ({ provider, onSave, onCancel }) => {
   const { t } = useI18n();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   const [form, setForm] = useState<ProviderFormState>({
     name: provider.name ?? PROVIDER_PRESETS[provider.providerId]?.name ?? "",
     apiKey: "",
     baseURL: provider.baseURL ?? PROVIDER_PRESETS[provider.providerId]?.defaultBaseURL ?? "",
     defaultModel: provider.defaultModel ?? "",
+    contextWindow: provider.contextWindow != null ? String(provider.contextWindow) : "",
+    modelContextWindows: provider.modelContextWindows ?? {},
     skipTLSVerify: provider.skipTLSVerify ?? false,
     advancedParams: provider.advancedParams ?? {},
+    style: provider.style ?? "",
+    iconId: provider.iconId ?? "",
+    iconDataUrl: provider.iconDataUrl ?? "",
   });
-  const isCustom = provider.providerId === "custom";
   const [showApiKey, setShowApiKey] = useState(false);
   const [isDecrypting, setIsDecrypting] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showIconPicker, setShowIconPicker] = useState(false);
+  const [iconError, setIconError] = useState<string | null>(null);
+  const [contextWindowError, setContextWindowError] = useState<string | null>(null);
+  const [apiKeySourceVersion, setApiKeySourceVersion] = useState(0);
+  const [isTesting, setIsTesting] = useState(false);
+  const [probeResult, setProbeResult] = useState<{
+    health: ProviderProbeHealth;
+    message: string;
+  } | null>(null);
+  const probeRequestIdRef = useRef(0);
 
   const preset = PROVIDER_PRESETS[provider.providerId];
+  const resolvedStyle: ProviderStyle = form.style || resolveProviderStyle({ providerId: provider.providerId });
+  const modelMetadataSourceKey = useMemo(() => JSON.stringify({
+    providerId: provider.providerId,
+    baseURL: form.baseURL || preset?.defaultBaseURL || "",
+    modelsEndpoint: preset?.modelsEndpoint ?? "",
+    apiKeySourceVersion,
+    style: resolvedStyle,
+    skipTLSVerify: form.skipTLSVerify,
+  }), [
+    provider.providerId,
+    form.baseURL,
+    apiKeySourceVersion,
+    form.skipTLSVerify,
+    preset?.defaultBaseURL,
+    preset?.modelsEndpoint,
+    resolvedStyle,
+  ]);
+  const probeFingerprint = useMemo(() => JSON.stringify({
+    baseURL: form.baseURL || preset?.defaultBaseURL || "",
+    apiKey: form.apiKey,
+    style: resolvedStyle,
+    skipTLSVerify: form.skipTLSVerify,
+    modelsEndpoint: preset?.modelsEndpoint ?? "",
+  }), [
+    form.apiKey,
+    form.baseURL,
+    form.skipTLSVerify,
+    preset?.defaultBaseURL,
+    preset?.modelsEndpoint,
+    resolvedStyle,
+  ]);
+  const modelMetadataSourceKeyRef = useRef<string | null>(null);
+  const probeFingerprintRef = useRef<string | null>(null);
+  const previewProvider: Pick<ProviderConfig, "providerId" | "name" | "iconId" | "iconDataUrl"> = {
+    providerId: provider.providerId,
+    name: form.name,
+    iconId: form.iconId || undefined,
+    iconDataUrl: form.iconDataUrl || undefined,
+  };
 
   // Decrypt and load existing API key on mount
   useEffect(() => {
@@ -44,6 +145,32 @@ export const ProviderConfigForm: React.FC<{
         .finally(() => setIsDecrypting(false));
     }
   }, [provider.apiKey]);
+
+  useEffect(() => {
+    if (modelMetadataSourceKeyRef.current == null) {
+      modelMetadataSourceKeyRef.current = modelMetadataSourceKey;
+      return;
+    }
+    if (modelMetadataSourceKeyRef.current === modelMetadataSourceKey) return;
+
+    modelMetadataSourceKeyRef.current = modelMetadataSourceKey;
+    setForm((prev) => Object.keys(prev.modelContextWindows).length > 0
+      ? { ...prev, modelContextWindows: {} }
+      : prev);
+  }, [modelMetadataSourceKey]);
+
+  useEffect(() => {
+    if (probeFingerprintRef.current == null) {
+      probeFingerprintRef.current = probeFingerprint;
+      return;
+    }
+    if (probeFingerprintRef.current === probeFingerprint) return;
+
+    probeFingerprintRef.current = probeFingerprint;
+    probeRequestIdRef.current += 1;
+    setProbeResult(null);
+    setIsTesting(false);
+  }, [probeFingerprint]);
 
   const [advancedParamRaw, setAdvancedParamRaw] = useState<Record<string, string>>({});
   const handleAdvancedParam = useCallback((key: keyof ProviderAdvancedParams, raw: string) => {
@@ -62,6 +189,120 @@ export const ProviderConfigForm: React.FC<{
     });
   }, []);
 
+  const handleIconFileSelect = useCallback(async (file: File | null) => {
+    setIconError(null);
+    if (!file) return;
+    if (!/^image\//.test(file.type)) {
+      setIconError(t("ai.providers.icon.errorType"));
+      return;
+    }
+    try {
+      const dataUrl = await compressIconFileToDataUrl(file);
+      setForm((prev) => ({ ...prev, iconDataUrl: dataUrl, iconId: "" }));
+    } catch (err) {
+      setIconError(err instanceof Error ? err.message : String(err));
+    }
+  }, [t]);
+
+  const handlePickBuiltin = useCallback((icon: BuiltinProviderIcon) => {
+    setIconError(null);
+    setForm((prev) => ({ ...prev, iconId: icon.id, iconDataUrl: "", name: icon.name }));
+  }, []);
+
+  const handleResetIcon = useCallback(() => {
+    setIconError(null);
+    setForm((prev) => ({ ...prev, iconId: "", iconDataUrl: "" }));
+  }, []);
+
+  const handleApiKeyChange = useCallback((value: string) => {
+    setApiKeySourceVersion((version) => version + 1);
+    setForm((prev) => ({ ...prev, apiKey: value }));
+  }, []);
+
+  const handleTestConnection = useCallback(async () => {
+    const baseURL = form.baseURL || preset?.defaultBaseURL || "";
+    const inputCheck = validateProviderProbeInputs({
+      baseURL,
+      apiKey: form.apiKey,
+      providerId: provider.providerId,
+    });
+    if (!inputCheck.ok) {
+      probeRequestIdRef.current += 1;
+      setIsTesting(false);
+      setProbeResult({
+        health: "error",
+        message: t(
+          inputCheck.reason === "missing_base_url"
+            ? "ai.providers.test.missingBaseUrl"
+            : "ai.providers.test.missingApiKey",
+        ),
+      });
+      return;
+    }
+
+    const requestId = ++probeRequestIdRef.current;
+    setIsTesting(true);
+    setProbeResult(null);
+    try {
+      const run = await probeProviderConnection({
+        bridge: getFetchBridge(),
+        baseURL,
+        apiKey: form.apiKey,
+        providerId: provider.providerId,
+        style: resolvedStyle,
+        presetModelsEndpoint: preset?.modelsEndpoint,
+        skipTLSVerify: form.skipTLSVerify,
+      });
+      if (probeRequestIdRef.current !== requestId) return;
+      if (!run.ok) {
+        setProbeResult({
+          health: "error",
+          message: t(
+            run.reason === "missing_base_url"
+              ? "ai.providers.test.missingBaseUrl"
+              : run.reason === "missing_api_key"
+                ? "ai.providers.test.missingApiKey"
+                : "ai.providers.test.unavailable",
+          ),
+        });
+        return;
+      }
+      const classified = run.classification;
+      const latency = String(classified.latencyMs);
+      if (classified.health === "ok") {
+        setProbeResult({
+          health: "ok",
+          message: t("ai.providers.test.ok", { latency }),
+        });
+      } else if (classified.health === "warn") {
+        const warnKey = classified.modelCount === 0 || classified.error
+          ? "ai.providers.test.warn"
+          : "ai.providers.test.warnSlow";
+        setProbeResult({
+          health: "warn",
+          message: t(warnKey, { latency }),
+        });
+      } else {
+        const detail = classified.error
+          || (classified.statusCode ? `HTTP ${classified.statusCode}` : "error");
+        setProbeResult({
+          health: "error",
+          message: t("ai.providers.test.error", { detail }),
+        });
+      }
+    } catch (err) {
+      if (probeRequestIdRef.current !== requestId) return;
+      setProbeResult({
+        health: "error",
+        message: t("ai.providers.test.error", {
+          detail: err instanceof Error ? err.message : String(err),
+        }),
+      });
+    } finally {
+      if (probeRequestIdRef.current === requestId) setIsTesting(false);
+    }
+  }, [form.apiKey, form.baseURL, form.skipTLSVerify, preset?.defaultBaseURL, preset?.modelsEndpoint, provider.providerId, resolvedStyle, t]);
+
   const handleSave = useCallback(async () => {
     const cleanedParams: ProviderAdvancedParams = {};
     const ap = form.advancedParams;
@@ -71,12 +312,32 @@ export const ProviderConfigForm: React.FC<{
     if (ap.frequencyPenalty != null) cleanedParams.frequencyPenalty = Math.min(2, Math.max(-2, ap.frequencyPenalty));
     if (ap.presencePenalty != null) cleanedParams.presencePenalty = Math.min(2, Math.max(-2, ap.presencePenalty));
 
+    const trimmedName = form.name.trim();
+    const defaultName = PROVIDER_PRESETS[provider.providerId]?.name ?? "";
+    const rawContextWindow = form.contextWindow.trim();
+    const rawContextWindowNumber = Number(rawContextWindow);
+    if (rawContextWindow && (!Number.isInteger(rawContextWindowNumber) || rawContextWindowNumber <= 0)) {
+      setContextWindowError(t("ai.providers.contextWindow.error"));
+      return;
+    }
+    const manualContextWindow = rawContextWindow ? sanitizeContextWindow(rawContextWindow) : undefined;
+    if (rawContextWindow && manualContextWindow == null) {
+      setContextWindowError(t("ai.providers.contextWindow.error"));
+      return;
+    }
+    setContextWindowError(null);
+
     const updates: Partial<ProviderConfig> = {
+      name: trimmedName || defaultName,
       baseURL: form.baseURL || undefined,
       defaultModel: form.defaultModel || undefined,
+      contextWindow: manualContextWindow,
+      modelContextWindows: Object.keys(form.modelContextWindows).length > 0 ? form.modelContextWindows : undefined,
       skipTLSVerify: form.skipTLSVerify || undefined,
       advancedParams: Object.keys(cleanedParams).length > 0 ? cleanedParams : undefined,
-      ...(isCustom && form.name.trim() ? { name: form.name.trim() } : {}),
+      style: form.style || undefined,
+      iconId: form.iconId || undefined,
+      iconDataUrl: form.iconDataUrl || undefined,
     };
 
     // Encrypt API key before saving
@@ -87,23 +348,133 @@ export const ProviderConfigForm: React.FC<{
     }
 
     onSave(updates);
-  }, [form, onSave, isCustom]);
+  }, [form, onSave, provider.providerId, t]);
 
   return (
     <div className="mt-3 space-y-3 border-t border-border/40 pt-3">
-      {/* Name (custom providers only) */}
-      {isCustom && (
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-muted-foreground">{t('ai.providers.name')}</label>
+      {/* Display: icon + name */}
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium text-muted-foreground">{t('ai.providers.name')}</label>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowIconPicker((v) => !v)}
+            className="group relative shrink-0 rounded-md transition-all hover:brightness-110 hover:ring-2 hover:ring-primary/45 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+            aria-label={t('ai.providers.icon.change')}
+            title={t('ai.providers.icon.change')}
+          >
+            <ProviderIconBadge provider={previewProvider} />
+            <span
+              aria-hidden="true"
+              className="pointer-events-none absolute -bottom-1 -right-1 flex h-4 w-4 items-center justify-center rounded-full border border-background bg-primary text-primary-foreground opacity-0 shadow-sm transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+            >
+              <Pencil size={9} strokeWidth={2.5} />
+            </span>
+          </button>
           <input
             type="text"
             value={form.name}
             onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
             placeholder={t('ai.providers.name.placeholder')}
-            className="w-full h-8 rounded-md border border-input bg-background px-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            className="flex-1 h-8 rounded-md border border-input bg-background px-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           />
         </div>
-      )}
+        {showIconPicker && (
+          <div className="rounded-md border border-border/50 bg-muted/20 p-2 space-y-2">
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(120px,1fr))] gap-1.5">
+              {BUILTIN_PROVIDER_ICONS.map((icon) => {
+                const isSelected = form.iconId === icon.id && !form.iconDataUrl;
+                return (
+                  <button
+                    key={icon.id}
+                    type="button"
+                    onClick={() => (isSelected ? handleResetIcon() : handlePickBuiltin(icon))}
+                    title={icon.label}
+                    aria-label={icon.label}
+                    aria-pressed={isSelected}
+                    className={cn(
+                      "flex items-center gap-2 px-2 py-1.5 rounded-md border text-left transition-colors min-w-0",
+                      isSelected
+                        ? "border-primary/70 bg-primary/15"
+                        : "border-transparent hover:border-border hover:bg-muted/40",
+                    )}
+                  >
+                    <ProviderIconBadge
+                      provider={{ providerId: provider.providerId, name: icon.label, iconId: icon.id }}
+                      size="md"
+                    />
+                    <span className="text-xs text-foreground/85 truncate">{icon.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex items-center gap-2 pt-2 border-t border-border/40">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => void handleIconFileSelect(e.target.files?.[0] ?? null)}
+              />
+              <Button variant="ghost" size="sm" onClick={() => fileInputRef.current?.click()}>
+                <Upload size={12} className="mr-1.5" />
+                {t('ai.providers.icon.upload')}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={handleResetIcon}>
+                <RotateCcw size={12} className="mr-1.5" />
+                {t('ai.providers.icon.reset')}
+              </Button>
+              {form.iconDataUrl && (
+                <span className="text-[10px] text-muted-foreground">{t('ai.providers.icon.uploadedNote')}</span>
+              )}
+              <div className="ml-auto" />
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowIconPicker(false)}
+                aria-label={t('ai.providers.icon.close')}
+                title={t('ai.providers.icon.close')}
+              >
+                <X size={12} className="mr-1.5" />
+                {t('ai.providers.icon.close')}
+              </Button>
+            </div>
+            {iconError && <p className="text-[11px] text-destructive">{iconError}</p>}
+          </div>
+        )}
+      </div>
+
+      {/* Provider style */}
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium text-muted-foreground">{t('ai.providers.style')}</label>
+        <div className="flex items-center gap-1.5">
+          {STYLE_OPTIONS.map((style) => {
+            const isSelected = resolvedStyle === style;
+            const isInherited = !form.style && isSelected;
+            return (
+              <button
+                key={style}
+                type="button"
+                onClick={() => setForm((prev) => ({ ...prev, style: prev.style === style ? "" : style }))}
+                className={cn(
+                  "h-7 px-2.5 rounded-md text-xs border transition-colors",
+                  isSelected
+                    ? "border-primary/70 bg-primary/15 text-foreground"
+                    : "border-border/50 bg-background text-muted-foreground hover:text-foreground hover:bg-muted/40",
+                )}
+                aria-pressed={isSelected}
+              >
+                {t(`ai.providers.style.${style}`)}
+                {isInherited && (
+                  <span className="ml-1 text-[9px] text-muted-foreground/70">({t('ai.providers.style.inherited')})</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        <p className="text-[11px] text-muted-foreground/70">{t('ai.providers.style.help')}</p>
+      </div>
+
       {/* API Key */}
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-muted-foreground">{t('ai.providers.apiKey')}</label>
@@ -112,7 +483,7 @@ export const ProviderConfigForm: React.FC<{
             <input
               type={showApiKey ? "text" : "password"}
               value={isDecrypting ? "" : form.apiKey}
-              onChange={(e) => setForm((prev) => ({ ...prev, apiKey: e.target.value }))}
+              onChange={(e) => handleApiKeyChange(e.target.value)}
               placeholder={isDecrypting ? t('ai.providers.apiKey.decrypting') : t('ai.providers.apiKey.placeholder')}
               disabled={isDecrypting}
               className="w-full h-8 rounded-md border border-input bg-background px-3 pr-9 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
@@ -138,6 +509,9 @@ export const ProviderConfigForm: React.FC<{
           placeholder={preset?.defaultBaseURL || "https://"}
           className="w-full h-8 rounded-md border border-input bg-background px-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         />
+        {resolvedStyle === "anthropic" ? (
+          <p className="text-[11px] text-muted-foreground/70">{t('ai.providers.baseUrl.anthropicHelp')}</p>
+        ) : null}
       </div>
 
       {/* Default Model */}
@@ -146,12 +520,46 @@ export const ProviderConfigForm: React.FC<{
         <ModelSelector
           value={form.defaultModel}
           onChange={(val) => setForm((prev) => ({ ...prev, defaultModel: val }))}
+          onModelMetadata={(model) => {
+            setForm((prev) => ({
+              ...prev,
+              modelContextWindows: mergeModelContextWindow(prev.modelContextWindows, model.id, model.contextWindow) ?? prev.modelContextWindows,
+            }));
+          }}
           baseURL={form.baseURL || preset?.defaultBaseURL || ""}
           modelsEndpoint={preset?.modelsEndpoint}
+          presetModels={preset?.defaultModels}
           apiKey={form.apiKey}
           providerId={provider.providerId}
+          style={resolvedStyle}
           skipTLSVerify={form.skipTLSVerify}
         />
+      </div>
+
+      {/* Context window */}
+      <div className="space-y-1.5">
+        <label className="text-xs font-medium text-muted-foreground">{t('ai.providers.contextWindow')}</label>
+        <input
+          type="number"
+          min={1}
+          step={1}
+          value={form.contextWindow}
+          onChange={(e) => {
+            setContextWindowError(null);
+            setForm((prev) => ({ ...prev, contextWindow: e.target.value }));
+          }}
+          placeholder={
+            form.defaultModel && form.modelContextWindows[form.defaultModel]
+              ? String(form.modelContextWindows[form.defaultModel])
+              : t('ai.providers.contextWindow.placeholder')
+          }
+          className={cn(
+            "w-full h-8 rounded-md border border-input bg-background px-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+            contextWindowError && "border-destructive focus-visible:ring-destructive",
+          )}
+        />
+        {contextWindowError && <p className="text-[11px] text-destructive">{contextWindowError}</p>}
+        <p className="text-[11px] text-muted-foreground/70">{t('ai.providers.contextWindow.help')}</p>
       </div>
 
       {/* Skip TLS Verification */}
@@ -252,14 +660,40 @@ export const ProviderConfigForm: React.FC<{
       </div>
 
       {/* Actions */}
-      <div className="flex items-center gap-2 pt-1">
-        <Button variant="default" size="sm" onClick={() => void handleSave()}>
-          <Check size={14} className="mr-1.5" />
-          {t('common.save')}
-        </Button>
-        <Button variant="ghost" size="sm" onClick={onCancel}>
-          {t('common.cancel')}
-        </Button>
+      <div className="flex flex-col gap-2 pt-1">
+        <div className="flex items-center gap-2">
+          <Button variant="default" size="sm" onClick={() => void handleSave()}>
+            <Check size={14} className="mr-1.5" />
+            {t('common.save')}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void handleTestConnection()}
+            disabled={isTesting || isDecrypting}
+          >
+            <RefreshCw size={14} className={cn("mr-1.5", isTesting && "animate-spin")} />
+            {isTesting ? t('ai.providers.test.testing') : t('ai.providers.test')}
+          </Button>
+          <Button variant="ghost" size="sm" onClick={onCancel}>
+            {t('common.cancel')}
+          </Button>
+        </div>
+        {(isTesting || probeResult) && (
+          <p
+            className={cn(
+              "text-[11px]",
+              isTesting && "text-muted-foreground",
+              probeResult?.health === "ok" && "text-emerald-500",
+              probeResult?.health === "warn" && "text-amber-500",
+              probeResult?.health === "error" && "text-destructive",
+            )}
+            role="status"
+            aria-live="polite"
+          >
+            {isTesting ? t('ai.providers.test.testing') : probeResult?.message}
+          </p>
+        )}
       </div>
     </div>
   );

@@ -6,6 +6,8 @@
 const path = require("node:path");
 const fs = require("node:fs");
 
+const { safeSend } = require("./ipcUtils.cjs");
+
 const V8_CACHE_OPTIONS = "bypassHeatCheck";
 
 function getGlobalShortcutBridge() {
@@ -28,13 +30,33 @@ const THEME_COLORS = {
 
 // State
 let mainWindow = null;
+const mainWindows = new Set();
+const appContentWindows = new Set();
+const dirtyEditorWindows = new Set();
+let appContentWindowClosedHandler = null;
+let lastFocusedMainWindow = null;
 let settingsWindow = null;
 let currentTheme = "light";
 let currentLanguage = "en";
+let currentWindowOpacity = 1;
+let cachedNativeTheme = null;
+
 let handlersRegistered = false; // Prevent duplicate IPC handler registration
 let menuDeps = null;
+let pluginApplicationMenuProvider = null;
 let electronApp = null; // Reference to Electron app for userData path
 let isQuitting = false;
+// Set right before electron-updater's quitAndInstall() drives app.quit() for a
+// macOS/Windows in-place update. The install only succeeds if the app process
+// exits cleanly: Squirrel.Mac's ShipIt helper waits on the parent PID to die
+// before swapping the bundle. Two normal-quit behaviors would otherwise keep
+// the process alive and strand the installer (see #1215):
+//   1. close-to-tray hides the window instead of closing it, and
+//   2. the before-quit dirty-editor guard preventDefault()s the quit for a
+//      5s renderer round-trip.
+// This flag lets both paths recognize an update install and let the quit
+// through immediately.
+let quittingForUpdate = false;
 const rendererReadyCallbacksByWebContentsId = new Map();
 const rendererReadySeenByWebContentsId = new Set();
 const rendererReadyWaitersByWebContentsId = new Map();
@@ -43,7 +65,12 @@ const DEBUG_WINDOWS = process.env.NETCATTY_DEBUG_WINDOWS === "1";
 const OAUTH_DEFAULT_WIDTH = 600;
 const OAUTH_DEFAULT_HEIGHT = 700;
 const OAUTH_OVERLAY_ID = "__netcatty_oauth_loading__";
-const OAUTH_LOOPBACK_PORT = 45678; // must match electron/bridges/oauthBridge.cjs
+const WINDOW_COMMAND_CLOSE_CHANNEL = "netcatty:window:command-close";
+// The OAuth callback port is chosen dynamically by oauthBridge (prefers
+// 45678, falls back to an OS-assigned free port if that is in use, #823),
+// so the in-app popup allow-list has to consult the bridge at popup-open
+// time instead of a hardcoded constant.
+const oauthBridge = require("./oauthBridge.cjs");
 const WINDOW_STATE_FILE = "window-state.json";
 const DEFAULT_WINDOW_WIDTH = 1400;
 const DEFAULT_WINDOW_HEIGHT = 900;
@@ -64,6 +91,61 @@ function debugLog(...args) {
 
 function setIsQuitting(nextValue) {
   isQuitting = Boolean(nextValue);
+}
+
+function setAppContentWindowClosedHandler(handler) {
+  if (handler != null && typeof handler !== "function") {
+    throw new TypeError("App content window close handler must be a function");
+  }
+  appContentWindowClosedHandler = handler ?? null;
+}
+
+function notifyAppContentWindowClosed(win) {
+  appContentWindowClosedHandler?.(win);
+}
+
+function shouldCloseWindowFromInput(input) {
+  return Boolean(
+    input?.type === "keyDown" &&
+    input?.meta &&
+    !input?.control &&
+    !input?.alt &&
+    !input?.shift &&
+    String(input?.key || "").toLowerCase() === "w",
+  );
+}
+
+/**
+ * Read the generic "app is quitting" flag. Window close handlers gate
+ * close-to-tray / settings-window hiding on this; exposed so the update-quit
+ * rollback can be verified.
+ */
+function getIsQuitting() {
+  return isQuitting;
+}
+
+/**
+ * Mark that the app is quitting to install a downloaded update. Mirrors the
+ * generic isQuitting flag so the main-window close handler bypasses
+ * close-to-tray. Call this right before electron-updater's quitAndInstall().
+ *
+ * Passing false rolls BOTH flags back — used when a quitAndInstall never
+ * actually quits the app (throw / Squirrel follow-up error / stale download).
+ * Without resetting isQuitting too, close-to-tray and settings-window hiding
+ * would stay disabled for the rest of the session (#1215 review).
+ */
+function setQuittingForUpdate(nextValue) {
+  quittingForUpdate = Boolean(nextValue);
+  isQuitting = quittingForUpdate;
+}
+
+/**
+ * True when quitAndInstall() initiated the current quit. The before-quit guard
+ * still performs the dirty-editor round-trip; if the user cancels to save, it
+ * uses this state to roll back the update quit flags.
+ */
+function isQuittingForUpdate() {
+  return quittingForUpdate;
 }
 
 /**
@@ -180,8 +262,10 @@ function getWindowBoundsState(win, overrideBounds) {
 }
 
 const MENU_LABELS = {
-  en: { edit: "Edit", view: "View", window: "Window", reload: "Reload" },
-  "zh-CN": { edit: "编辑", view: "视图", window: "窗口", reload: "重新加载" },
+  en: { edit: "Edit", view: "View", plugins: "Plugins", window: "Window", reload: "Reload", closeWindow: "Close Window" },
+  ru: { edit: "Правка", view: "Вид", plugins: "Плагины", window: "Окно", reload: "Перезагрузить", closeWindow: "Закрыть окно" },
+  "zh-CN": { edit: "编辑", view: "视图", plugins: "插件", window: "窗口", reload: "重新加载", closeWindow: "关闭窗口" },
+  "zh-TW": { edit: "編輯", view: "檢視", plugins: "外掛程式", window: "視窗", reload: "重新載入", closeWindow: "關閉視窗" },
 };
 
 function tMenu(language, key) {
@@ -197,7 +281,19 @@ function tMenu(language, key) {
 function rebuildApplicationMenu() {
   if (!menuDeps?.Menu || !menuDeps?.app) return;
   const menu = buildAppMenu(menuDeps.Menu, menuDeps.app, menuDeps.isMac, currentLanguage);
-  menuDeps.Menu.setApplicationMenu(menu);
+  menuDeps.Menu.setApplicationMenu?.(menu);
+}
+
+function setPluginApplicationMenuProvider(provider) {
+  if (provider != null && typeof provider !== "function") {
+    throw new TypeError("Plugin application menu provider must be a function");
+  }
+  pluginApplicationMenuProvider = provider ?? null;
+  rebuildApplicationMenu();
+}
+
+function getCurrentLanguage() {
+  return currentLanguage;
 }
 
 function getWindowForIpcEvent(event) {
@@ -208,14 +304,155 @@ function getWindowForIpcEvent(event) {
   } catch {
     // ignore
   }
-  return mainWindow;
+  return getMainWindow();
+}
+
+function pruneMainWindows() {
+  for (const win of Array.from(mainWindows)) {
+    if (!win || win.isDestroyed?.()) {
+      mainWindows.delete(win);
+      if (lastFocusedMainWindow === win) lastFocusedMainWindow = null;
+      if (mainWindow === win) mainWindow = null;
+    }
+  }
+}
+
+function pruneAppContentWindows() {
+  for (const win of Array.from(appContentWindows)) {
+    if (!win || win.isDestroyed?.()) {
+      appContentWindows.delete(win);
+      dirtyEditorWindows.delete(win);
+    }
+  }
+  for (const win of Array.from(dirtyEditorWindows)) {
+    if (!appContentWindows.has(win)) dirtyEditorWindows.delete(win);
+  }
+}
+
+function getMainWindowList() {
+  pruneMainWindows();
+  return Array.from(mainWindows).filter((win) => isWindowUsable(win));
+}
+
+function getAppContentWindowList() {
+  pruneAppContentWindows();
+  return Array.from(appContentWindows).filter((win) => isWindowUsable(win));
+}
+
+function getDirtyEditorWindowList() {
+  pruneAppContentWindows();
+  return Array.from(dirtyEditorWindows).filter((win) => isWindowUsable(win));
+}
+
+function rememberMainWindow(win) {
+  if (!win || win.isDestroyed?.()) return;
+  lastFocusedMainWindow = win;
+  mainWindow = win;
+}
+
+function registerAppContentWindow(win, options = {}) {
+  if (!win || win.isDestroyed?.()) return;
+  appContentWindows.add(win);
+  if (options.queryDirtyEditors === true) dirtyEditorWindows.add(win);
+}
+
+function unregisterAppContentWindow(win) {
+  if (!win) return;
+  appContentWindows.delete(win);
+  dirtyEditorWindows.delete(win);
+}
+
+function registerMainWindow(win) {
+  if (!win || win.isDestroyed?.()) return;
+  registerAppContentWindow(win, { queryDirtyEditors: true });
+  mainWindows.add(win);
+  rememberMainWindow(win);
+  try {
+    win.on("focus", () => rememberMainWindow(win));
+  } catch {
+    // ignore
+  }
+}
+
+function unregisterMainWindow(win) {
+  if (!win) return;
+  mainWindows.delete(win);
+  unregisterAppContentWindow(win);
+  if (lastFocusedMainWindow === win) lastFocusedMainWindow = null;
+  if (mainWindow === win) mainWindow = null;
+  const fallback = getMainWindowList().at(-1) || null;
+  if (fallback) rememberMainWindow(fallback);
+}
+
+function forEachMainWindow(callback) {
+  for (const win of getMainWindowList()) {
+    try {
+      callback(win);
+    } catch {
+      // ignore per-window broadcast failures
+    }
+  }
+}
+
+function clampWindowOpacity(opacity) {
+  const value = Number(opacity);
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(1, Math.max(0.5, value));
+}
+
+function applyWindowOpacityToWindow(win) {
+  if (!win || win.isDestroyed?.()) return;
+  try {
+    win.setOpacity?.(currentWindowOpacity);
+  } catch {
+    // ignore
+  }
+}
+
+function applyWindowOpacity(opacity) {
+  currentWindowOpacity = clampWindowOpacity(opacity);
+  forEachMainWindow(applyWindowOpacityToWindow);
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    applyWindowOpacityToWindow(settingsWindow);
+  }
+  return currentWindowOpacity;
+}
+
+function getMainWindowCount() {
+  return getMainWindowList().length;
+}
+
+function isMainWindow(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  pruneMainWindows();
+  return mainWindows.has(win);
+}
+
+function closeBrowserWindow(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  try {
+    win.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function requestWindowCommandClose(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  try {
+    const webContents = win.webContents;
+    if (!webContents || webContents.isDestroyed?.()) return closeBrowserWindow(win);
+    webContents.send(WINDOW_COMMAND_CLOSE_CHANNEL);
+    return true;
+  } catch {
+    return closeBrowserWindow(win);
+  }
 }
 
 function broadcastLanguageChanged() {
   try {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents?.send?.("netcatty:languageChanged", currentLanguage);
-    }
+    forEachMainWindow((win) => win.webContents?.send?.("netcatty:languageChanged", currentLanguage));
     if (settingsWindow && !settingsWindow.isDestroyed()) {
       settingsWindow.webContents?.send?.("netcatty:languageChanged", currentLanguage);
     }
@@ -269,95 +506,10 @@ function getDevRendererBaseUrl(devServerUrl) {
   return fallback;
 }
 
-function hslToHex(h, s, l) {
-  const hue = ((h % 360) + 360) % 360;
-  const sat = Math.max(0, Math.min(100, s)) / 100;
-  const light = Math.max(0, Math.min(100, l)) / 100;
-
-  const c = (1 - Math.abs(2 * light - 1)) * sat;
-  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
-  const m = light - c / 2;
-
-  let r1 = 0;
-  let g1 = 0;
-  let b1 = 0;
-
-  if (hue < 60) {
-    r1 = c; g1 = x; b1 = 0;
-  } else if (hue < 120) {
-    r1 = x; g1 = c; b1 = 0;
-  } else if (hue < 180) {
-    r1 = 0; g1 = c; b1 = x;
-  } else if (hue < 240) {
-    r1 = 0; g1 = x; b1 = c;
-  } else if (hue < 300) {
-    r1 = x; g1 = 0; b1 = c;
-  } else {
-    r1 = c; g1 = 0; b1 = x;
-  }
-
-  const toHex = (n) => Math.round((n + m) * 255).toString(16).padStart(2, "0");
-  return `#${toHex(r1)}${toHex(g1)}${toHex(b1)}`;
-}
-
-function normalizeBackgroundColor(value) {
-  if (!value) return null;
-  const raw = String(value).trim();
-  if (!raw) return null;
-  if (raw.startsWith("#")) return raw;
-
-  const parts = raw.split(/\s+/).filter(Boolean);
-  if (parts.length < 3) return null;
-  const h = Number(parts[0]);
-  const s = Number(String(parts[1]).replace("%", ""));
-  const l = Number(String(parts[2]).replace("%", ""));
-  if (!Number.isFinite(h) || !Number.isFinite(s) || !Number.isFinite(l)) return null;
-  return hslToHex(h, s, l);
-}
-
-function parseBackgroundFromIndexHtml(indexHtml, theme) {
-  if (!indexHtml) return null;
-
-  const block =
-    theme === "dark"
-      ? indexHtml.match(/\.dark\s*\{[\s\S]*?\}/)
-      : indexHtml.match(/:root\s*\{[\s\S]*?\}/);
-
-  const within = block?.[0] || indexHtml;
-  const m = within.match(/--background:\s*([^;]+);/);
-  const raw = m?.[1]?.trim();
-  if (!raw) return null;
-
-  const parts = raw.split(/\s+/).filter(Boolean);
-  if (parts.length < 3) return null;
-
-  const h = Number(parts[0]);
-  const s = Number(String(parts[1]).replace("%", ""));
-  const l = Number(String(parts[2]).replace("%", ""));
-
-  if (!Number.isFinite(h) || !Number.isFinite(s) || !Number.isFinite(l)) return null;
-  return hslToHex(h, s, l);
-}
-
-function resolveIndexHtmlPath(electronDir) {
-  const dist = path.join(electronDir, "../dist/index.html");
-  const root = path.join(electronDir, "../index.html");
-  if (fs.existsSync(dist)) return dist;
-  if (fs.existsSync(root)) return root;
-  return dist;
-}
-
-function resolveFrontendBackgroundColor(electronDir, theme) {
-  try {
-    const htmlPath = resolveIndexHtmlPath(electronDir);
-    if (!htmlPath || !fs.existsSync(htmlPath)) return null;
-    const indexHtml = fs.readFileSync(htmlPath, "utf8");
-    return parseBackgroundFromIndexHtml(indexHtml, theme);
-  } catch {
-    return null;
-  }
-}
-
+const {
+  normalizeBackgroundColor,
+  resolveFrontendBackgroundColor,
+} = require("./windowManager/backgroundColor.cjs");
 function parseWindowOpenFeatures(features) {
   if (!features) return {};
   const parts = String(features)
@@ -385,267 +537,26 @@ function parseWindowOpenFeatures(features) {
  * Track open fallback browser windows so they are garbage-collected when the
  * BrowserWindow is destroyed.
  */
-const fallbackBrowserWindows = new Set();
-
-/**
- * Open a URL in a minimal in-app BrowserWindow. Used as a fallback when the
- * host OS cannot open the URL with the system browser (e.g. Tiny11 / Windows
- * with no default browser configured — error 0x483). The window is
- * intentionally stripped down:
- *   - no preload script (remote content must NEVER touch contextBridge)
- *   - sandboxed + contextIsolated renderer
- *   - a separate persisted session partition so cookies and storage do not
- *     leak into the main app session
- */
-function openFallbackBrowser(url, options = {}) {
-  const { backgroundColor, appIcon } = options;
-  const electron = require("electron");
-  const { BrowserWindow, screen } = electron;
-
-  // Size and center relative to the main window when possible.
-  let bounds = { width: 1100, height: 740 };
-  try {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      const mainBounds = mainWindow.getBounds();
-      const display = screen.getDisplayMatching(mainBounds);
-      const area = display.workArea;
-      const w = Math.min(1200, Math.round(area.width * 0.85));
-      const h = Math.min(800, Math.round(area.height * 0.85));
-      bounds = {
-        width: w,
-        height: h,
-        x: Math.round(area.x + (area.width - w) / 2),
-        y: Math.round(area.y + (area.height - h) / 2),
-      };
-    }
-  } catch {
-    // Fall through to default bounds.
-  }
-
-  const win = new BrowserWindow({
-    ...bounds,
-    title: url,
-    backgroundColor: backgroundColor || THEME_COLORS[currentTheme]?.background,
-    icon: appIcon,
-    show: false,
-    autoHideMenuBar: true,
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
-      webSecurity: true,
-      // Isolated session so users' browsing does not mix with main app state.
-      partition: "persist:netcatty-fallback-browser",
-    },
-  });
-
-  fallbackBrowserWindows.add(win);
-  win.on("closed", () => {
-    fallbackBrowserWindows.delete(win);
-  });
-
-  // Reflect the loaded page title in the window bar; fall back to the URL.
-  try {
-    win.webContents.on("page-title-updated", (_event, title) => {
-      try {
-        win.setTitle(title || url);
-      } catch {
-        // ignore
-      }
-    });
-  } catch {
-    // ignore
-  }
-
-  // Popups inside the fallback browser: open them in another fallback window
-  // rather than looping back through shell.openExternal (which is what
-  // failed in the first place). These popups are fire-and-forget, so we
-  // explicitly catch the `loaded` rejection to avoid unhandledRejection.
-  try {
-    win.webContents.setWindowOpenHandler((details) => {
-      const targetUrl = details?.url;
-      if (targetUrl && typeof targetUrl === "string" && /^https?:/i.test(targetUrl)) {
-        try {
-          const popup = openFallbackBrowser(targetUrl, { backgroundColor, appIcon });
-          popup.loaded.catch((err) => {
-            console.warn("[windowManager] fallback popup loadURL failed:", err?.message || err);
-          });
-        } catch (popupErr) {
-          console.warn("[windowManager] fallback popup open failed:", popupErr?.message || popupErr);
-        }
-      }
-      return { action: "deny" };
-    });
-  } catch {
-    // ignore
-  }
-
-  // Minimal keyboard navigation: Alt+← / Alt+→ / Ctrl/Cmd+R.
-  try {
-    win.webContents.on("before-input-event", (_event, input) => {
-      if (input.type !== "keyDown") return;
-      try {
-        const history = win.webContents.navigationHistory;
-        if (input.alt && input.key === "ArrowLeft" && history?.canGoBack?.()) {
-          history.goBack();
-        } else if (input.alt && input.key === "ArrowRight" && history?.canGoForward?.()) {
-          history.goForward();
-        } else if ((input.control || input.meta) && typeof input.key === "string" && input.key.toLowerCase() === "r") {
-          win.webContents.reload();
-        }
-      } catch {
-        // ignore navigation errors
-      }
-    });
-  } catch {
-    // ignore
-  }
-
-  win.once("ready-to-show", () => {
-    try {
-      win.show();
-    } catch {
-      // ignore
-    }
-  });
-
-  // Return the window together with its initial-load Promise. Callers that
-  // care about whether the page actually loaded can await `loaded`; fire-
-  // and-forget callers must still catch the rejection themselves to avoid
-  // turning it into an unhandledRejection.
-  const loaded = win.loadURL(url);
-
-  return { window: win, loaded };
-}
-
-/**
- * Try to open a URL with the OS default browser via shell.openExternal; if
- * that fails (e.g. no default browser configured), fall back to the in-app
- * BrowserWindow. Resolves on success (either via system browser, or when
- * the in-app fallback window finishes its initial load). Throws on total
- * failure so callers that rely on rejection semantics (e.g. OAuth flows
- * waiting on a Promise.race) still abort cleanly when no browser path is
- * available.
- */
-async function tryOpenExternalWithFallback(shell, url, options = {}) {
-  if (!url || typeof url !== "string" || !/^https?:/i.test(url)) {
-    throw new Error("openExternal: invalid URL");
-  }
-  try {
-    await shell?.openExternal?.(url);
-    return;
-  } catch (err) {
-    const message = err?.message || String(err);
-    console.warn("[windowManager] shell.openExternal failed, using in-app fallback:", message);
-
-    let fallback;
-    try {
-      fallback = openFallbackBrowser(url, options);
-    } catch (createErr) {
-      console.warn("[windowManager] fallback browser creation failed:", createErr?.message || createErr);
-      throw err instanceof Error ? err : new Error(message);
-    }
-
-    try {
-      // Wait for the fallback window's initial load. If the URL is
-      // unreachable or malformed, loadURL rejects — surface that as a real
-      // failure so callers (e.g. OAuth flows) can cancel early instead of
-      // waiting for a downstream timeout.
-      await fallback.loaded;
-      return;
-    } catch (loadErr) {
-      console.warn("[windowManager] fallback browser loadURL failed:", loadErr?.message || loadErr);
-      try {
-        if (fallback.window && !fallback.window.isDestroyed()) {
-          fallback.window.close();
-        }
-      } catch {
-        // ignore cleanup errors
-      }
-      throw err instanceof Error ? err : new Error(message);
-    }
-  }
-}
-
-function createExternalOnlyWindowOpenHandler(shell, options = {}) {
-  return (details) => {
-    const targetUrl = details?.url;
-    if (targetUrl && typeof targetUrl === "string" && /^https?:/i.test(targetUrl)) {
-      // Run async fallback path without blocking the window-open decision.
-      tryOpenExternalWithFallback(shell, targetUrl, options).catch((err) => {
-        console.warn("[windowManager] tryOpenExternalWithFallback threw:", err?.message || err);
-      });
-    }
-    return { action: "deny" };
-  };
-}
-
-function createAppWindowOpenHandler(shell, { backgroundColor, appIcon }) {
-  const allowedPopupHosts = new Set([
-    // OAuth (PKCE loopback)
-    "accounts.google.com",
-    "login.microsoftonline.com",
-    "login.live.com",
-  ]);
-
-  const isAllowedInAppPopupUrl = (rawUrl) => {
-    try {
-      const u = new URL(String(rawUrl));
-      if (u.protocol === "https:") {
-        return allowedPopupHosts.has(u.hostname);
-      }
-      if (u.protocol === "http:") {
-        // Allow ONLY the loopback OAuth callback page.
-        const isLoopback =
-          u.hostname === "127.0.0.1" || u.hostname === "localhost";
-        return isLoopback && u.port === String(OAUTH_LOOPBACK_PORT) && u.pathname === "/oauth/callback";
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  };
-
-  return (details) => {
-    const targetUrl = details?.url;
-    if (!targetUrl || typeof targetUrl !== "string" || !/^https?:/i.test(targetUrl)) {
-      return { action: "deny" };
-    }
-
-    // Default: open in system browser to reduce remote-content attack surface.
-    if (!isAllowedInAppPopupUrl(targetUrl)) {
-      // Try system browser first, fall back to an in-app BrowserWindow when
-      // the OS has no handler for the URL (see tryOpenExternalWithFallback).
-      tryOpenExternalWithFallback(shell, targetUrl, { backgroundColor, appIcon }).catch((err) => {
-        console.warn("[windowManager] tryOpenExternalWithFallback threw:", err?.message || err);
-      });
-      return { action: "deny" };
-    }
-
-    const size = parseWindowOpenFeatures(details?.features);
-    return {
-      action: "allow",
-      overrideBrowserWindowOptions: {
-        width: size.width || OAUTH_DEFAULT_WIDTH,
-        height: size.height || OAUTH_DEFAULT_HEIGHT,
-        minWidth: 420,
-        minHeight: 560,
-        backgroundColor,
-        icon: appIcon,
-        autoHideMenuBar: true,
-        menuBarVisible: false,
-        title: "Netcatty Authorization",
-        webPreferences: {
-          contextIsolation: true,
-          nodeIntegration: false,
-          // Sandboxed because this window renders remote content and does not need a preload bridge.
-          sandbox: true,
-          v8CacheOptions: V8_CACHE_OPTIONS,
-        },
-      },
-    };
-  };
-}
+const { createExternalWindowApi } = require("./windowManager/externalWindows.cjs");
+const externalWindowApi = createExternalWindowApi({
+  get mainWindow() { return mainWindow; },
+  get currentTheme() { return currentTheme; },
+  THEME_COLORS,
+  OAUTH_DEFAULT_WIDTH,
+  OAUTH_DEFAULT_HEIGHT,
+  V8_CACHE_OPTIONS,
+  require,
+  console,
+  URL,
+  parseWindowOpenFeatures,
+  oauthBridge,
+});
+const {
+  openFallbackBrowser,
+  tryOpenExternalWithFallback,
+  createExternalOnlyWindowOpenHandler,
+  createAppWindowOpenHandler,
+} = externalWindowApi;
 
 function attachOAuthLoadingOverlay(win) {
   if (!win || win.isDestroyed?.()) return;
@@ -812,6 +723,11 @@ function resolveRendererReady(wcId) {
   }
 }
 
+function clearRendererReadyForWebContents(wcId) {
+  if (!wcId) return;
+  rendererReadySeenByWebContentsId.delete(wcId);
+}
+
 function isWindowUsable(win, options = {}) {
   const requireVisible = options.requireVisible === true;
   if (!win || typeof win.isDestroyed !== "function" || win.isDestroyed()) {
@@ -917,322 +833,121 @@ function waitForRendererReady(win, { timeoutMs = 15000 } = {}) {
 }
 
 /**
- * Create the main application window
+ * Wait for a freshly created window's renderer to report ready, then deliver an
+ * IPC message to it. The renderer only registers its IPC listeners (and reports
+ * ready) after React mounts, and Electron does not queue messages for listeners
+ * that do not exist yet. So if readiness times out we must NOT send — the
+ * message would be silently dropped, leaving the window blank while the caller
+ * still saw "success". Returning a failure here lets the caller surface the
+ * existing error path instead.
  */
-async function createWindow(electronModule, options) {
-  const { BrowserWindow, nativeTheme, app, screen, shell } = electronModule;
-  const { preload, devServerUrl, isDev, appIcon, isMac, onRegisterBridge, electronDir } = options;
-
-  // Store app reference for window state persistence
-  electronApp = app;
-
-  const osTheme = nativeTheme?.shouldUseDarkColors ? "dark" : "light";
-  const effectiveTheme = currentTheme === "dark" || currentTheme === "light" ? currentTheme : osTheme;
-  const frontendBackground = resolveFrontendBackgroundColor(electronDir || __dirname, effectiveTheme);
-  const backgroundColor = frontendBackground || "#1a1a1a";
-  const themeConfig = THEME_COLORS[effectiveTheme] || THEME_COLORS.light;
-
-  // Load saved window state
-  const savedState = loadWindowState();
-  let windowBounds = {
-    width: DEFAULT_WINDOW_WIDTH,
-    height: DEFAULT_WINDOW_HEIGHT,
-  };
-
-  if (savedState) {
-    // Use saved dimensions, but clamp to the minimum so a previously
-    // shrunk window from an older build cannot start below the minimum.
-    windowBounds.width = Math.max(savedState.width, MIN_WINDOW_WIDTH);
-    windowBounds.height = Math.max(savedState.height, MIN_WINDOW_HEIGHT);
-
-    // Only use saved position if the screen is available at that location
-    if (typeof savedState.x === "number" && typeof savedState.y === "number") {
-      try {
-        // Check if the saved position is within any available display
-        const displays = screen?.getAllDisplays?.() || [];
-        const isPositionVisible = displays.some((display) => {
-          const { x, y, width, height } = display.bounds;
-          // Check if at least part of the window would be visible on this display
-          return (
-            savedState.x < x + width &&
-            savedState.x + savedState.width > x &&
-            savedState.y < y + height &&
-            savedState.y + savedState.height > y
-          );
-        });
-
-        if (isPositionVisible) {
-          windowBounds.x = savedState.x;
-          windowBounds.y = savedState.y;
-        }
-      } catch {
-        // Ignore screen check errors, just don't set position
-      }
-    }
-  }
-
-  const win = new BrowserWindow({
-    ...windowBounds,
-    minWidth: MIN_WINDOW_WIDTH,
-    minHeight: MIN_WINDOW_HEIGHT,
-    backgroundColor,
-    icon: appIcon,
-    show: false,
-    frame: isMac,
-    titleBarStyle: isMac ? "hiddenInset" : undefined,
-    trafficLightPosition: isMac ? { x: 12, y: 12 } : undefined,
-    webPreferences: {
-      preload,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false,
-      v8CacheOptions: V8_CACHE_OPTIONS,
-    },
-  });
-
-  mainWindow = win;
-
-  // Clear reference when the main window is destroyed
-  win.on('closed', () => {
-    try {
-      if (win?.webContents?.id) {
-        unhealthyWebContentsIds.delete(win.webContents.id);
-        rendererReadySeenByWebContentsId.delete(win.webContents.id);
-      }
-    } catch {
-      // ignore
-    }
-    if (mainWindow === win) mainWindow = null;
-  });
-
-  // Log renderer crashes for diagnostics (skip normal clean exits)
-  win.webContents.on("render-process-gone", (_event, details) => {
-    if (details?.reason === "clean-exit") return;
-    try {
-      if (win.webContents?.id) {
-        unhealthyWebContentsIds.add(win.webContents.id);
-      }
-    } catch {
-      // ignore
-    }
-    try {
-      const crashLogBridge = require("./crashLogBridge.cjs");
-      crashLogBridge.captureError("render-process-gone", new Error(
-        `Renderer process gone: reason=${details?.reason}, exitCode=${details?.exitCode}`
-      ), { reason: details?.reason, exitCode: details?.exitCode });
-    } catch {}
-    console.error("[WindowManager] Renderer process gone:", details);
-  });
-
-  // Prevent top-level navigation away from the app origin. If a remote origin ever
-  // loads in a privileged window (with preload), it can become an RCE vector.
-  const allowedOrigins = new Set(["app://netcatty"]);
-  if (isDev && devServerUrl) {
-    try {
-      allowedOrigins.add(new URL(getDevRendererBaseUrl(devServerUrl)).origin);
-    } catch {
-      // ignore invalid dev server URL
-    }
-  }
-  const isAllowedTopLevelUrl = (targetUrl) => {
-    try {
-      return allowedOrigins.has(new URL(String(targetUrl)).origin);
-    } catch {
-      return false;
-    }
-  };
-  const blockUntrustedNavigation = (event, targetUrl) => {
-    if (isAllowedTopLevelUrl(targetUrl)) return;
-    try {
-      event.preventDefault();
-    } catch {
-      // ignore
-    }
-    debugLog("Blocked navigation to untrusted origin", { targetUrl });
-  };
-  win.webContents.on("will-navigate", blockUntrustedNavigation);
-  win.webContents.on("will-redirect", blockUntrustedNavigation);
-
-  // Prevent Chromium from consuming Alt+Arrow as browser back/forward navigation.
-  // Terminal apps need these keys to pass through to the remote shell (e.g., byobu, tmux).
-  // Using setIgnoreMenuShortcuts lets the keydown still reach the page (xterm.js)
-  // while preventing Chromium's built-in shortcuts from triggering.
-  win.webContents.on("before-input-event", (_event, input) => {
-    if (input.alt && !input.control && !input.meta) {
-      if (input.key === "ArrowLeft" || input.key === "ArrowRight") {
-        win.webContents.setIgnoreMenuShortcuts(true);
-        return;
-      }
-    }
-    win.webContents.setIgnoreMenuShortcuts(false);
-  });
-
-  // Restore maximized state if it was saved
-  if (savedState?.isMaximized && !savedState?.isFullScreen) {
-    win.once("ready-to-show", () => {
-      try {
-        win.maximize();
-      } catch {
-        // ignore
-      }
-    });
-  }
-
-  // Track window bounds for saving (use last non-maximized/non-fullscreen bounds)
-  let lastNormalBounds = null;
-  let saveStateTimer = null;
-
-  const updateNormalBounds = () => {
-    if (!win.isDestroyed() && !win.isMaximized() && !win.isFullScreen()) {
-      lastNormalBounds = win.getBounds();
-    }
-  };
-
-  const scheduleSaveState = () => {
-    if (saveStateTimer) clearTimeout(saveStateTimer);
-    saveStateTimer = setTimeout(() => {
-      const state = getWindowBoundsState(win, lastNormalBounds);
-      if (state) queueWindowStateSave(state);
-    }, 500);
-  };
-
-  // Update normal bounds on resize/move when not maximized/fullscreen
-  win.on("resize", () => {
-    updateNormalBounds();
-    scheduleSaveState();
-  });
-
-  win.on("move", () => {
-    updateNormalBounds();
-    scheduleSaveState();
-  });
-
-  win.on("maximize", scheduleSaveState);
-  win.on("unmaximize", () => {
-    updateNormalBounds();
-    scheduleSaveState();
-  });
-
-  // Save state when window is about to close
-  win.on("close", (event) => {
-    // Check if close-to-tray is enabled
-    if (!isQuitting && getGlobalShortcutBridge().handleWindowClose(event, win)) {
-      // Window was hidden to tray - save state before returning
-      if (saveStateTimer) clearTimeout(saveStateTimer);
-      const state = getWindowBoundsState(win, lastNormalBounds);
-      if (state) saveWindowStateSync(state);
-      hideSettingsWindow();
-      return;
-    }
-
-    if (windowStateCloseRequested) {
-      return;
-    }
-    windowStateCloseRequested = true;
-    if (saveStateTimer) clearTimeout(saveStateTimer);
-    const state = getWindowBoundsState(win, lastNormalBounds);
-    if (pendingWindowStateWrite) {
-      event.preventDefault();
-      if (state) queuedWindowState = state;
-      pendingWindowStateWrite
-        .catch(() => {
-          // ignore async write errors before closing
-        })
-        .finally(() => {
-          const finalState = getWindowBoundsState(win, lastNormalBounds);
-          if (finalState) saveWindowStateSync(finalState);
-          closeSettingsWindow();
-          try {
-            win.close();
-          } catch {
-            // ignore
-          }
-        });
-      return;
-    }
-    if (state) saveWindowStateSync(state);
-    closeSettingsWindow();
-  });
-
-  const safeSend = (channel, ...args) => {
-    try {
-      if (!win.isDestroyed() && win.webContents && !win.webContents.isDestroyed()) {
-        win.webContents.send(channel, ...args);
-      }
-    } catch {
-      // Render frame disposed during HMR / reload – safe to ignore
-    }
-  };
-
-  win.on("enter-full-screen", () => {
-    safeSend("netcatty:window:fullscreen-changed", true);
-    scheduleSaveState();
-  });
-
-  win.on("leave-full-screen", () => {
-    safeSend("netcatty:window:fullscreen-changed", false);
-    updateNormalBounds();
-    scheduleSaveState();
-  });
-
-  // Ensure native background matches frontend background, even before first paint.
+async function sendWhenRendererReady(win, channel, payload, options = {}) {
+  const {
+    timeoutMs = 8000,
+    waitForReady = waitForRendererReady,
+    shouldSend,
+    cancelReason = "cancelled",
+  } = options;
   try {
-    win.setBackgroundColor(backgroundColor);
+    await waitForReady(win, { timeoutMs });
+  } catch (err) {
+    if (typeof shouldSend === "function" && shouldSend() === false) {
+      return { success: false, reason: cancelReason };
+    }
+    return {
+      success: false,
+      error: "New window did not become ready in time",
+      reason: err?.message || String(err),
+    };
+  }
+  if (win?.isDestroyed?.() || win?.webContents?.isDestroyed?.()) {
+    return { success: false, error: "Window closed before message could be delivered" };
+  }
+  if (typeof shouldSend === "function" && shouldSend() === false) {
+    return { success: false, reason: cancelReason };
+  }
+  win.webContents.send(channel, payload);
+  return { success: true };
+}
+
+function resolveLiveAppIcon(fallback = null) {
+  try {
+    const appIconManager = require("./appIconManager.cjs");
+    const appPath = electronApp?.getAppPath?.();
+    if (appPath) {
+      const iconPath = appIconManager.getAppIconPath(appPath);
+      if (iconPath) return iconPath;
+    }
   } catch {
     // ignore
   }
-
-  // Defer show until renderer is ready; use fallback timeout to avoid keeping window hidden forever.
-  // Production gets a shorter timeout since the splash screen provides visual feedback.
-  setupDeferredShow(win, { timeoutMs: isDev ? 3000 : 1500 });
-
-  win.webContents.on("did-create-window", (childWindow) => {
-    try {
-      childWindow.setMenuBarVisibility(false);
-      childWindow.autoHideMenuBar = true;
-      childWindow.removeMenu();
-    } catch {
-      // ignore
-    }
-    try {
-      if (appIcon && childWindow.setIcon) childWindow.setIcon(appIcon);
-    } catch {
-      // ignore
-    }
-    // Never allow chained popups from remote content windows.
-    try {
-      childWindow.webContents?.setWindowOpenHandler?.(createExternalOnlyWindowOpenHandler(shell));
-    } catch {
-      // ignore
-    }
-    attachOAuthLoadingOverlay(childWindow);
-  });
-
-  win.webContents.setWindowOpenHandler(
-    createAppWindowOpenHandler(shell, { backgroundColor, appIcon })
-  );
-
-  // Register window control handlers
-  registerWindowHandlers(electronModule.ipcMain, nativeTheme);
-
-  // Register IPC handlers BEFORE loading any URL so the renderer never
-  // calls a handler that hasn't been registered yet.
-  onRegisterBridge?.(win);
-
-  if (isDev) {
-    try {
-      await win.loadURL(getDevRendererBaseUrl(devServerUrl));
-      win.webContents.openDevTools({ mode: "detach" });
-      return win;
-    } catch (e) {
-      console.warn("Dev server not reachable, falling back to bundled dist.", e);
-    }
-  }
-
-  // Production mode - load via custom protocol.
-  await win.loadURL("app://netcatty/index.html");
-  return win;
+  return fallback;
 }
+
+/**
+ * Create the main application window
+ */
+const {
+  createMainWindowApi,
+  setTerminalKeyboardFocusForWindow,
+} = require("./windowManager/mainWindow.cjs");
+const mainWindowApi = createMainWindowApi({
+  get mainWindow() { return mainWindow; },
+  set mainWindow(value) { mainWindow = value; },
+  get electronApp() { return electronApp; },
+  set electronApp(value) { electronApp = value; },
+  get currentTheme() { return currentTheme; },
+  get isQuitting() { return isQuitting; },
+  get pendingWindowStateWrite() { return pendingWindowStateWrite; },
+  set pendingWindowStateWrite(value) { pendingWindowStateWrite = value; },
+  get queuedWindowState() { return queuedWindowState; },
+  set queuedWindowState(value) { queuedWindowState = value; },
+  get windowStateCloseRequested() { return windowStateCloseRequested; },
+  set windowStateCloseRequested(value) { windowStateCloseRequested = value; },
+  DEFAULT_WINDOW_WIDTH,
+  DEFAULT_WINDOW_HEIGHT,
+  MIN_WINDOW_WIDTH,
+  MIN_WINDOW_HEIGHT,
+  V8_CACHE_OPTIONS,
+  THEME_COLORS,
+  unhealthyWebContentsIds,
+  rendererReadySeenByWebContentsId,
+  __dirname,
+  URL,
+  require,
+  console,
+  setTimeout,
+  clearTimeout,
+  getGlobalShortcutBridge,
+  debugLog,
+  resolveFrontendBackgroundColor,
+  loadWindowState,
+  getDevRendererBaseUrl,
+  getWindowBoundsState,
+  queueWindowStateSave,
+  saveWindowStateSync,
+  setupDeferredShow,
+  clearRendererReadyForWebContents,
+  createExternalOnlyWindowOpenHandler,
+  createAppWindowOpenHandler,
+  attachOAuthLoadingOverlay,
+  queryDirtyEditors: (...args) => require("./dirtyEditorGuard.cjs").queryDirtyEditors(...args),
+  registerWindowHandlers,
+  requestWindowCommandClose,
+  shouldCloseWindowFromInput,
+  registerMainWindow,
+  unregisterMainWindow,
+  registerAppContentWindow,
+  unregisterAppContentWindow,
+  notifyAppContentWindowClosed,
+  setAppContentWindowClosedHandler,
+  getMainWindowCount,
+  applyWindowOpacityToWindow,
+  resolveLiveAppIcon,
+  closeSettingsWindow: (...args) => closeSettingsWindow(...args),
+  hideSettingsWindow: (...args) => hideSettingsWindow(...args),
+});
+const { createWindow } = mainWindowApi;
 
 /**
  * Create or focus the settings window
@@ -1255,256 +970,56 @@ async function createWindow(electronModule, options) {
  * calling `webContents.focus()` covers (2) so the renderer marks the page as
  * focused regardless of whether the OS granted foreground.
  */
-function showAndFocusWindow(win) {
-  if (!win || win.isDestroyed()) return;
-  try {
-    win.show();
-  } catch {
-    // ignore
-  }
-  if (process.platform === "win32") {
-    try {
-      win.setAlwaysOnTop(true);
-      win.focus();
-      win.setAlwaysOnTop(false);
-    } catch {
-      // ignore
-    }
-  } else {
-    try {
-      win.focus();
-    } catch {
-      // ignore
-    }
-  }
-  try {
-    if (win.webContents && !win.webContents.isDestroyed()) {
-      win.webContents.focus();
-    }
-  } catch {
-    // ignore
-  }
-}
+const { createSettingsWindowApi } = require("./windowManager/settingsWindow.cjs");
+const settingsWindowApi = createSettingsWindowApi({
+  get settingsWindow() { return settingsWindow; },
+  set settingsWindow(value) { settingsWindow = value; },
+  get mainWindow() { return mainWindow; },
+  get currentTheme() { return currentTheme; },
+  get isQuitting() { return isQuitting; },
+  V8_CACHE_OPTIONS,
+  THEME_COLORS,
+  __dirname,
+  process,
+  URL,
+  debugLog,
+  resolveFrontendBackgroundColor,
+  createAppWindowOpenHandler,
+  createExternalOnlyWindowOpenHandler,
+  resolveLiveAppIcon,
+  getDevRendererBaseUrl,
+  applyWindowOpacityToWindow,
+});
+const {
+  restoreWindowInputFocus,
+  showAndFocusWindow,
+  isLiveWindow,
+  resolveSettingsWindowBounds,
+  centerSettingsWindowOnSourceDisplay,
+  openSettingsWindow,
+  closeSettingsWindow,
+  hideSettingsWindow,
+  prewarmSettingsWindow,
+} = settingsWindowApi;
 
-async function openSettingsWindow(electronModule, options, { showOnLoad = true } = {}) {
-  const { BrowserWindow, shell } = electronModule;
-  const { preload, devServerUrl, isDev, appIcon, isMac, electronDir } = options;
-
-  // If settings window already exists, show and focus it
-  if (settingsWindow && !settingsWindow.isDestroyed()) {
-    showAndFocusWindow(settingsWindow);
-    return settingsWindow;
-  }
-
-  const osTheme = electronModule?.nativeTheme?.shouldUseDarkColors ? "dark" : "light";
-  const effectiveTheme = currentTheme === "dark" || currentTheme === "light" ? currentTheme : osTheme;
-  const frontendBackground = resolveFrontendBackgroundColor(electronDir || __dirname, effectiveTheme);
-  const backgroundColor = frontendBackground || "#1a1a1a";
-  const themeConfig = THEME_COLORS[effectiveTheme] || THEME_COLORS.light;
-
-  // Center the settings window on the same display as the main window
-  const settingsWidth = 980;
-  const settingsHeight = 720;
-  let settingsX, settingsY;
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    const { screen } = electronModule;
-    const mainBounds = mainWindow.getBounds();
-    const display = screen.getDisplayMatching(mainBounds);
-    const { x: dx, y: dy, width: dw, height: dh } = display.workArea;
-    settingsX = Math.round(dx + (dw - settingsWidth) / 2);
-    settingsY = Math.round(dy + (dh - settingsHeight) / 2);
-  }
-
-  const win = new BrowserWindow({
-    title: "netcatty Settings",
-    width: settingsWidth,
-    height: settingsHeight,
-    ...(settingsX !== undefined && settingsY !== undefined ? { x: settingsX, y: settingsY } : {}),
-    minWidth: 820,
-    minHeight: 600,
-    backgroundColor,
-    icon: appIcon,
-    fullscreenable: !isMac,
-    // NOTE: Do NOT set parent - on macOS this causes rendering issues when dragging
-    // the window to a different screen (the window becomes invisible while still
-    // appearing in "Show All Windows" in the Dock). On Windows it can cause the
-    // main window to close when the settings window is closed.
-    modal: false,
-    show: false,
-    frame: isMac,
-    titleBarStyle: isMac ? "hiddenInset" : undefined,
-    trafficLightPosition: isMac ? { x: 12, y: 12 } : undefined,
-    webPreferences: {
-      preload,
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false,
-      v8CacheOptions: V8_CACHE_OPTIONS,
-    },
-  });
-
-  settingsWindow = win;
-
-  // Open external links in system browser by default, and allow only known OAuth hosts in-app.
-  try {
-    win.webContents?.setWindowOpenHandler?.(
-      createAppWindowOpenHandler(shell, { backgroundColor, appIcon })
-    );
-  } catch {
-    // ignore
-  }
-
-  // Never allow chained popups from remote content windows spawned from settings.
-  win.webContents?.on?.("did-create-window", (childWindow) => {
-    try {
-      childWindow.webContents?.setWindowOpenHandler?.(createExternalOnlyWindowOpenHandler(shell));
-    } catch {
-      // ignore
-    }
-  });
-
-  // Same navigation hardening as the main window (settings has preload access too).
-  const allowedOrigins = new Set(["app://netcatty"]);
-  if (isDev && devServerUrl) {
-    try {
-      allowedOrigins.add(new URL(getDevRendererBaseUrl(devServerUrl)).origin);
-    } catch {
-      // ignore invalid dev server URL
-    }
-  }
-  const isAllowedTopLevelUrl = (targetUrl) => {
-    try {
-      return allowedOrigins.has(new URL(String(targetUrl)).origin);
-    } catch {
-      return false;
-    }
-  };
-  const blockUntrustedNavigation = (event, targetUrl) => {
-    if (isAllowedTopLevelUrl(targetUrl)) return;
-    try {
-      event.preventDefault();
-    } catch {
-      // ignore
-    }
-    debugLog("Blocked navigation to untrusted origin (settings)", { targetUrl });
-  };
-  win.webContents.on("will-navigate", blockUntrustedNavigation);
-  win.webContents.on("will-redirect", blockUntrustedNavigation);
-
-  if (isMac) {
-    try {
-      win.setWindowButtonVisibility(true);
-    } catch {
-      // ignore
-    }
-  }
-
-  const safeSend = (channel, ...args) => {
-    try {
-      if (!win.isDestroyed() && win.webContents && !win.webContents.isDestroyed()) {
-        win.webContents.send(channel, ...args);
-      }
-    } catch {
-      // Render frame disposed during HMR / reload – safe to ignore
-    }
-  };
-
-  win.on("enter-full-screen", () => {
-    safeSend("netcatty:window:fullscreen-changed", true);
-  });
-
-  win.on("leave-full-screen", () => {
-    safeSend("netcatty:window:fullscreen-changed", false);
-  });
-
-  // Ensure native background matches frontend background, even before first paint.
-  try {
-    win.setBackgroundColor(backgroundColor);
-  } catch {
-    // ignore
-  }
-
-  // Hide instead of close so the window can be reused instantly.
-  // When the app is quitting, allow normal close/destroy.
-  win.on('close', (event) => {
-    if (!isQuitting) {
-      event.preventDefault();
-      try {
-        win.hide();
-      } catch {
-        // ignore
-      }
-    }
-  });
-
-  // Clean up reference when actually destroyed
-  win.on('closed', () => {
-    settingsWindow = null;
-  });
-
-  // Prevent HTML <title> from overriding the window title
-  win.on('page-title-updated', (e) => { e.preventDefault(); });
-
-  // Load the settings page
-  const settingsPath = '/#/settings';
-
-  if (isDev) {
-    try {
-      const baseUrl = getDevRendererBaseUrl(devServerUrl);
-      await win.loadURL(`${baseUrl}${settingsPath}`);
-      if (showOnLoad) { showAndFocusWindow(win); }
-      return win;
-    } catch (e) {
-      console.warn("Dev server not reachable for settings window", e);
-    }
-  }
-
-  // Production mode - load via custom protocol.
-  await win.loadURL("app://netcatty/index.html#/settings");
-  if (showOnLoad) { showAndFocusWindow(win); }
-
-  return win;
-}
-
-/**
- * Destroy the settings window (used when the app is quitting).
- */
-function closeSettingsWindow() {
-  if (settingsWindow && !settingsWindow.isDestroyed()) {
-    try {
-      settingsWindow.destroy();
-    } catch {
-      // ignore
-    }
-    settingsWindow = null;
-  }
-}
-
-/**
- * Hide the settings window without destroying it (used when main window hides to tray).
- */
-function hideSettingsWindow() {
-  if (settingsWindow && !settingsWindow.isDestroyed()) {
-    try {
-      settingsWindow.hide();
-    } catch {
-      // ignore
-    }
-  }
-}
-
-/**
- * Pre-warm the settings window in the background so that opening it later is instant.
- * The window is created hidden and fully loaded; `openSettingsWindow` will simply show it.
- */
-async function prewarmSettingsWindow(electronModule, options) {
-  if (settingsWindow && !settingsWindow.isDestroyed()) return;
-  try {
-    await openSettingsWindow(electronModule, options, { showOnLoad: false });
-  } catch (err) {
-    debugLog("Failed to pre-warm settings window", { error: String(err) });
-  }
-}
+const { createTerminalPopupWindowApi } = require("./windowManager/terminalPopupWindow.cjs");
+const terminalPopupWindowApi = createTerminalPopupWindowApi({
+  get mainWindow() { return mainWindow; },
+  get currentTheme() { return currentTheme; },
+  V8_CACHE_OPTIONS,
+  __dirname,
+  resolveFrontendBackgroundColor,
+  createExternalOnlyWindowOpenHandler,
+  getDevRendererBaseUrl,
+  applyWindowOpacityToWindow,
+  sendWhenRendererReady,
+  showAndFocusWindow,
+  resolveSettingsWindowBounds,
+  registerAppContentWindow,
+  unregisterAppContentWindow,
+  notifyAppContentWindowClosed,
+});
+const { openTerminalPopupWindow, closeTerminalPopupWindow } = terminalPopupWindowApi;
 
 /**
  * Register window control IPC handlers (only once)
@@ -1515,6 +1030,7 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
     return;
   }
   handlersRegistered = true;
+  cachedNativeTheme = nativeTheme;
 
   ipcMain.handle("netcatty:window:minimize", (event) => {
     const win = getWindowForIpcEvent(event);
@@ -1568,17 +1084,37 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
     return false;
   });
 
+  ipcMain.handle("netcatty:window:focus", (event) => {
+    const win = getWindowForIpcEvent(event);
+    return restoreWindowInputFocus(win);
+  });
+
+  ipcMain.on("netcatty:window:set-terminal-keyboard-focus", (event, payload) => {
+    const win = getWindowForIpcEvent(event);
+    setTerminalKeyboardFocusForWindow(win, payload?.focused === true);
+  });
+
+  ipcMain.handle("netcatty:window:setTitle", (event, title) => {
+    const win = getWindowForIpcEvent(event);
+    if (!win || win.isDestroyed()) return false;
+    const value = typeof title === "string" ? title.trim() : "";
+    try {
+      win.setTitle(value || "Netcatty");
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
   ipcMain.handle("netcatty:setTheme", (_event, theme) => {
     currentTheme = theme;
     nativeTheme.themeSource = theme;
+    rebuildApplicationMenu();
     const effectiveTheme = theme === "system"
       ? (nativeTheme?.shouldUseDarkColors ? "dark" : "light")
       : theme;
     const themeConfig = THEME_COLORS[effectiveTheme] || THEME_COLORS.light;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setBackgroundColor(themeConfig.background);
-    }
-    // Also update settings window if open
+    forEachMainWindow((win) => win.setBackgroundColor(themeConfig.background));
     if (settingsWindow && !settingsWindow.isDestroyed()) {
       settingsWindow.setBackgroundColor(themeConfig.background);
     }
@@ -1588,13 +1124,28 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   ipcMain.handle("netcatty:setBackgroundColor", (_event, color) => {
     const normalized = normalizeBackgroundColor(color);
     if (!normalized) return false;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setBackgroundColor(normalized);
-    }
+    forEachMainWindow((win) => win.setBackgroundColor(normalized));
     if (settingsWindow && !settingsWindow.isDestroyed()) {
       settingsWindow.setBackgroundColor(normalized);
     }
     return true;
+  });
+
+  ipcMain.handle("netcatty:setWindowOpacity", (_event, opacity) => {
+    applyWindowOpacity(opacity);
+    return true;
+  });
+
+  ipcMain.handle("netcatty:setAppIconVariant", (_event, variant) => {
+    const { app, BrowserWindow, nativeImage } = require("electron");
+    const appIconManager = require("./appIconManager.cjs");
+    return appIconManager.applyAppIconVariant(variant, {
+      app,
+      BrowserWindow,
+      nativeImage,
+      appPath: app.getAppPath(),
+      isMac: process.platform === "darwin",
+    });
   });
 
   ipcMain.handle("netcatty:setLanguage", (_event, language) => {
@@ -1637,12 +1188,30 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   // Broadcast settings changed to all windows (for cross-window sync)
   ipcMain.on("netcatty:settings:changed", (event, payload) => {
     const senderId = event?.sender?.id;
+    // Apply SSH transport idle park TTL in the main process (shared shell/SFTP/
+    // transfer/port-forward connections). Renderer owns persistence; main owns
+    // the registry timers.
+    try {
+      if (typeof payload?.value === "number" && Number.isFinite(payload.value) && payload.value >= 0) {
+        const {
+          setDefaultTransportIdleTtlMs,
+          STORAGE_KEY_SSH_TRANSPORT_IDLE_TTL_MS,
+        } = require("./sshConnectionPool.cjs");
+        if (payload?.key === STORAGE_KEY_SSH_TRANSPORT_IDLE_TTL_MS) {
+          setDefaultTransportIdleTtlMs(payload.value);
+        }
+      }
+    } catch {
+      // ignore — pool may be unavailable in tests
+    }
     // Notify all windows except the sender
     // Check both isDestroyed() and webContents.isDestroyed() to handle HMR refresh
     try {
-      if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed() && mainWindow.webContents.id !== senderId) {
-        mainWindow.webContents.send("netcatty:settings:changed", payload);
-      }
+      forEachMainWindow((win) => {
+        if (!win.webContents.isDestroyed() && win.webContents.id !== senderId) {
+          win.webContents.send("netcatty:settings:changed", payload);
+        }
+      });
       if (settingsWindow && !settingsWindow.isDestroyed() && !settingsWindow.webContents.isDestroyed() && settingsWindow.webContents.id !== senderId) {
         settingsWindow.webContents.send("netcatty:settings:changed", payload);
       }
@@ -1665,6 +1234,16 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
 function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
   // Save deps so later language changes can rebuild the menu.
   menuDeps = { Menu, app, isMac };
+  const closeFocusedWindow = (_menuItem, browserWindow) => {
+    // 只有主窗口/设置窗口会接收 command-close；其他 BrowserWindow 直接关闭。
+    if (browserWindow && !isMainWindow(browserWindow) && browserWindow !== settingsWindow) {
+      closeBrowserWindow(browserWindow);
+      return;
+    }
+
+    // macOS 的 Cmd+W 先交给渲染层关闭标签页；没有标签页时渲染层再关闭窗口。
+    requestWindowCommandClose(browserWindow) || requestWindowCommandClose(getMainWindow());
+  };
   const template = [
     ...(isMac
       ? [
@@ -1698,7 +1277,6 @@ function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
       label: tMenu(language, "view"),
       submenu: [
         { label: tMenu(language, "reload"), click: (_, win) => { if (win) win.reload(); } },
-        { role: "forceReload" },
         { role: "toggleDevTools" },
         { type: "separator" },
         { role: "resetZoom" },
@@ -1708,13 +1286,52 @@ function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
         { role: "togglefullscreen" },
       ],
     },
+    ...(() => {
+      let items = [];
+      try { items = pluginApplicationMenuProvider?.() ?? []; } catch {}
+      if (!Array.isArray(items) || items.length === 0) return [];
+      const sortedItems = [...items].sort((left, right) => (
+        String(left.group ?? "").localeCompare(String(right.group ?? ""))
+        || Number(left.order ?? 0) - Number(right.order ?? 0)
+        || String(left.id ?? "").localeCompare(String(right.id ?? ""))
+      ));
+      const submenu = [];
+      let previousGroup = null;
+      for (const item of sortedItems) {
+        const group = String(item.group ?? "");
+        if (previousGroup != null && group !== previousGroup) submenu.push({ type: "separator" });
+        previousGroup = group;
+        submenu.push({
+          id: item.id,
+          label: item.label,
+          enabled: item.enabled !== false,
+          type: item.checked == null ? "normal" : "checkbox",
+          checked: item.checked === true,
+          accelerator: item.accelerator,
+          icon: item.icon,
+          click: item.click,
+        });
+      }
+      return [{
+        label: tMenu(language, "plugins"),
+        submenu,
+      }];
+    })(),
     {
       label: tMenu(language, "window"),
       submenu: [
         { role: "minimize" },
         { role: "zoom" },
         ...(isMac
-          ? [{ type: "separator" }, { role: "front" }]
+          ? [
+            { type: "separator" },
+            {
+              label: tMenu(language, "closeWindow"),
+              accelerator: "CommandOrControl+W",
+              click: closeFocusedWindow,
+            },
+            { role: "front" },
+          ]
           : [{ role: "close" }]),
       ],
     },
@@ -1727,7 +1344,14 @@ function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
  * Get the main window instance
  */
 function getMainWindow() {
-  return mainWindow;
+  const candidates = getMainWindowList();
+  if (lastFocusedMainWindow && candidates.includes(lastFocusedMainWindow)) {
+    return lastFocusedMainWindow;
+  }
+  if (mainWindow && candidates.includes(mainWindow)) {
+    return mainWindow;
+  }
+  return candidates.at(-1) || null;
 }
 
 /**
@@ -1737,18 +1361,86 @@ function getSettingsWindow() {
   return settingsWindow;
 }
 
+/**
+ * Show the main window and restore reliable keyboard/caret routing (#760, #1722).
+ * Global hotkeys and tray entry points invoke this from non-foreground contexts
+ * where bare BrowserWindow.focus() is silently rejected on Windows.
+ */
+function showAndFocusMainWindow(win) {
+  if (!win || win.isDestroyed?.()) return false;
+  if (win.isMinimized?.()) {
+    try {
+      win.restore();
+    } catch {
+      // ignore
+    }
+  }
+  const restored = restoreWindowInputFocus(win, { show: true });
+  if (restored) notifyWindowFocusRequested(win);
+  return restored;
+}
+
+/**
+ * Renderer input-focus recovery is only valid after an explicit foreground
+ * request (hotkey, tray, Dock, deep link). Plain BrowserWindow "show" events
+ * can also come from OS window/space transitions and must not steal focus.
+ */
+function notifyWindowFocusRequested(win) {
+  if (!win || win.isDestroyed?.()) return;
+  safeSend(win.webContents, "netcatty:window:focus-requested");
+}
+
+/**
+ * Tell the renderer to dismiss transient overlays before the native hide (#1722).
+ * Must run before BrowserWindow.hide(), not from Electron's post-hide event.
+ */
+function notifyWindowWillHide(win) {
+  if (!win || win.isDestroyed?.()) return;
+  safeSend(win.webContents, "netcatty:window:will-hide");
+}
+
 module.exports = {
   createWindow,
   openSettingsWindow,
   closeSettingsWindow,
+  openTerminalPopupWindow,
+  closeTerminalPopupWindow,
   prewarmSettingsWindow,
   buildAppMenu,
+  getCurrentLanguage,
+  setPluginApplicationMenuProvider,
   getMainWindow,
+  getMainWindows: getMainWindowList,
+  getAppContentWindows: getAppContentWindowList,
+  getDirtyEditorWindows: getDirtyEditorWindowList,
+  getMainWindowCount,
+  isMainWindow,
+  registerMainWindow,
+  unregisterMainWindow,
+  registerAppContentWindow,
+  unregisterAppContentWindow,
+  setAppContentWindowClosedHandler,
   getSettingsWindow,
   isWindowUsable,
+  registerWindowHandlers,
+  restoreWindowInputFocus,
+  showAndFocusMainWindow,
+  notifyWindowFocusRequested,
+  notifyWindowWillHide,
+  requestWindowCommandClose,
+  shouldCloseWindowFromInput,
+  WINDOW_COMMAND_CLOSE_CHANNEL,
   waitForRendererReady,
+  sendWhenRendererReady,
   setIsQuitting,
+  getIsQuitting,
+  setQuittingForUpdate,
+  isQuittingForUpdate,
   openFallbackBrowser,
   tryOpenExternalWithFallback,
+  resolveSettingsWindowBounds,
   THEME_COLORS,
+  clampWindowOpacity,
+  applyWindowOpacity,
+  applyWindowOpacityToWindow,
 };

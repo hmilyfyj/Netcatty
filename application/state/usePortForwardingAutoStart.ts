@@ -4,40 +4,263 @@
  * when the application starts, not when the user navigates to the port forwarding page.
  */
 import { useCallback, useEffect, useRef } from "react";
-import { GroupConfig, Host, Identity, PortForwardingRule, SSHKey } from "../../domain/models";
+import { GroupConfig, Host, Identity, KnownHost, PortForwardingRule, ProxyProfile, SSHKey } from "../../domain/models";
 import { resolveGroupDefaults, applyGroupDefaults } from "../../domain/groupConfig";
+import { materializeHostProxyProfile } from "../../domain/proxyProfiles";
 import { STORAGE_KEY_PORT_FORWARDING } from "../../infrastructure/config/storageKeys";
 import { localStorageAdapter } from "../../infrastructure/persistence/localStorageAdapter";
 import {
   getActiveConnection,
+  isReconnectRecoveryEligible,
+  resetReconnectAttempts,
   setReconnectCallback,
   startPortForward,
   syncWithBackend,
 } from "../../infrastructure/services/portForwardingService";
 import { logger } from "../../lib/logger";
+import { applyPortForwardingRuntimeStatus } from "./usePortForwardingState";
 
 export interface UsePortForwardingAutoStartOptions {
+  enabled?: boolean;
+  isVaultInitialized: boolean;
   hosts: Host[];
   keys: SSHKey[];
   identities: Identity[];
+  proxyProfiles: ProxyProfile[];
   groupConfigs: GroupConfig[];
+  knownHosts?: KnownHost[];
+  terminalSettings?: { keepaliveInterval: number; keepaliveCountMax: number };
 }
+
+const AUTO_START_PROXY_NOT_READY_ERROR = "Proxy or jump host configuration is not ready";
+const AUTO_START_AUTH_NOT_READY_ERROR = "Host authentication configuration is not ready";
+
+export const isAutoStartProxyReady = (
+  host: Host,
+  allHosts: Host[],
+  proxyProfiles: ProxyProfile[],
+  groupConfigs: GroupConfig[],
+  seen = new Set<string>(),
+): boolean => {
+  if (!host || seen.has(host.id)) return true;
+  seen.add(host.id);
+
+  const validProxyProfileIds: ReadonlySet<string> = new Set(proxyProfiles.map((profile) => profile.id));
+  const rawGroupDefaults = host.group
+    ? resolveGroupDefaults(host.group, groupConfigs)
+    : {};
+  const groupDefaults = host.group
+    ? resolveGroupDefaults(host.group, groupConfigs, { validProxyProfileIds })
+    : {};
+  const missingHostProxyProfile = Boolean(
+    host.proxyProfileId && !validProxyProfileIds.has(host.proxyProfileId),
+  );
+  const missingGroupProxyProfile = Boolean(
+    !host.proxyConfig &&
+    !host.proxyProfileId &&
+    rawGroupDefaults.proxyProfileId &&
+    !validProxyProfileIds.has(rawGroupDefaults.proxyProfileId),
+  );
+  const effectiveHost = applyGroupDefaults(host, groupDefaults, { validProxyProfileIds });
+  const hasProxyReplacement = Boolean(
+    effectiveHost.proxyConfig ||
+    (effectiveHost.proxyProfileId && validProxyProfileIds.has(effectiveHost.proxyProfileId)),
+  );
+
+  if ((missingHostProxyProfile || missingGroupProxyProfile) && !hasProxyReplacement) {
+    return false;
+  }
+
+  const chainIds = effectiveHost.hostChain?.hostIds || [];
+  for (const chainId of chainIds) {
+    const chainHost = allHosts.find((candidate) => candidate.id === chainId);
+    if (!chainHost) return false;
+    if (!isAutoStartProxyReady(chainHost, allHosts, proxyProfiles, groupConfigs, seen)) return false;
+  }
+
+  return true;
+};
+
+export const getAutoStartRuleBlockReason = (
+  rule: PortForwardingRule,
+  hosts: Host[],
+  proxyProfiles: ProxyProfile[],
+  groupConfigs: GroupConfig[],
+  isHostAuthReady: (host: Host) => boolean,
+): string | undefined => {
+  if (!rule.hostId) return "Rule host is not configured";
+  const host = hosts.find((candidate) => candidate.id === rule.hostId);
+  if (!host) return "Host not found";
+  if (!isHostAuthReady(host)) return AUTO_START_AUTH_NOT_READY_ERROR;
+  if (!isAutoStartProxyReady(host, hosts, proxyProfiles, groupConfigs)) {
+    return AUTO_START_PROXY_NOT_READY_ERROR;
+  }
+  return undefined;
+};
+
+export const isPortForwardingAutoStartEnabled = (
+  rules: PortForwardingRule[],
+  ruleId: string,
+): boolean => rules.some((rule) => rule.id === ruleId && rule.autoStart === true);
+
+export const shouldStartPortForwardingAutoStartRule = (
+  rule: PortForwardingRule,
+  connection?: { status: PortForwardingRule["status"] },
+): boolean => rule.autoStart === true && (
+  !connection || connection.status === "inactive" || connection.status === "error"
+);
+
+export const recoverPortForwardingAutoStartAfterNetworkRestore = async (
+  restartAutoStartRules: (recoverableRuleIds: ReadonlySet<string>) => Promise<void>,
+): Promise<void> => {
+  const rules = localStorageAdapter.read<PortForwardingRule[]>(
+    STORAGE_KEY_PORT_FORWARDING,
+  ) ?? [];
+  const recoverableRuleIds = new Set<string>();
+  for (const rule of rules) {
+    if (rule.autoStart && resetReconnectAttempts(rule.id)) {
+      recoverableRuleIds.add(rule.id);
+    }
+  }
+  if (recoverableRuleIds.size > 0) {
+    await restartAutoStartRules(recoverableRuleIds);
+  }
+};
+
+interface PortForwardingNetworkRecoveryTarget {
+  addEventListener: (type: "online", listener: EventListener) => void;
+  removeEventListener: (type: "online", listener: EventListener) => void;
+}
+
+export const subscribeToPortForwardingNetworkRecovery = (
+  target: PortForwardingNetworkRecoveryTarget,
+  restartAutoStartRules: (recoverableRuleIds: ReadonlySet<string>) => Promise<void>,
+): (() => void) => {
+  let restartInFlight: Promise<void> | undefined;
+  const handleOnline: EventListener = () => {
+    if (restartInFlight) return;
+    restartInFlight = recoverPortForwardingAutoStartAfterNetworkRestore(restartAutoStartRules)
+      .catch((error: unknown) => {
+        logger.warn("[PortForwardingAutoStart] Network recovery restart failed:", error);
+      })
+      .finally(() => {
+        restartInFlight = undefined;
+      });
+  };
+
+  target.addEventListener("online", handleOnline);
+  return () => target.removeEventListener("online", handleOnline);
+};
+
+interface RunPortForwardingAutoStartOptions {
+  hosts: Host[];
+  keys: SSHKey[];
+  identities: Identity[];
+  proxyProfiles: ProxyProfile[];
+  groupConfigs: GroupConfig[];
+  knownHosts: KnownHost[];
+  terminalSettings?: { keepaliveInterval: number; keepaliveCountMax: number };
+  isHostAuthReady: (host: Host) => boolean;
+  resolveEffectiveHost: (host: Host) => Host;
+  updateStoredRuleStatus: (
+    ruleId: string,
+    status: PortForwardingRule["status"],
+    error?: string,
+  ) => void;
+  recoveryRuleIds?: ReadonlySet<string>;
+}
+
+export const runPortForwardingAutoStart = async ({
+  hosts,
+  keys,
+  identities,
+  proxyProfiles,
+  groupConfigs,
+  knownHosts,
+  terminalSettings,
+  isHostAuthReady,
+  resolveEffectiveHost,
+  updateStoredRuleStatus,
+  recoveryRuleIds,
+}: RunPortForwardingAutoStartOptions): Promise<void> => {
+  await syncWithBackend({
+    shouldReconnect: (ruleId) => isPortForwardingAutoStartEnabled(
+      localStorageAdapter.read<PortForwardingRule[]>(STORAGE_KEY_PORT_FORWARDING) ?? [],
+      ruleId,
+    ),
+    onStatusChange: (ruleId, status, error) => {
+      updateStoredRuleStatus(ruleId, status, error);
+    },
+  });
+
+  const rules = localStorageAdapter.read<PortForwardingRule[]>(
+    STORAGE_KEY_PORT_FORWARDING,
+  ) ?? [];
+  const autoStartRules = rules.filter((rule) =>
+    (!recoveryRuleIds || recoveryRuleIds.has(rule.id)) &&
+    (!recoveryRuleIds || isReconnectRecoveryEligible(rule.id)) &&
+    shouldStartPortForwardingAutoStartRule(rule, getActiveConnection(rule.id)),
+  );
+
+  if (autoStartRules.length === 0) return;
+  logger.info(`[PortForwardingAutoStart] Starting ${autoStartRules.length} auto-start rules`);
+  const effectiveHosts = hosts.map((host) => resolveEffectiveHost(host));
+
+  for (const rule of autoStartRules) {
+    const rawHost = hosts.find((host) => host.id === rule.hostId);
+    const blockReason = getAutoStartRuleBlockReason(
+      rule,
+      hosts,
+      proxyProfiles,
+      groupConfigs,
+      isHostAuthReady,
+    );
+    if (blockReason) {
+      updateStoredRuleStatus(rule.id, "error", blockReason);
+      continue;
+    }
+
+    if (!rawHost) continue;
+    void startPortForward(
+      rule,
+      resolveEffectiveHost(rawHost),
+      effectiveHosts,
+      keys,
+      identities,
+      (status, error) => {
+        updateStoredRuleStatus(rule.id, status, error);
+      },
+      true,
+      terminalSettings,
+      knownHosts,
+    );
+  }
+};
 
 /**
  * Auto-starts port forwarding rules that have autoStart enabled.
  * This hook should be called at the App level to run on app launch.
  */
 export const usePortForwardingAutoStart = ({
+  enabled = true,
+  isVaultInitialized,
   hosts,
   keys,
   identities,
+  proxyProfiles,
   groupConfigs,
+  knownHosts = [],
+  terminalSettings,
 }: UsePortForwardingAutoStartOptions): void => {
   const autoStartExecutedRef = useRef(false);
   const hostsRef = useRef<Host[]>(hosts);
   const keysRef = useRef<SSHKey[]>(keys);
   const identitiesRef = useRef<Identity[]>(identities);
+  const proxyProfilesRef = useRef<ProxyProfile[]>(proxyProfiles);
   const groupConfigsRef = useRef<GroupConfig[]>(groupConfigs);
+  const knownHostsRef = useRef<KnownHost[]>(knownHosts);
+  const terminalSettingsRef = useRef(terminalSettings);
+  terminalSettingsRef.current = terminalSettings;
 
   const isHostAuthReady = useCallback((host: Host, seen = new Set<string>()): boolean => {
     if (!host || seen.has(host.id)) return true;
@@ -78,17 +301,47 @@ export const usePortForwardingAutoStart = ({
   }, [identities]);
 
   useEffect(() => {
+    proxyProfilesRef.current = proxyProfiles;
+  }, [proxyProfiles]);
+
+  useEffect(() => {
     groupConfigsRef.current = groupConfigs;
   }, [groupConfigs]);
 
+  useEffect(() => {
+    knownHostsRef.current = knownHosts;
+  }, [knownHosts]);
+
   const resolveEffectiveHost = useCallback((host: Host): Host => {
-    if (!host.group) return host;
-    const defaults = resolveGroupDefaults(host.group, groupConfigsRef.current);
-    return applyGroupDefaults(host, defaults);
+    const validProxyProfileIds: ReadonlySet<string> = new Set(proxyProfilesRef.current.map((profile) => profile.id));
+    const withGroupDefaults = host.group
+      ? applyGroupDefaults(
+          host,
+          resolveGroupDefaults(host.group, groupConfigsRef.current, { validProxyProfileIds }),
+          { validProxyProfileIds },
+        )
+      : applyGroupDefaults(host, {}, { validProxyProfileIds });
+    return materializeHostProxyProfile(withGroupDefaults, proxyProfilesRef.current);
   }, []);
+
+  const resolveEffectiveHosts = useCallback(
+    (items: Host[]): Host[] => items.map((host) => resolveEffectiveHost(host)),
+    [resolveEffectiveHost],
+  );
+
+  // Runtime phases stay in the in-memory projection only (#2288). Writing
+  // active/connecting/error into localStorage would churn sync hashes and
+  // fight the main-process authority model.
+  const updateStoredRuleStatus = useCallback(
+    (ruleId: string, status: PortForwardingRule["status"], error?: string) => {
+      applyPortForwardingRuntimeStatus(ruleId, status, error);
+    },
+    [],
+  );
 
   // Set up the reconnect callback
   useEffect(() => {
+    if (!enabled) return;
     const handleReconnect = async (
       ruleId: string,
       onStatusChange: (status: PortForwardingRule["status"], error?: string) => void,
@@ -99,102 +352,81 @@ export const usePortForwardingAutoStart = ({
       ) ?? [];
       
       const rule = rules.find((r) => r.id === ruleId);
-      if (!rule || !rule.hostId) {
-        return { success: false, error: "Rule or host not found" };
+      if (!rule) {
+        const error = "Rule not found";
+        onStatusChange("error", error);
+        return { success: false, error };
+      }
+      if (!rule.hostId) {
+        const error = "Rule host is not configured";
+        onStatusChange("error", error);
+        return { success: false, error };
       }
 
       const rawHost = hostsRef.current.find((h) => h.id === rule.hostId);
       if (!rawHost) {
-        return { success: false, error: "Host not found" };
+        const error = "Host not found";
+        onStatusChange("error", error);
+        return { success: false, error };
+      }
+      const blockReason = getAutoStartRuleBlockReason(
+        rule,
+        hostsRef.current,
+        proxyProfilesRef.current,
+        groupConfigsRef.current,
+        (host) => isHostAuthReady(host),
+      );
+      if (blockReason) {
+        onStatusChange("error", blockReason);
+        return { success: false, error: blockReason };
       }
 
       const host = resolveEffectiveHost(rawHost);
-      return startPortForward(rule, host, hostsRef.current, keysRef.current, identitiesRef.current, onStatusChange, true);
+      return startPortForward(rule, host, resolveEffectiveHosts(hostsRef.current), keysRef.current, identitiesRef.current, onStatusChange, true, terminalSettingsRef.current, knownHostsRef.current);
     };
 
     setReconnectCallback(handleReconnect);
     return () => {
       setReconnectCallback(null);
     };
-  }, [resolveEffectiveHost]);
+  }, [enabled, isHostAuthReady, resolveEffectiveHost, resolveEffectiveHosts]);
+
+  const runAutoStart = useCallback((recoveryRuleIds?: ReadonlySet<string>) => runPortForwardingAutoStart({
+    hosts: hostsRef.current,
+    keys: keysRef.current,
+    identities: identitiesRef.current,
+    proxyProfiles: proxyProfilesRef.current,
+    groupConfigs: groupConfigsRef.current,
+    knownHosts: knownHostsRef.current,
+    terminalSettings: terminalSettingsRef.current,
+    isHostAuthReady: (host) => isHostAuthReady(host),
+    resolveEffectiveHost,
+    updateStoredRuleStatus,
+    recoveryRuleIds,
+  }), [isHostAuthReady, resolveEffectiveHost, updateStoredRuleStatus]);
 
   // Auto-start rules on app launch
   useEffect(() => {
+    if (!enabled) return;
     if (autoStartExecutedRef.current) return;
-    if (hosts.length === 0) return;
-
-    const storedRules = localStorageAdapter.read<PortForwardingRule[]>(
-      STORAGE_KEY_PORT_FORWARDING,
-    ) ?? [];
-    const pendingAutoStartRules = storedRules.filter((rule) => rule.autoStart && rule.hostId);
-    if (pendingAutoStartRules.some((rule) => {
-      const host = hosts.find((candidate) => candidate.id === rule.hostId);
-      return !host || !isHostAuthReady(host);
-    })) {
-      return;
-    }
+    if (!isVaultInitialized) return;
 
     // Mark as executed immediately to prevent duplicate runs
     // (React StrictMode or dependency changes could cause re-runs)
     autoStartExecutedRef.current = true;
 
-    const runAutoStart = async () => {
-      // First sync with backend to get any active tunnels
-      await syncWithBackend();
-
-      // Load rules from storage
-      const rules = localStorageAdapter.read<PortForwardingRule[]>(
-        STORAGE_KEY_PORT_FORWARDING,
-      ) ?? [];
-
-      // Only start rules that are not already active
-      const autoStartRules = rules.filter((r) => {
-        if (!r.autoStart || !r.hostId) return false;
-        // Check if there's an active connection for this rule
-        const conn = getActiveConnection(r.id);
-        // Only start if not already connecting or active
-        return !conn || conn.status === 'inactive' || conn.status === 'error';
-      });
-
-      if (autoStartRules.length === 0) return;
-      logger.info(`[PortForwardingAutoStart] Starting ${autoStartRules.length} auto-start rules`);
-
-      // Start each auto-start rule
-      for (const rule of autoStartRules) {
-        const rawHost = hosts.find((h) => h.id === rule.hostId);
-        if (rawHost) {
-          const host = resolveEffectiveHost(rawHost);
-          void startPortForward(
-            rule,
-            host,
-            hosts,
-            keys,
-            identities,
-            (status, error) => {
-              // Update the rule status in storage
-              const currentRules = localStorageAdapter.read<PortForwardingRule[]>(
-                STORAGE_KEY_PORT_FORWARDING,
-              ) ?? [];
-              
-              const updatedRules = currentRules.map((r) =>
-                r.id === rule.id
-                  ? {
-                      ...r,
-                      status,
-                      error,
-                      lastUsedAt: status === "active" ? Date.now() : r.lastUsedAt,
-                    }
-                  : r,
-              );
-              
-              localStorageAdapter.write(STORAGE_KEY_PORT_FORWARDING, updatedRules);
-            },
-            true, // Enable reconnect for auto-start rules
-          );
-        }
-      }
-    };
-
     void runAutoStart();
-  }, [hosts, identities, isHostAuthReady, keys, resolveEffectiveHost]);
+  }, [
+    enabled,
+    isVaultInitialized,
+    runAutoStart,
+  ]);
+
+  // A local outage can consume all bounded SSH retries. Only an explicit
+  // network recovery event starts a fresh retry cycle, so an unreachable
+  // server still stops retrying after the existing limit.
+  useEffect(() => {
+    if (!enabled || !isVaultInitialized || typeof window === "undefined") return;
+    return subscribeToPortForwardingNetworkRecovery(window, runAutoStart);
+  }, [enabled, isVaultInitialized, runAutoStart]);
 };

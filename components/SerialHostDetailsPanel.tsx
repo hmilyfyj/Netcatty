@@ -6,19 +6,27 @@ import { ChevronDown, ChevronUp, Save, Tag, Usb } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { useTerminalBackend } from '../application/state/useTerminalBackend';
-import type { Host, SerialConfig, SerialFlowControl, SerialParity } from '../domain/models';
+import type { GroupConfig, Host, SerialConfig, SerialFlowControl, SerialParity } from '../domain/models';
+import {
+  resolveSerialBackspaceFormValue,
+  resolveSerialBackspaceOverrideOnSave,
+} from '../domain/serialBackspace';
 
 import { Button } from './ui/button';
 import { Combobox, ComboboxOption, MultiCombobox } from './ui/combobox';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
 import {
   AsidePanel,
   AsidePanelContent,
   AsidePanelFooter,
   type AsidePanelLayout,
+  type AsidePanelResizeProps,
 } from './ui/aside-panel';
+import { HostNotesEditor } from './host/HostNotesEditor';
+import { cn } from '../lib/utils';
 
 interface SerialPort {
   path: string;
@@ -34,10 +42,14 @@ interface SerialHostDetailsPanelProps {
   initialData: Host;
   allTags?: string[];
   groups?: string[];
+  groupDefaults?: Partial<GroupConfig>;
   onSave: (host: Host) => void;
   onCancel: () => void;
   layout?: AsidePanelLayout;
+  className?: string;
 }
+
+type SerialHostDetailsPanelPropsWithResize = SerialHostDetailsPanelProps & AsidePanelResizeProps;
 
 const BAUD_RATES = [300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
 const DATA_BITS: Array<5 | 6 | 7 | 8> = [5, 6, 7, 8];
@@ -45,13 +57,18 @@ const STOP_BITS: Array<1 | 1.5 | 2> = [1, 1.5, 2];
 const PARITY_OPTIONS: SerialParity[] = ['none', 'even', 'odd', 'mark', 'space'];
 const FLOW_CONTROL_OPTIONS: SerialFlowControl[] = ['none', 'xon/xoff', 'rts/cts'];
 
-export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelProps> = ({
+export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelPropsWithResize> = ({
   initialData,
   allTags = [],
   groups = [],
+  groupDefaults,
   onSave,
   onCancel,
   layout = 'overlay',
+  className,
+  resizable,
+  persistWidthStorageKey,
+  resizeAriaLabel,
 }) => {
   const { t } = useI18n();
   const terminalBackend = useTerminalBackend();
@@ -69,9 +86,14 @@ export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelProps> = ({
   const [flowControl, setFlowControl] = useState<SerialFlowControl>(initialData.serialConfig?.flowControl || 'none');
   const [localEcho, setLocalEcho] = useState(initialData.serialConfig?.localEcho || false);
   const [lineMode, setLineMode] = useState(initialData.serialConfig?.lineMode || false);
+  const [backspaceBehavior, setBackspaceBehavior] = useState(
+    resolveSerialBackspaceFormValue(initialData, groupDefaults),
+  );
+  const [backspaceBehaviorChanged, setBackspaceBehaviorChanged] = useState(false);
   const [charset, setCharset] = useState(initialData.charset || 'UTF-8');
   const [tags, setTags] = useState<string[]>(initialData.tags || []);
   const [group, setGroup] = useState(initialData.group || '');
+  const [notes, setNotes] = useState(initialData.notes ?? '');
 
   const loadPorts = useCallback(async () => {
     setIsLoadingPorts(true);
@@ -101,6 +123,11 @@ export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelProps> = ({
       flowControl,
       localEcho,
       lineMode,
+      backspaceBehavior: resolveSerialBackspaceOverrideOnSave({
+        initialHost: initialData,
+        selectedBehavior: backspaceBehavior,
+        behaviorChanged: backspaceBehaviorChanged,
+      }),
     };
 
     const portName = selectedPort.split('/').pop() || selectedPort;
@@ -113,6 +140,8 @@ export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelProps> = ({
       group,
       charset,
       serialConfig: config,
+      backspaceBehavior: undefined,
+      notes: notes.trim() || undefined,
     };
 
     onSave(updatedHost);
@@ -166,9 +195,12 @@ export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelProps> = ({
       onClose={onCancel}
       title={t('serial.edit.title')}
       subtitle={initialData.label}
-      className="z-40"
+      className={cn('z-40', className)}
       layout={layout}
       dataSection="serial-host-details-panel"
+      resizable={resizable}
+      persistWidthStorageKey={persistWidthStorageKey}
+      resizeAriaLabel={resizeAriaLabel}
     >
       <AsidePanelContent>
         {/* Label */}
@@ -256,6 +288,12 @@ export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelProps> = ({
           />
         </div>
 
+        <HostNotesEditor
+          panelKey={initialData.id}
+          value={notes}
+          onChange={setNotes}
+        />
+
         {/* Group */}
         <div className="space-y-2">
           <Label>{t('hostDetails.group')}</Label>
@@ -291,35 +329,41 @@ export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelProps> = ({
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="data-bits">{t('serial.field.dataBits')}</Label>
-                <select
-                  id="data-bits"
-                  value={dataBits}
-                  onChange={(e) => setDataBits(parseInt(e.target.value, 10) as 5 | 6 | 7 | 8)}
-                  className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                <Select
+                  value={String(dataBits)}
+                  onValueChange={(v) => setDataBits(parseInt(v, 10) as 5 | 6 | 7 | 8)}
                 >
-                  {DATA_BITS.map((bits) => (
-                    <option key={bits} value={bits}>
-                      {bits}
-                    </option>
-                  ))}
-                </select>
+                  <SelectTrigger id="data-bits">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {DATA_BITS.map((bits) => (
+                      <SelectItem key={bits} value={String(bits)}>
+                        {bits}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
 
               {/* Stop Bits */}
               <div className="space-y-2">
                 <Label htmlFor="stop-bits">{t('serial.field.stopBits')}</Label>
-                <select
-                  id="stop-bits"
-                  value={stopBits}
-                  onChange={(e) => setStopBits(parseFloat(e.target.value) as 1 | 1.5 | 2)}
-                  className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                <Select
+                  value={String(stopBits)}
+                  onValueChange={(v) => setStopBits(parseFloat(v) as 1 | 1.5 | 2)}
                 >
-                  {STOP_BITS.map((bits) => (
-                    <option key={bits} value={bits}>
-                      {bits}
-                    </option>
-                  ))}
-                </select>
+                  <SelectTrigger id="stop-bits">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {STOP_BITS.map((bits) => (
+                      <SelectItem key={bits} value={String(bits)}>
+                        {bits}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
                 {isStopBits15 && (
                   <p className="text-xs text-yellow-500">
                     {t('serial.field.stopBits15Warning')}
@@ -331,39 +375,67 @@ export const SerialHostDetailsPanel: React.FC<SerialHostDetailsPanelProps> = ({
             {/* Parity */}
             <div className="space-y-2">
               <Label htmlFor="parity">{t('serial.field.parity')}</Label>
-              <select
-                id="parity"
+              <Select
                 value={parity}
-                onChange={(e) => setParity(e.target.value as SerialParity)}
-                className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                onValueChange={(v) => setParity(v as SerialParity)}
               >
-                {PARITY_OPTIONS.map((option) => (
-                  <option key={option} value={option}>
-                    {t(`serial.parity.${option}`)}
-                  </option>
-                ))}
-              </select>
+                <SelectTrigger id="parity">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PARITY_OPTIONS.map((option) => (
+                    <SelectItem key={option} value={option}>
+                      {t(`serial.parity.${option}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
 
             {/* Flow Control */}
             <div className="space-y-2">
               <Label htmlFor="flow-control">{t('serial.field.flowControl')}</Label>
-              <select
-                id="flow-control"
+              <Select
                 value={flowControl}
-                onChange={(e) => setFlowControl(e.target.value as SerialFlowControl)}
-                className="w-full h-10 px-3 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                onValueChange={(v) => setFlowControl(v as SerialFlowControl)}
               >
-                {FLOW_CONTROL_OPTIONS.map((option) => (
-                  <option key={option} value={option}>
-                    {t(`serial.flowControl.${option}`)}
-                  </option>
-                ))}
-              </select>
+                <SelectTrigger id="flow-control">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {FLOW_CONTROL_OPTIONS.map((option) => (
+                    <SelectItem key={option} value={option}>
+                      {t(`serial.flowControl.${option}`)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
 
             {/* Terminal Options */}
             <div className="space-y-3 pt-2 border-t border-border/60">
+              <div className="space-y-2">
+                <Label htmlFor="serial-backspace">{t('serial.field.backspaceBehavior')}</Label>
+                <Select
+                  value={backspaceBehavior}
+                  onValueChange={(value) => {
+                    setBackspaceBehavior(value === 'ctrl-h' ? 'ctrl-h' : 'default');
+                    setBackspaceBehaviorChanged(true);
+                  }}
+                >
+                  <SelectTrigger id="serial-backspace">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">{t('serial.backspace.default')}</SelectItem>
+                    <SelectItem value="ctrl-h">{t('serial.backspace.ctrlH')}</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t('serial.field.backspaceBehaviorDesc')}
+                </p>
+              </div>
+
               <div className="flex items-center justify-between">
                 <div className="space-y-0.5">
                   <Label htmlFor="local-echo" className="text-sm font-medium cursor-pointer">

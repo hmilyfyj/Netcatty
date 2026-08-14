@@ -1,5 +1,9 @@
-import { Suspense, lazy } from 'react';
+import { StrictMode, Suspense, lazy } from 'react';
 import ReactDOM from 'react-dom/client';
+import '@fontsource/mona-sans/400.css';
+import '@fontsource/mona-sans/500.css';
+import '@fontsource/mona-sans/600.css';
+import '@fontsource/mona-sans/700.css';
 import '@fontsource/space-grotesk/400.css';
 import '@fontsource/space-grotesk/500.css';
 import '@fontsource/space-grotesk/600.css';
@@ -9,9 +13,11 @@ import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
 import App from './App';
 import { ToastProvider } from './components/ui/toast';
+import { TooltipProvider } from './components/ui/tooltip';
 
 const LazySettingsPage = lazy(() => import('./components/SettingsPage'));
 const LazyTrayPanel = lazy(() => import('./components/TrayPanel'));
+const LazyTerminalPopupPage = lazy(() => import('./components/TerminalPopupPage'));
 
 function SettingsWindowFallback() {
   return (
@@ -22,7 +28,7 @@ function SettingsWindowFallback() {
         flexDirection: 'column',
         background: 'hsl(var(--background))',
         color: 'hsl(var(--foreground))',
-        fontFamily: 'Space Grotesk, system-ui, sans-serif',
+        fontFamily: 'var(--font-sans)',
       }}
     >
       <div
@@ -79,6 +85,36 @@ function SettingsWindowFallback() {
   );
 }
 
+function TerminalPopupWindowFallback() {
+  return (
+    <div
+      style={{
+        width: '100vw',
+        height: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: '#0b1015',
+        color: '#d7e0ea',
+      }}
+    >
+      <svg width="28" height="28" viewBox="0 0 28 28" aria-label="Loading" style={{ opacity: 0.8 }}>
+        <circle cx="14" cy="14" r="11" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.18" />
+        <path d="M25 14a11 11 0 0 0-11-11" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="2">
+          <animateTransform
+            attributeName="transform"
+            dur="0.75s"
+            from="0 14 14"
+            repeatCount="indefinite"
+            to="360 14 14"
+            type="rotate"
+          />
+        </path>
+      </svg>
+    </div>
+  );
+}
+
 const rootElement = document.getElementById('root');
 if (!rootElement) {
   throw new Error("Could not find root element to mount to");
@@ -93,31 +129,72 @@ const getRoute = () => {
   if (hash === '#/tray' || hash.startsWith('#/tray')) {
     return 'tray';
   }
+  if (hash === '#/terminal-popup' || hash.startsWith('#/terminal-popup')) {
+    return 'terminal-popup';
+  }
+  if (hash === '#/session-window' || hash.startsWith('#/session-window')) {
+    return 'main';
+  }
   return 'main';
 };
 
 const root = ReactDOM.createRoot(rootElement);
 
+const syncTrayWindowClass = (route: string) => {
+  const rootEl = document.documentElement;
+  if (route === 'tray') {
+    rootEl.classList.add('tray-window');
+    document.getElementById('splash')?.remove();
+  } else {
+    rootEl.classList.remove('tray-window');
+  }
+};
+
 const renderApp = () => {
   const route = getRoute();
+  syncTrayWindowClass(route);
   if (route === 'settings') {
     root.render(
-      <ToastProvider>
-        <Suspense fallback={<SettingsWindowFallback />}>
-          <LazySettingsPage />
-        </Suspense>
-      </ToastProvider>
+      <StrictMode>
+        <ToastProvider>
+          <TooltipProvider delayDuration={300}>
+            <Suspense fallback={<SettingsWindowFallback />}>
+              <LazySettingsPage />
+            </Suspense>
+          </TooltipProvider>
+        </ToastProvider>
+      </StrictMode>
     );
   } else if (route === 'tray') {
     root.render(
-      <ToastProvider>
-        <Suspense fallback={<div style={{ padding: 12, color: '#fff' }}>Loading tray panel…</div>}>
-          <LazyTrayPanel />
-        </Suspense>
-      </ToastProvider>
+      <StrictMode>
+        <ToastProvider>
+          <TooltipProvider delayDuration={300}>
+            <Suspense fallback={<div style={{ padding: 12, color: '#fff' }}>Loading tray panel…</div>}>
+              <LazyTrayPanel />
+            </Suspense>
+          </TooltipProvider>
+        </ToastProvider>
+      </StrictMode>
+    );
+  } else if (route === 'terminal-popup') {
+    root.render(
+      <StrictMode>
+        <ToastProvider>
+          <TooltipProvider delayDuration={300}>
+            <Suspense fallback={<TerminalPopupWindowFallback />}>
+              <LazyTerminalPopupPage />
+            </Suspense>
+          </TooltipProvider>
+        </ToastProvider>
+      </StrictMode>
     );
   } else {
-    root.render(<App />);
+    root.render(
+      <StrictMode>
+        <App />
+      </StrictMode>
+    );
   }
 };
 

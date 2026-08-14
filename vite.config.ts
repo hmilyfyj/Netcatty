@@ -1,7 +1,7 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 
 // Custom plugin to suppress monaco-editor source map warnings
 const suppressMonacoSourcemapWarning = () => ({
@@ -15,6 +15,25 @@ const suppressMonacoSourcemapWarning = () => ({
       if (msg.includes('loader.js.map')) return;
       originalWarn(msg, options);
     };
+  },
+});
+
+/** After git pull / npm install, stale pre-bundles return 504; force a full reload. */
+const reloadOnOutdatedOptimizeDep = (): Plugin => ({
+  name: 'reload-on-outdated-optimize-dep',
+  apply: 'serve',
+  configureServer(server) {
+    server.middlewares.use((req, res, next) => {
+      res.on('finish', () => {
+        if (
+          res.statusCode === 504
+          && req.url?.includes('/node_modules/.vite/deps/')
+        ) {
+          server.ws.send({ type: 'full-reload', path: '*' });
+        }
+      });
+      next();
+    });
   },
 });
 
@@ -44,7 +63,6 @@ export default defineConfig(() => {
           output: {
             manualChunks: {
               // Vendor chunks - rarely change, can be cached aggressively
-              'vendor-react': ['react', 'react-dom'],
               'vendor-radix': [
                 '@radix-ui/react-collapsible',
                 '@radix-ui/react-context-menu',
@@ -52,12 +70,12 @@ export default defineConfig(() => {
                 '@radix-ui/react-popover',
                 '@radix-ui/react-scroll-area',
                 '@radix-ui/react-select',
-                '@radix-ui/react-slot',
                 '@radix-ui/react-tabs',
               ],
               'vendor-xterm': [
                 '@xterm/xterm',
                 '@xterm/addon-fit',
+                '@xterm/addon-image',
                 '@xterm/addon-search',
                 '@xterm/addon-serialize',
                 '@xterm/addon-web-links',
@@ -74,7 +92,7 @@ export default defineConfig(() => {
           },
         },
       },
-      plugins: [suppressMonacoSourcemapWarning(), tailwindcss(), react()],
+      plugins: [suppressMonacoSourcemapWarning(), reloadOnOutdatedOptimizeDep(), tailwindcss(), react()],
       resolve: {
         alias: {
           '@': path.resolve(__dirname, '.'),

@@ -1,6 +1,7 @@
 import { GripHorizontal } from "lucide-react";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../../application/i18n/I18nProvider";
+import { sftpTransferCenterStore } from "../../application/state/sftpTransferCenterStore";
 import { useStoredNumber } from "../../application/state/useStoredNumber";
 import type { useSftpState } from "../../application/state/useSftpState";
 import {
@@ -9,7 +10,16 @@ import {
 } from "../../infrastructure/config/storageKeys";
 import type { TransferTask } from "../../types";
 import { Button } from "../ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import { SftpTransferItem } from "./SftpTransferItem";
+
+/** Same control path as the global transfer center — never a second pause implementation. */
+const pauseViaCenter = (taskId: string) => {
+  void sftpTransferCenterStore.pause(taskId);
+};
+const resumeViaCenter = (taskId: string) => {
+  void sftpTransferCenterStore.resume(taskId);
+};
 
 type SftpState = ReturnType<typeof useSftpState>;
 
@@ -19,6 +29,8 @@ interface SftpTransferQueueProps {
   allTransfers: SftpState["transfers"];
   canRevealTransferTarget?: (task: TransferTask) => boolean;
   onRevealTransferTarget?: (task: TransferTask) => void | Promise<void>;
+  canCopyTransferTargetPath?: (task: TransferTask) => boolean;
+  onCopyTransferTargetPath?: (task: TransferTask) => void | Promise<void>;
 }
 
 const MIN_PANEL_HEIGHT = 112;
@@ -29,29 +41,38 @@ const MAX_CHILD_NAME_WIDTH = 480;
 const CHILD_ROW_HEIGHT = 28;
 const CHILD_VIRTUALIZE_THRESHOLD = 80;
 const CHILD_OVERSCAN = 8;
+const childListIdForTask = (taskId: string) => `sftp-transfer-children-${taskId.replace(/[^A-Za-z0-9_-]/g, "-")}`;
 
 interface TransferChildListProps {
   childTasks: TransferTask[];
+  childListId: string;
   childNameWidth: number;
   onResizeNameColumn: (event: React.MouseEvent<HTMLDivElement>) => void;
   scrollContainerRef: React.RefObject<HTMLDivElement>;
   scrollTop: number;
   viewportHeight: number;
   onCancel: (taskId: string) => void;
+  onPause: (taskId: string) => void;
+  onResume: (taskId: string) => void;
   onRetry: (taskId: string) => Promise<void>;
   onDismiss: (taskId: string) => void;
+  onSetNameColumnWidth: (width: number) => void;
 }
 
 const TransferChildList: React.FC<TransferChildListProps> = ({
   childTasks,
+  childListId,
   childNameWidth,
   onResizeNameColumn,
   scrollContainerRef,
   scrollTop,
   viewportHeight,
   onCancel,
+  onPause,
+  onResume,
   onRetry,
   onDismiss,
+  onSetNameColumnWidth,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [contentTop, setContentTop] = useState(0);
@@ -102,6 +123,7 @@ const TransferChildList: React.FC<TransferChildListProps> = ({
 
   return (
     <div
+      id={childListId}
       ref={containerRef}
       className="border-t border-border/30 bg-background/30"
     >
@@ -121,8 +143,14 @@ const TransferChildList: React.FC<TransferChildListProps> = ({
                 task={child}
                 isChild
                 childNameColumnWidth={childNameWidth}
+                childNameColumnMinWidth={MIN_CHILD_NAME_WIDTH}
+                childNameColumnMaxWidth={MAX_CHILD_NAME_WIDTH}
                 onResizeNameColumn={onResizeNameColumn}
+                onSetNameColumnWidth={onSetNameColumnWidth}
+                resizeHandleTabIndex={visibleIndex === 0 ? 0 : -1}
                 onCancel={() => onCancel(child.id)}
+                onPause={() => onPause(child.id)}
+                onResume={() => onResume(child.id)}
                 onRetry={() => onRetry(child.id)}
                 onDismiss={() => onDismiss(child.id)}
               />
@@ -140,6 +168,8 @@ export const SftpTransferQueue: React.FC<SftpTransferQueueProps> = ({
   allTransfers,
   canRevealTransferTarget,
   onRevealTransferTarget,
+  canCopyTransferTargetPath,
+  onCopyTransferTargetPath,
 }) => {
   const { t } = useI18n();
   const [expandedParents, setExpandedParents] = useState<Record<string, boolean>>({});
@@ -303,6 +333,12 @@ export const SftpTransferQueue: React.FC<SftpTransferQueueProps> = ({
     document.body.style.userSelect = "none";
   }, [childNameWidth]);
 
+  const handleChildColumnWidthSet = useCallback((width: number) => {
+    const nextWidth = Math.max(MIN_CHILD_NAME_WIDTH, Math.min(MAX_CHILD_NAME_WIDTH, width));
+    setChildNameWidth(nextWidth);
+    persistChildNameWidth(nextWidth);
+  }, [persistChildNameWidth, setChildNameWidth]);
+
   const toggleExpanded = useCallback((taskId: string) => {
     setExpandedParents((prev) => ({
       ...prev,
@@ -325,18 +361,26 @@ export const SftpTransferQueue: React.FC<SftpTransferQueueProps> = ({
 
   return (
     <div
-      className="border-t border-border/70 bg-secondary/80 backdrop-blur-sm shrink-0"
+      className="border-t border-border/70 bg-secondary/80 supports-[backdrop-filter]:backdrop-blur-sm shrink-0"
+      data-section="terminal-sftp-transfer-queue"
       style={{ height: clampPanelHeight(panelHeight) }}
     >
-      <div
-        className="group flex h-3 cursor-row-resize items-center justify-center border-b border-border/30 text-muted-foreground/70"
-        onMouseDown={handleResizeStart}
-        title={t("sftp.transfers.dragToResize")}
-      >
-        <GripHorizontal size={14} className="transition-colors group-hover:text-foreground/80" />
-      </div>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <div
+            className="group flex h-3 cursor-row-resize items-center justify-center border-b border-border/30 text-muted-foreground/70"
+            onMouseDown={handleResizeStart}
+          >
+            <GripHorizontal size={14} className="transition-colors group-hover:text-foreground/80" />
+          </div>
+        </TooltipTrigger>
+        <TooltipContent>{t("sftp.transfers.dragToResize")}</TooltipContent>
+      </Tooltip>
 
-      <div className="flex items-center justify-between border-b border-border/40 px-3 py-1.5 text-[11px] text-muted-foreground">
+      <div
+        className="flex items-center justify-between border-b border-border/40 px-3 py-1.5 text-[11px] text-muted-foreground"
+        data-section="terminal-sftp-transfer-queue-header"
+      >
         <span className="font-medium">
           {t("sftp.transfers")}
           {sftp.activeTransfersCount > 0 && (
@@ -363,12 +407,14 @@ export const SftpTransferQueue: React.FC<SftpTransferQueueProps> = ({
       <div
         ref={scrollContainerRef}
         className="overflow-auto"
+        data-section="terminal-sftp-transfer-list"
         style={{ height: `calc(100% - ${HEADER_HEIGHT}px)` }}
         onScroll={handleScroll}
       >
         {topLevelTransfers.map((task) => {
           const childTasks = childrenByParent.get(task.id) ?? [];
           const isExpanded = expandedParents[task.id] ?? true;
+          const childListId = childListIdForTask(task.id);
 
           return (
             <React.Fragment key={task.id}>
@@ -377,15 +423,15 @@ export const SftpTransferQueue: React.FC<SftpTransferQueueProps> = ({
                 canToggleChildren={childTasks.length > 0}
                 isExpanded={isExpanded}
                 visibleChildCount={childTasks.length}
+                childListId={childListId}
                 onToggleChildren={() => toggleExpanded(task.id)}
                 onCancel={() => {
-                  if (task.sourceConnectionId === "external") {
-                    sftp.cancelExternalUpload();
-                  }
-                  sftp.cancelTransfer(task.id);
+                  void sftpTransferCenterStore.cancel(task.id);
                 }}
-                onRetry={() => sftp.retryTransfer(task.id)}
-                onDismiss={() => sftp.dismissTransfer(task.id)}
+                onPause={() => pauseViaCenter(task.id)}
+                onResume={() => resumeViaCenter(task.id)}
+                onRetry={() => { void sftpTransferCenterStore.retry(task.id); }}
+                onDismiss={() => sftpTransferCenterStore.dismiss(task.id)}
                 canRevealTarget={canRevealTransferTarget?.(task) ?? false}
                 onRevealTarget={
                   onRevealTransferTarget
@@ -394,19 +440,31 @@ export const SftpTransferQueue: React.FC<SftpTransferQueueProps> = ({
                       }
                     : undefined
                 }
+                canCopyTargetPath={canCopyTransferTargetPath?.(task) ?? false}
+                onCopyTargetPath={
+                  onCopyTransferTargetPath
+                    ? () => {
+                        void onCopyTransferTargetPath(task);
+                      }
+                    : undefined
+                }
               />
 
               {isExpanded && childTasks.length > 0 && (
                 <TransferChildList
                   childTasks={childTasks}
+                  childListId={childListId}
                   childNameWidth={childNameWidth}
                   onResizeNameColumn={handleChildColumnResizeStart}
+                  onSetNameColumnWidth={handleChildColumnWidthSet}
                   scrollContainerRef={scrollContainerRef}
                   scrollTop={scrollTop}
                   viewportHeight={viewportHeight}
-                  onCancel={(taskId) => sftp.cancelTransfer(taskId)}
-                  onRetry={(taskId) => sftp.retryTransfer(taskId)}
-                  onDismiss={(taskId) => sftp.dismissTransfer(taskId)}
+                  onCancel={(taskId) => { void sftpTransferCenterStore.cancel(taskId); }}
+                  onPause={(taskId) => pauseViaCenter(taskId)}
+                  onResume={(taskId) => resumeViaCenter(taskId)}
+                  onRetry={(taskId) => { void sftpTransferCenterStore.retry(taskId); }}
+                  onDismiss={(taskId) => sftpTransferCenterStore.dismiss(taskId)}
                 />
               )}
             </React.Fragment>
