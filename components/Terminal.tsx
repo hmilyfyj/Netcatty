@@ -3530,7 +3530,7 @@ const TerminalComponent: React.FC<TerminalProps> = ({
     setProgressLogs((prev) => (
       mode === "auto"
         ? [...prev, t("terminal.progress.autoReconnectAttempt", { attempt: autoReconnectAttemptRef.current })]
-        : ["Retrying secure channel..."]
+        : [...prev, "Retrying secure channel..."]
     ));
     setShowLogs(true);
 

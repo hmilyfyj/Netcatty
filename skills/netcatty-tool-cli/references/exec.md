@@ -1,31 +1,42 @@
-# Exec Reference
+# 命令执行参考
 
-Use this reference for remote command execution tasks.
+用于远程命令、系统信息、日志片段、进程检查、服务状态等任务。
 
-## Shortest Path
+## 短命令流程
 
-`exec` calls are internal agent transport calls. Always include both `--session <session-id>` and `--chat-session <chat-session-id>`.
-After `--`, pass exactly one shell-ready command string. Preserve any quoting inside that one argument instead of splitting it into multiple tokens.
+已有默认目标 session：
 
-1. If the host prompt already gives a connected default target session, prefer it directly:
-   - `<netcatty-cli-prefix> session --session <default-session-id> --json --chat-session <chat-session-id>`
-   - `<netcatty-cli-prefix> exec --session <default-session-id> --json --chat-session <chat-session-id> -- <command>`
-2. Otherwise:
-   - `<netcatty-cli-prefix> env --json --chat-session <chat-session-id>`
-   - Choose a `connected` session.
-   - `<netcatty-cli-prefix> session --session <session-id> --json --chat-session <chat-session-id>`
-   - `<netcatty-cli-prefix> exec --session <session-id> --json --chat-session <chat-session-id> -- <command>`
+```bash
+<netcatty-cli-prefix> session --session <session-id> --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> exec --session <session-id> --json --chat-session <chat-session-id> -- "<command>"
+```
 
-## Rules
+需要发现 session：
 
-- Use `exec` only for command-style tasks expected to finish within about 60 seconds, such as hostname, IP address, CPU info, memory info, disk usage, pwd, whoami, uname, or process checks.
-- Use long-running jobs for builds, scans, migrations, watch mode, `tail -f`, `ping`, log-following, or anything likely to exceed that budget or stream output for an extended period.
-- Long-running flow:
-  - `<netcatty-cli-prefix> job-start --session <session-id> --chat-session <chat-session-id> --json -- <command>`
-  - wait before polling unless the output clearly justifies checking sooner
-  - `<netcatty-cli-prefix> job-poll --job <job-id> --chat-session <chat-session-id> --offset <offset> --json`
-  - if the user asks to stop it: `<netcatty-cli-prefix> job-stop --job <job-id> --chat-session <chat-session-id> --json`
-- Prefer one straightforward command over temporary scripts or multi-step shell orchestration.
-- Avoid shell command substitution such as `$()` and backticks, because Netcatty safety policy may block them.
-- Avoid wrapping simple commands in `sh -c`, `bash -c`, or similar shell launchers unless truly necessary.
-- Only write a script when the task genuinely needs branching, loops, or structured parsing that cannot fit cleanly in one direct command.
+```bash
+<netcatty-cli-prefix> env --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> session --session <session-id> --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> exec --session <session-id> --json --chat-session <chat-session-id> -- "<command>"
+```
+
+`--` 后传入一个 shell-ready 命令字符串，保留命令内部引号。
+
+## 长任务流程
+
+适用于构建、扫描、迁移、watch、`tail -f`、持续 ping、长日志跟随。
+
+```bash
+<netcatty-cli-prefix> job-start --session <session-id> --json --chat-session <chat-session-id> -- "<command>"
+<netcatty-cli-prefix> job-poll --job <job-id> --offset 0 --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> job-stop --job <job-id> --json --chat-session <chat-session-id>
+```
+
+轮询使用上一次结果里的 `nextOffset`。默认约 30 秒轮询一次，输出显示完成后立即停止轮询并分析结果。
+
+## 命令选择
+
+- `exec` 承载约 60 秒内完成的命令，例如 `hostname`、`pwd`、`whoami`、`uname -a`、`df -h`、`free -m`。
+- 简单读取任务使用一条直接命令。
+- 需要循环、分支、复杂解析时再写脚本。
+- 避开 `$()` 和反引号形式的命令替换，Netcatty 安全策略可能拦截这类模式。
+- 串口/raw session 和网络设备 session 会按原样发送命令，结果通常没有 exit code。

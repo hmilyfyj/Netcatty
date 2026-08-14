@@ -28,7 +28,17 @@ NODE_OPTIONS=--disable-warning=DEP0190 \
   -c.mac.identity=- \
   -c.mac.notarize=false
 
-SOURCE_APP="$(find "${PROJECT_ROOT}/release" -maxdepth 2 -type d -name "${APP_NAME}" | head -n 1)"
+if [[ "$(uname -m)" == "arm64" ]]; then
+  PREFERRED_APP="${PROJECT_ROOT}/release/mac-arm64/${APP_NAME}"
+else
+  PREFERRED_APP="${PROJECT_ROOT}/release/mac/${APP_NAME}"
+fi
+
+if [[ -d "${PREFERRED_APP}" ]]; then
+  SOURCE_APP="${PREFERRED_APP}"
+else
+  SOURCE_APP="$(find "${PROJECT_ROOT}/release" -maxdepth 2 -type d -name "${APP_NAME}" | head -n 1)"
+fi
 
 if [[ -z "${SOURCE_APP}" ]]; then
   echo "未找到构建产物 ${APP_NAME}"

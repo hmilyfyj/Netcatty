@@ -1,47 +1,64 @@
 ---
 name: netcatty-tool-cli
-description: Use this skill when an external agent needs to operate on Netcatty sessions through Skills + CLI instead of the netcatty-remote-hosts MCP server.
+description: 当外部 AI 需要通过 Netcatty 已连接会话执行远程命令、长任务或 SFTP 文件操作时使用。适用于 Netcatty 的 Skills + CLI 集成模式，使用主程序提供的 netcatty-tool-cli 前缀访问当前授权的服务器会话。
 ---
 
 # Netcatty Tool CLI
 
-Use this skill for external ACP agents when Netcatty is configured for `Skills + CLI` mode.
+此 skill 用于外部 ACP/CLI agent 通过 Netcatty 操作当前授权范围内的终端会话。Netcatty 负责保存服务器、凭证、代理、跳板、权限和审批；agent 只通过 CLI 操作已暴露的 session。
 
-For routine tasks, the host prompt is usually enough. Read only the reference that matches the task type.
+## 快速路由
 
-## Router
+1. 使用宿主提示中给出的 Netcatty CLI 前缀。
+2. 每次调用都带上 `--chat-session <chat-session-id>`。
+3. 涉及目标会话的命令都带上 `--session <session-id>`。
+4. 先按任务类型选路径：
+   - 远程命令：阅读 `references/exec.md`。
+   - 远程文件或目录：阅读 `references/sftp.md`。
+   - 会话类型、网络设备、串口：阅读 `references/session-types.md`。
+   - 取消、恢复、长任务诊断：阅读 `references/control-commands.md`。
+   - CLI 报错：阅读 `references/errors.md`。
 
-1. Use the exact Netcatty CLI prefix provided by the host prompt.
-2. Keep `--chat-session <chat-session-id>` on every Netcatty CLI call. Do not omit it.
-3. Treat `--chat-session <chat-session-id>` as required for `env`, `session`, real `exec`, and every `sftp` operation. Treat `--session <session-id>` as required for `session`, `exec`, and every `sftp` operation.
-4. Classify the task before choosing a command path:
-   - Remote command execution tasks go through the exec reference.
-   - Remote file or directory tasks go through the sftp reference.
-   - If the user explicitly says to avoid shell or `exec`, do not use `exec`.
-   - Treat `exec` as the short-command path only. If the command may exceed about 60 seconds, or streams output for an extended period, use the long-running job commands instead of plain `exec`.
-5. If the host prompt already names a connected default target session, use that session directly for routine requests that do not mention another session or host, but still start with `session --session <id> --json --chat-session <chat-session-id>` instead of jumping straight to `exec` or `sftp`.
-6. Only fall back to `env` lookup when the task is ambiguous, the user points to another session, or that direct `session` lookup fails.
+## 最短可用流程
 
-## Core Rules
+已有默认目标 session 时：
 
-- Treat the host-provided CLI prefix as the only supported entrypoint for this session.
-- If a command launcher is needed, prefer the operating system's built-in launcher for the current environment; do not require optional shells that may not be installed.
-- Run Netcatty CLI commands strictly serially.
-- Treat Netcatty CLI errors as authoritative.
-- Never ask the user for SSH credentials, key paths, proxy settings, or jump-host details when Netcatty session access already exists.
-- Do not pause to explain the plan, re-read this skill, or design scripts before trying that shortest path.
-- When presenting structured results, prefer a concise table if it fits clearly.
+```bash
+<netcatty-cli-prefix> session --session <session-id> --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> exec --session <session-id> --json --chat-session <chat-session-id> -- "pwd"
+```
 
-Examples:
+需要发现可用 session 时：
 
-- On Windows, if a literal shell command line is required, use the host-provided prefix with the system launcher available in the environment, such as `cmd.exe` or Windows PowerShell; do not assume PowerShell 7 `pwsh.exe` exists.
-- On macOS or Linux, use the host-provided prefix directly, or the system shell already available in that environment when a shell command line is unavoidable.
-- When the execution surface accepts argv-style calls, use the Netcatty launcher path as the executable and pass subcommands and flags as separate arguments instead of wrapping it in another shell.
+```bash
+<netcatty-cli-prefix> env --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> session --session <session-id> --json --chat-session <chat-session-id>
+```
 
-## References
+## 核心规则
 
-- Exec and session workflow: `references/exec.md`
-- SFTP file workflow: `references/sftp.md`
-- Session and device-type handling: `references/session-types.md`
-- Cancel, resume, and runtime diagnostics: `references/control-commands.md`
-- Error handling and authoritative failures: `references/errors.md`
+- CLI 调用串行执行，等待上一条完成后再发下一条。
+- `session` 查询是执行前的确认步骤，用它核对 `protocol`、`shellType`、`deviceType`、`connected`。
+- `exec` 用于约 60 秒内完成的命令。
+- 长时间运行、持续输出、构建、扫描、日志跟随类任务使用 `job-start`、`job-poll`、`job-stop`。
+- 文件读写、目录列表、上传下载优先走 SFTP CLI。
+- SSH 凭证、私钥路径、代理、跳板链由 Netcatty 管理，agent 直接使用 session。
+- Netcatty CLI 的错误结果作为当前事实依据。
+
+## 常用命令形态
+
+```bash
+<netcatty-cli-prefix> status --json
+<netcatty-cli-prefix> env --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> session --session <session-id> --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> exec --session <session-id> --json --chat-session <chat-session-id> -- "hostname && pwd"
+<netcatty-cli-prefix> job-start --session <session-id> --json --chat-session <chat-session-id> -- "npm run build"
+<netcatty-cli-prefix> job-poll --job <job-id> --offset 0 --json --chat-session <chat-session-id>
+<netcatty-cli-prefix> sftp list --session <session-id> --remote-path /tmp --json --chat-session <chat-session-id>
+```
+
+## 输出习惯
+
+- 结构化结果优先用简短表格。
+- 执行失败时报告 Netcatty 返回的 `code` 和 `message`。
+- 涉及写操作、删除、上传、长任务停止时说明目标 session 与路径。

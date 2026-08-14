@@ -1,42 +1,65 @@
-# SFTP Reference
+# SFTP 参考
 
-Use this reference for remote file or directory tasks.
+用于远程文件读取、写入、目录列表、上传、下载、改名、权限修改等任务。
 
-## Default Path
+## 前置检查
 
-- Treat file and directory tasks as SFTP tasks by default, not shell tasks.
-- If the user explicitly says to use only `sftp`, do not call `exec`.
-- Every `sftp` command must include both `--session <session-id>` and `--chat-session <chat-session-id>`.
-- Do not use reusable SFTP handles or `--sftp <id>`.
-- After choosing a target session, first run `session --session <id> --json --chat-session <chat-session-id>` and inspect the returned metadata.
-- Use SFTP only when that `session` result shows a connected SSH-backed session. For local, Mosh, Telnet, serial/raw, or network-device sessions, do not use SFTP.
-- Keep path semantics strict:
-  - `--remote-path` always means a path on the remote host.
-  - `--local-path` always means a path on the local machine running Netcatty.
-- If the user says "download" to a local destination such as `/tmp`, `~/Downloads`, or Desktop, use `sftp download`.
-- If the user says to create or modify a file on the remote host, use `sftp write`, `sftp upload`, or another remote SFTP operation. Do not reinterpret that as a local download.
+先确认目标 session：
 
-## One-Off Commands
+```bash
+<netcatty-cli-prefix> session --session <session-id> --json --chat-session <chat-session-id>
+```
 
-- List a directory:
-  - `<netcatty-cli-prefix> sftp list --session <session-id> --remote-path <remote-path> --json --chat-session <chat-session-id>`
-- Read a file:
-  - `<netcatty-cli-prefix> sftp read --session <session-id> --remote-path <remote-path> --json --chat-session <chat-session-id>`
-- Write a small text file with known content:
-  - `<netcatty-cli-prefix> sftp write --session <session-id> --remote-path <remote-path> --content <text> --json --chat-session <chat-session-id>`
-- Download a remote file to an existing local path:
-  - `<netcatty-cli-prefix> sftp download --session <session-id> --remote-path <remote-path> --local-path <local-path> --json --chat-session <chat-session-id>`
-- Upload an existing local file:
-  - `<netcatty-cli-prefix> sftp upload --session <session-id> --local-path <local-path> --remote-path <remote-path> --json --chat-session <chat-session-id>`
-- Delete a remote path:
-  - `<netcatty-cli-prefix> sftp delete --session <session-id> --remote-path <remote-path> --json --chat-session <chat-session-id>`
+继续前核对：
 
-## Rules
+- `connected` 为可用状态。
+- `protocol` 为 SSH 相关会话。
+- 文件任务的目标路径属于远程主机时使用 `--remote-path`。
+- 保存到本机的目标路径使用 `--local-path`。
 
-- Use `sftp write` directly for creating or updating a small text file with known content.
-- Use `sftp upload` only when a real local file already exists and must be transferred.
-- Use `sftp download` when the result must be saved to the local filesystem.
-- Do not create temporary local files just to upload text that could be sent with `sftp write`.
-- Do not use `sftp read` as a substitute for `sftp download` when the user asked for a local saved file.
-- Do not use `sftp write` as a substitute for `sftp download`; writing to `/tmp/foo` with `sftp write` writes to the remote host's `/tmp`, not the local machine.
-- Do not use shell commands like `cat`, `touch`, redirection, or ad hoc SCP/SSH usage for remote file tasks.
+## 常用命令
+
+列目录：
+
+```bash
+<netcatty-cli-prefix> sftp list --session <session-id> --remote-path <remote-path> --json --chat-session <chat-session-id>
+```
+
+读远程文本文件：
+
+```bash
+<netcatty-cli-prefix> sftp read --session <session-id> --remote-path <remote-path> --json --chat-session <chat-session-id>
+```
+
+写入小文本文件：
+
+```bash
+<netcatty-cli-prefix> sftp write --session <session-id> --remote-path <remote-path> --content "<text>" --json --chat-session <chat-session-id>
+```
+
+下载远程文件到本机：
+
+```bash
+<netcatty-cli-prefix> sftp download --session <session-id> --remote-path <remote-path> --local-path <local-path> --json --chat-session <chat-session-id>
+```
+
+上传本机文件到远程：
+
+```bash
+<netcatty-cli-prefix> sftp upload --session <session-id> --local-path <local-path> --remote-path <remote-path> --json --chat-session <chat-session-id>
+```
+
+删除远程路径：
+
+```bash
+<netcatty-cli-prefix> sftp delete --session <session-id> --remote-path <remote-path> --json --chat-session <chat-session-id>
+```
+
+## 路径语义
+
+- `--remote-path` 表示远程服务器路径。
+- `--local-path` 表示运行 Netcatty 的本机路径。
+- 用户要求下载到 `/tmp`、`~/Downloads`、Desktop 等本机位置时使用 `sftp download`。
+- 用户要求创建或修改远程文件时使用 `sftp write` 或 `sftp upload`。
+- 已有本机文件需要传到远程时使用 `sftp upload`。
+- 已知文本内容需要写到远程时直接使用 `sftp write`。

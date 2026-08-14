@@ -1,17 +1,29 @@
-# Control Commands
+# 控制命令参考
 
-Read this when you need diagnostics, cancellation, or to re-enable a cancelled chat scope.
+用于运行状态诊断、取消当前 chat scope 的任务、恢复被取消的 scope。
 
-## Useful Commands
+## 常用命令
 
-- Runtime diagnostics:
-  - `<netcatty-cli-prefix> status --json`
-- Cancel outstanding Netcatty work for this chat scope:
-  - `<netcatty-cli-prefix> cancel --chat-session <chat-session-id> --json`
-- Re-enable execution for that same chat scope:
-  - `<netcatty-cli-prefix> resume --chat-session <chat-session-id> --json`
+运行状态：
 
-## Rules
+```bash
+<netcatty-cli-prefix> status --json
+```
 
-- `cancel` affects the current chat scope; it requests cancellation for in-flight `exec`, session-backed SFTP transfers, and running `job-start` work in that scope. Later `exec` calls in that scope stay blocked until `resume`.
-- Do not issue control commands concurrently with other Netcatty CLI commands for the same chat session.
+取消当前 chat scope 的未完成工作：
+
+```bash
+<netcatty-cli-prefix> cancel --chat-session <chat-session-id> --json
+```
+
+恢复当前 chat scope 的执行能力：
+
+```bash
+<netcatty-cli-prefix> resume --chat-session <chat-session-id> --json
+```
+
+## 行为边界
+
+- `cancel` 影响当前 `--chat-session` 范围内的 `exec`、session-backed SFTP 传输、运行中的 job。
+- `resume` 用于同一个 `--chat-session`。
+- 控制命令与同一 chat session 的其他 Netcatty CLI 调用串行执行。
