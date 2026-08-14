@@ -1,0 +1,7 @@
+interface:
+  display_name: "Netcatty Tool CLI"
+  short_description: "通过 Netcatty 会话执行命令与 SFTP"
+  default_prompt: "使用 $netcatty-tool-cli 查看当前 Netcatty 会话并在目标服务器执行 pwd。"
+
+policy:
+  allow_implicit_invocation: true
