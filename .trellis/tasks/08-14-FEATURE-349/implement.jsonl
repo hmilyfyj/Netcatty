@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/desktop/app/index.md", "reason": "桌面应用规范入口"}
+{"file": ".trellis/spec/desktop/app/directory-structure.md", "reason": "确认主仓分层与 allowlist 目录"}
+{"file": ".trellis/spec/desktop/app/quality-guidelines.md", "reason": "确认检查命令和 MR 目标"}
+{"file": ".trellis/spec/guides/task-writing-guide.md", "reason": "本仓 task 文档写法"}
