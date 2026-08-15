@@ -32,9 +32,9 @@
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `trellis platforms --json` 含 claude-code、codex、pi、trae 四个 id。
-- [ ] AC-2: `git check-ignore` 对 `.trellis/config.yaml`、`.claude/settings.json`、`.codex/config.toml`、`.pi/settings.json`、`.trae/hooks.json`、`.agents/skills/trellis-start/SKILL.md` 均不命中。
-- [ ] AC-3: `AGENTS.md` 含 `<!-- TRELLIS:START -->` / `<!-- TRELLIS:END -->`，且原有 domain/application/UI 说明仍在。
-- [ ] AC-4: `.trellis/config.yaml` 的 `default_package` 为 `desktop`，packages 仅 desktop / plugin-contract / plugin-sdk / plugin-cli。
-- [ ] AC-5: `.trellis/spec/` 无 `To fill` / `To be filled` / `placeholder`；`desktop` 规范引用真实路径（如 `domain/models.ts`、`infrastructure/config/storageKeys.ts`）。
-- [ ] AC-6: `python3 ./.trellis/scripts/task.py validate FEATURE-349` 通过；feature 分支已提交并可推到 origin。
+- [x] AC-1: `trellis platforms --json` 含 claude-code、codex、pi、trae 四个 id。
+- [x] AC-2: `git check-ignore` 对 `.trellis/config.yaml`、`.claude/settings.json`、`.codex/config.toml`、`.pi/settings.json`、`.trae/hooks.json`、`.agents/skills/trellis-start/SKILL.md` 均不命中。
+- [x] AC-3: `AGENTS.md` 含 `<!-- TRELLIS:START -->` / `<!-- TRELLIS:END -->`，且原有 domain/application/UI 说明仍在。
+- [x] AC-4: `.trellis/config.yaml` 的 `default_package` 为 `desktop`，packages 仅 desktop / plugin-contract / plugin-sdk / plugin-cli。
+- [x] AC-5: `.trellis/spec/` 无 `To fill` / `To be filled` / `placeholder`；`desktop` 规范引用真实路径（如 `domain/models.ts`、`infrastructure/config/storageKeys.ts`）。
+- [x] AC-6: `python3 ./.trellis/scripts/task.py validate FEATURE-349` 通过；feature 分支已提交并可推到 origin。

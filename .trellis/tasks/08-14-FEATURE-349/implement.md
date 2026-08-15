@@ -16,7 +16,7 @@
 
 ## 待做
 
-- [ ] 提交并推到 origin，开目标 `main` 的 PR
+- [x] 提交并推到 origin，开目标 `main` 的 PR（https://github.com/hmilyfyj/Netcatty/pull/3 已 MERGED）
 
 ## 验证命令
 
