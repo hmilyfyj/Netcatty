@@ -42,3 +42,37 @@ FEATURE-349 已 done 且 PR #3 已 MERGED。核验 6 条 AC 后勾选，在 feat
 ### Next Steps
 
 - 推送 feature/FEATURE-349-trellis 并开目标 main 的归档 PR，待人工评审
+
+
+## Session 2: 归档 FEATURE-346-sftp
+
+**Date**: 2026-08-17
+**Task**: 归档 FEATURE-346-sftp
+**Package**: desktop
+**Branch**: `feature/FEATURE-346-upstream-sync`
+
+### Summary
+
+用户确认分组 tab Open SFTP 已恢复后，核验 AC 并归档 08-17-FEATURE-346-sftp。单测 26 通过；未合入主干。
+
+### Main Changes
+
+- 勾选 FEATURE-346-sftp 三条 AC 并执行 task.py archive
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ce2aa139` | (see git log) |
+
+### Testing
+
+- [OK] node --test --import tsx application/state/terminalGroups.test.ts domain/sftpConnectedHosts.test.ts（26 passed）
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- FEATURE-346-follow-cwd 待用户确认本机 cd 跟随后再归档；FEATURE-346 issue 仍为 todo
