@@ -183,6 +183,17 @@ test("retained cleanup is scheduled even if close state has not committed yet", 
   }), true);
 });
 
+test("a live host-group tab is not treated as an invalid SFTP owner", () => {
+  assert.deepEqual(listInvalidSftpPanelTabIds({
+    mountedTabIds: ["group-1", "s-open"],
+    activeTransferTabIds: [],
+    retainedTabIds: [],
+    openingTabIds: ["group-1"],
+    cleanupTimerTabIds: [],
+    validTabIds: new Set(["group-1", "s-open"]),
+  }), []);
+});
+
 test("closing a terminal tab finds every retained SFTP resource for cleanup", () => {
   assert.deepEqual(listInvalidSftpPanelTabIds({
     mountedTabIds: ["closed-tab", "open-tab"],

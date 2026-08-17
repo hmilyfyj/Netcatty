@@ -6,6 +6,7 @@ import { Monitor, Search } from 'lucide-react';
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import {
+    sftpHostDisplayLabel,
     sftpHostEndpointsEqual,
     sftpSourceSessionIdForHost,
     type SftpConnectedHostEntry,
@@ -79,9 +80,9 @@ const SftpHostPickerInner: React.FC<SftpHostPickerProps> = ({
     const filteredConnectedHosts = useMemo(() => {
         return connectedHosts.filter(({ host }) =>
             !term ||
-            host.label.toLowerCase().includes(term) ||
+            sftpHostDisplayLabel(host).toLowerCase().includes(term) ||
             host.hostname.toLowerCase().includes(term) ||
-            host.username.toLowerCase().includes(term),
+            (host.username || '').toLowerCase().includes(term),
         );
     }, [connectedHosts, term]);
 
@@ -103,9 +104,9 @@ const SftpHostPickerInner: React.FC<SftpHostPickerProps> = ({
             const connected = connectedByHostId.get(h.id);
             if (connected && sftpHostEndpointsEqual(h, connected.host)) return false;
             return !term
-                || h.label.toLowerCase().includes(term)
+                || sftpHostDisplayLabel(h).toLowerCase().includes(term)
                 || h.hostname.toLowerCase().includes(term);
-        }).sort((a, b) => a.label.localeCompare(b.label));
+        }).sort((a, b) => sftpHostDisplayLabel(a).localeCompare(sftpHostDisplayLabel(b)));
     }, [hosts, term, connectedByHostId]);
     const sideLabel = side === 'left' ? t('common.left') : t('common.right');
 
@@ -300,10 +301,10 @@ const SftpHostPickerInner: React.FC<SftpHostPickerProps> = ({
                 onMouseMove={(event) => handlePointerHover(event.movementX, event.movementY)}
             >
                 <div className="flex items-center gap-3 min-w-0">
-                    <DistroAvatar host={host} fallback={host.label.slice(0, 2).toUpperCase()} size="sm" />
+                    <DistroAvatar host={host} fallback={sftpHostDisplayLabel(host).slice(0, 2).toUpperCase()} size="sm" />
                     <div className="flex min-w-0 items-center gap-1.5">
                         {showStatus ? <StatusDot /> : null}
-                        <span className="text-sm font-medium truncate">{host.label}</span>
+                        <span className="text-sm font-medium truncate">{sftpHostDisplayLabel(host)}</span>
                     </div>
                 </div>
                 <div className="ml-3 shrink-0 text-[11px] text-muted-foreground truncate max-w-[12rem]">

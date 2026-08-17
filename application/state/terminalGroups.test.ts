@@ -4,7 +4,9 @@ import test from "node:test";
 import type { TerminalSession } from "../../domain/models";
 import {
   addConsoleToGroup,
+  collectValidTerminalTabIds,
   createTerminalGroup,
+  getSessionSurfaceTabId,
   isRemoteGroupableHost,
   rebuildTerminalGroups,
   removeConsoleFromGroup,
@@ -69,4 +71,22 @@ test("resolveGroupedActiveSession prefers the group's active console", () => {
   const sessions = [session({ id: "s1", groupId: "g1" }), session({ id: "s2", groupId: "g1" })];
   const active = resolveGroupedActiveSession(groups, sessions, "g1");
   assert.equal(active?.id, "s1");
+});
+
+test("getSessionSurfaceTabId prefers workspace, then group, then session", () => {
+  assert.equal(getSessionSurfaceTabId(session({ id: "s1", workspaceId: "ws1", groupId: "g1" })), "ws1");
+  assert.equal(getSessionSurfaceTabId(session({ id: "s1", groupId: "g1" })), "g1");
+  assert.equal(getSessionSurfaceTabId(session({ id: "s1" })), "s1");
+});
+
+test("collectValidTerminalTabIds keeps group tabs so SFTP state is not evicted", () => {
+  const ids = collectValidTerminalTabIds({
+    sessions: [session({ id: "s1", groupId: "group-1" }), session({ id: "s2" })],
+    workspaces: [{ id: "ws1" }],
+    groups: [{ id: "group-1" }],
+  });
+  assert.equal(ids.has("s1"), true);
+  assert.equal(ids.has("s2"), true);
+  assert.equal(ids.has("group-1"), true);
+  assert.equal(ids.has("ws1"), true);
 });

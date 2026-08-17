@@ -5,6 +5,7 @@ import type { Host, TerminalSession } from "./models";
 import {
   listSftpConnectedHosts,
   resolveSftpTransferSourceSessionId,
+  sftpHostDisplayLabel,
   sftpHostEndpointsEqual,
   sftpPickerSessionsEqual,
   sftpSourceSessionIdForHost,
@@ -28,6 +29,33 @@ const session = (
   hostname: `${overrides.hostId}.example.test`,
   protocol: "ssh",
   ...overrides,
+});
+
+test("sftpHostDisplayLabel falls back to hostname when label is missing", () => {
+  assert.equal(sftpHostDisplayLabel({ id: "a", label: "Alpha", hostname: "a.example.test" }), "Alpha");
+  assert.equal(sftpHostDisplayLabel({ id: "b", label: "", hostname: "b.example.test" }), "b.example.test");
+  assert.equal(
+    sftpHostDisplayLabel({ id: "c", label: undefined as unknown as string, hostname: "c.example.test" }),
+    "c.example.test",
+  );
+});
+
+test("listSftpConnectedHosts sorts unlabeled hosts without throwing", () => {
+  const hosts = [
+    host({ id: "b", label: undefined as unknown as string, hostname: "bravo.example.test" }),
+    host({ id: "a", label: "Alpha" }),
+  ];
+  const hostsById = new Map(hosts.map((item) => [item.id, item]));
+  const sessions = [
+    session({ id: "s-b", hostId: "b", status: "connected" }),
+    session({ id: "s-a", hostId: "a", status: "connected" }),
+  ];
+
+  const result = listSftpConnectedHosts(sessions, hostsById);
+  assert.deepEqual(
+    result.map((entry) => entry.host.id),
+    ["a", "b"],
+  );
 });
 
 test("listSftpConnectedHosts returns connected SSH hosts sorted by label", () => {

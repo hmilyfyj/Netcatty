@@ -16,6 +16,10 @@ import { useTerminalBackend } from '../application/state/useTerminalBackend';
 import {
   useCodingCliSessionSignals,
 } from '../application/state/codingCliSessionSignalController';
+import {
+  collectValidTerminalTabIds,
+  getSessionSurfaceTabId,
+} from '../application/state/terminalGroups';
 import { collectSessionIds } from '../domain/workspace';
 import { isPluginHostProtocol } from '../domain/pluginConnection';
 
@@ -401,7 +405,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     if (!session) return;
     const proto = session.protocol;
     const sftpAvailable = proto === 'ssh' || proto === 'mosh';
-    const tabId = session.workspaceId || sessionId;
+    const tabId = getSessionSurfaceTabId(session);
 
     if (sidePanelOpenTabsRef.current.has(tabId)) return;
 
@@ -433,7 +437,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
           username: session.username,
           port: session.port ?? 22,
           protocol: proto,
-          label: session.label || session.hostname,
+          label: session.hostLabel || session.hostname,
         } as Host;
 
       setSftpHostForTab(prev => {
@@ -1149,12 +1153,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
   }, [onUpdateHost, onUpdateSessionFontSize, onUpdateTerminalFontSize]);
 
-  const validAIScopeTargetIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const session of sessions) ids.add(session.id);
-    for (const workspace of workspaces) ids.add(workspace.id);
-    return ids;
-  }, [sessions, workspaces]);
+  const validAIScopeTargetIds = useMemo(
+    () => collectValidTerminalTabIds({ sessions, workspaces, groups }),
+    [groups, sessions, workspaces],
+  );
 
   useEffect(() => {
     pruneTerminalTabMemoryState({

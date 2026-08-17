@@ -7,6 +7,11 @@ export type SftpConnectedHostEntry = {
   status: "connected";
 };
 
+/** Picker/sort text when a vault host has no label. */
+export const sftpHostDisplayLabel = (
+  host: Pick<Host, "id" | "label" | "hostname">,
+): string => host.label || host.hostname || host.id;
+
 /** Fields the SFTP Connected picker cares about from a terminal session. */
 export type SftpPickerSessionFields = Pick<
   TerminalSession,
@@ -127,7 +132,7 @@ export const listSftpConnectedHosts = (
   }
 
   return [...bestByHostId.values()].sort((a, b) =>
-    a.host.label.localeCompare(b.host.label),
+    sftpHostDisplayLabel(a.host).localeCompare(sftpHostDisplayLabel(b.host)),
   );
 };
 

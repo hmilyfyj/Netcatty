@@ -13,7 +13,7 @@ export function createTerminalGroup(input: {
 }): TerminalGroup {
   return {
     id: input.id,
-    title: input.host.label,
+    title: input.host.label || input.host.hostname,
     hostId: input.host.id,
     hostLabel: input.host.label,
     hostname: input.host.hostname,
@@ -124,4 +124,27 @@ export function resolveGroupedActiveSession(
   if (!group) return sessions.find((session) => session.id === activeTabId);
   return sessions.find((session) => session.id === group.activeSessionId)
     ?? sessions.find((session) => session.groupId === group.id);
+}
+
+/** Top-tab id that owns side-panel / SFTP state for a live session. */
+export function getSessionSurfaceTabId(
+  session: Pick<TerminalSession, "id" | "workspaceId" | "groupId">,
+): string {
+  return session.workspaceId || session.groupId || session.id;
+}
+
+/** Session, workspace, and host-group tab ids that may keep side-panel state. */
+export function collectValidTerminalTabIds(params: {
+  sessions: ReadonlyArray<Pick<TerminalSession, "id" | "groupId">>;
+  workspaces?: ReadonlyArray<{ id: string }>;
+  groups?: ReadonlyArray<Pick<TerminalGroup, "id">>;
+}): Set<string> {
+  const ids = new Set<string>();
+  for (const session of params.sessions) {
+    ids.add(session.id);
+    if (session.groupId) ids.add(session.groupId);
+  }
+  for (const workspace of params.workspaces ?? []) ids.add(workspace.id);
+  for (const group of params.groups ?? []) ids.add(group.id);
+  return ids;
 }
