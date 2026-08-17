@@ -1,7 +1,19 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
+import { createRequire } from 'node:module';
 import path from 'path';
 import { defineConfig, type Plugin } from 'vite';
+
+const require = createRequire(import.meta.url);
+const {
+  copyMonacoVsAssets,
+  copyMonacoVsAssetsToDist,
+  assertMonacoDistAssets,
+} = require('./scripts/copy-monaco.cjs') as {
+  copyMonacoVsAssets: () => string;
+  copyMonacoVsAssetsToDist: () => string;
+  assertMonacoDistAssets: () => string;
+};
 
 // Custom plugin to suppress monaco-editor source map warnings
 const suppressMonacoSourcemapWarning = () => ({
@@ -19,6 +31,22 @@ const suppressMonacoSourcemapWarning = () => ({
 });
 
 /** After git pull / npm install, stale pre-bundles return 504; force a full reload. */
+const copyMonacoBuildAssets = (): Plugin => ({
+  name: 'copy-monaco-build-assets',
+  apply: 'build',
+  buildStart() {
+    copyMonacoVsAssets();
+  },
+  closeBundle() {
+    try {
+      assertMonacoDistAssets();
+    } catch {
+      copyMonacoVsAssetsToDist();
+      assertMonacoDistAssets();
+    }
+  },
+});
+
 const reloadOnOutdatedOptimizeDep = (): Plugin => ({
   name: 'reload-on-outdated-optimize-dep',
   apply: 'serve',
@@ -92,7 +120,7 @@ export default defineConfig(() => {
           },
         },
       },
-      plugins: [suppressMonacoSourcemapWarning(), reloadOnOutdatedOptimizeDep(), tailwindcss(), react()],
+      plugins: [copyMonacoBuildAssets(), suppressMonacoSourcemapWarning(), reloadOnOutdatedOptimizeDep(), tailwindcss(), react()],
       resolve: {
         alias: {
           '@': path.resolve(__dirname, '.'),

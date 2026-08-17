@@ -14,13 +14,18 @@ import {
 import Editor, { type OnMount, loader, useMonaco } from '@monaco-editor/react';
 import type * as Monaco from 'monaco-editor';
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import { resolveMonacoVsPath } from '../../infrastructure/monaco/monacoVsPath';
 
-// Configure Monaco to use local files instead of CDN
-const viteEnv = import.meta.env ?? { BASE_URL: "/" };
-const monacoBasePath = viteEnv.DEV
-  ? './node_modules/monaco-editor/min/vs'
-  : `${viteEnv.BASE_URL}monaco/vs`;
-loader.config({ paths: { vs: monacoBasePath } });
+const viteEnv = import.meta.env ?? { DEV: false, BASE_URL: "/" };
+loader.config({
+  paths: {
+    vs: resolveMonacoVsPath({
+      isDev: Boolean(viteEnv.DEV),
+      baseUrl: viteEnv.BASE_URL,
+      baseURI: typeof document !== "undefined" ? document.baseURI : undefined,
+    }),
+  },
+});
 
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { useClipboardBackend } from '../../application/state/useClipboardBackend';

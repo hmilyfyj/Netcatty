@@ -8,13 +8,19 @@ import {
   readClipboardTextWithFallbacks,
 } from '@/infrastructure/monaco/monacoClipboardPaste';
 import { useNetcattyMonacoTheme } from '@/infrastructure/monaco/useNetcattyMonacoTheme';
+import { resolveMonacoVsPath } from '@/infrastructure/monaco/monacoVsPath';
 import { registerNctMonacoCompletionProvider } from '@/infrastructure/scripts/nctMonacoCompletion.ts';
 
-const viteEnv = import.meta.env ?? { BASE_URL: '/' };
-const monacoBasePath = viteEnv.DEV
-  ? './node_modules/monaco-editor/min/vs'
-  : `${viteEnv.BASE_URL}monaco/vs`;
-loader.config({ paths: { vs: monacoBasePath } });
+const viteEnv = import.meta.env ?? { DEV: false, BASE_URL: '/' };
+loader.config({
+  paths: {
+    vs: resolveMonacoVsPath({
+      isDev: Boolean(viteEnv.DEV),
+      baseUrl: viteEnv.BASE_URL,
+      baseURI: typeof document !== 'undefined' ? document.baseURI : undefined,
+    }),
+  },
+});
 
 export interface ScriptCodeEditorProps {
   value: string;
