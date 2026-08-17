@@ -31,6 +31,6 @@
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `node --test --import tsx application/state/terminalGroups.test.ts domain/sftpConnectedHosts.test.ts` 通过，且包含 group tab id 与缺 label 用例。
-- [ ] AC-2: `validAIScopeTargetIds` / 等价集合包含当前 `groups[].id`，`listInvalidSftpPanelTabIds` 不会把仍打开的 `group-*` 清掉。
-- [ ] AC-3: 本机安装版在 `队列服务器` 这类分组 tab 点 Open SFTP，终端层保持可见，右侧出现 SFTP 面板。
+- [x] AC-1: `node --test --import tsx application/state/terminalGroups.test.ts domain/sftpConnectedHosts.test.ts` 通过，且包含 group tab id 与缺 label 用例。
+- [x] AC-2: `validAIScopeTargetIds` / 等价集合包含当前 `groups[].id`，`listInvalidSftpPanelTabIds` 不会把仍打开的 `group-*` 清掉。
+- [x] AC-3: 本机安装版在 `队列服务器` 这类分组 tab 点 Open SFTP，终端层保持可见，右侧出现 SFTP 面板。
