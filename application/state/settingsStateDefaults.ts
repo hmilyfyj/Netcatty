@@ -73,7 +73,7 @@ export const DEFAULT_SFTP_AUTO_SYNC = false;
 export const DEFAULT_SFTP_SHOW_HIDDEN_FILES = false;
 export const DEFAULT_SFTP_USE_COMPRESSED_UPLOAD = true;
 export const DEFAULT_SFTP_AUTO_OPEN_SIDEBAR = false;
-export const DEFAULT_SFTP_FOLLOW_TERMINAL_CWD = false;
+export const DEFAULT_SFTP_FOLLOW_TERMINAL_CWD = true;
 export const DEFAULT_SFTP_DEFAULT_VIEW_MODE: 'list' | 'tree' = 'list';
 export const DEFAULT_SHOW_RECENT_HOSTS = true;
 export { DEFAULT_HOST_CLICK_BEHAVIOR } from '../../domain/hostClickBehavior';

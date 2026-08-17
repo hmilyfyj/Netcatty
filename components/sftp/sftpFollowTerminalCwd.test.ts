@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { DEFAULT_SFTP_FOLLOW_TERMINAL_CWD } from "../../application/state/settingsStateDefaults";
 import {
   mergeLatestFollowTerminalCwdHostSetting,
   resolveHostFollowTerminalCwd,
@@ -108,6 +109,10 @@ test("resolveHostFollowTerminalCwd inherits the global setting until the host ov
   assert.equal(resolveHostFollowTerminalCwd(undefined, false), false);
   assert.equal(resolveHostFollowTerminalCwd(true, false), true);
   assert.equal(resolveHostFollowTerminalCwd(false, true), false);
+  assert.equal(
+    resolveHostFollowTerminalCwd(undefined, DEFAULT_SFTP_FOLLOW_TERMINAL_CWD),
+    true,
+  );
 });
 
 test("resolveSftpFollowTerminalCwdTargetHost prefers the visible SFTP host", () => {

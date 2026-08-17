@@ -74,7 +74,7 @@ export const DEFAULT_TERMINAL_SETTINGS_SNAPSHOT: TerminalSettingsSnapshot = Obje
   sftpShowHiddenFiles: false,
   sftpUseCompressedUpload: false,
   sftpAutoOpenSidebar: false,
-  sftpFollowTerminalCwd: false,
+  sftpFollowTerminalCwd: true,
   sftpDefaultViewMode: 'list',
   editorWordWrap: true,
   sessionLogsEnabled: false,

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   DEFAULT_THEME,
+  DEFAULT_SFTP_FOLLOW_TERMINAL_CWD,
   getContrastRatio,
   buildAppThemeCssVars,
   getHslTokenRelativeLuminance,
@@ -27,6 +28,10 @@ function installMemoryLocalStorage(): Map<string, string> {
 
 test("fresh installs follow the operating system color scheme by default", () => {
   assert.equal(DEFAULT_THEME, "system");
+});
+
+test("SFTP follows the terminal directory by default", () => {
+  assert.equal(DEFAULT_SFTP_FOLLOW_TERMINAL_CWD, true);
 });
 
 test("migrateIncomingTerminalFontId rewrites deprecated ids to the auto sentinel, not menlo", () => {
