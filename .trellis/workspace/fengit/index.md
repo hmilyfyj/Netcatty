@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
-- **Last Active**: 2026-08-15
+- **Total Sessions**: 2
+- **Last Active**: 2026-08-17
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~44 | Active |
+| `journal-1.md` | ~78 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-08-17 | 归档 FEATURE-346-sftp | `ce2aa139` | `feature/FEATURE-346-upstream-sync` |
 | 1 | 2026-08-15 | FEATURE-349 归档 Trellis 接入任务 | `5b2f57f2`, `d1334d4e`, `43cfb060` | `feature/FEATURE-349-trellis` |
 <!-- @@@/auto:session-history -->
 
