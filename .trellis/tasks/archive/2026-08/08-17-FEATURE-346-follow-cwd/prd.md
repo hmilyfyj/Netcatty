@@ -27,6 +27,6 @@
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `node --test --import tsx application/state/settingsStateDefaults.test.ts components/sftp/sftpFollowTerminalCwd.test.ts` 通过，且默认跟随为 true。
-- [ ] AC-2: 主机没有 `sftpFollowTerminalCwd` 覆盖时，`resolveHostFollowTerminalCwd(undefined, DEFAULT)` 为 true。
-- [ ] AC-3: 本机安装版打开分组 tab 的 SFTP 后，终端 `cd` 到别的目录，侧栏路径跟着变。
+- [x] AC-1: `node --test --import tsx application/state/settingsStateDefaults.test.ts components/sftp/sftpFollowTerminalCwd.test.ts` 通过，且默认跟随为 true。
+- [x] AC-2: 主机没有 `sftpFollowTerminalCwd` 覆盖时，`resolveHostFollowTerminalCwd(undefined, DEFAULT)` 为 true。
+- [x] AC-3: 本机安装版打开分组 tab 的 SFTP 后，终端 `cd` 到别的目录，侧栏路径跟着变。（FEATURE-346 已 done，代码随 PR #5 合入 main）
