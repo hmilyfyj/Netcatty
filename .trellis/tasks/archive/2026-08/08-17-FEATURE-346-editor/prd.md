@@ -26,6 +26,6 @@ SFTP 点编辑后，弹窗工具栏和字数已经出来，中间 Monaco 一直�
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `node --test --import tsx infrastructure/monaco/monacoVsPath.test.ts` 通过。
-- [ ] AC-2: 生产 `resolveMonacoVsPath` 在 `file:///.../dist/index.html` 下得到 `file:///.../dist/monaco/vs`。
-- [ ] AC-3: `dist/monaco/vs/loader.js` 存在，安装版打开 `cron_docker.sh` 能看到正文，中间不再转圈。
+- [x] AC-1: `node --test --import tsx infrastructure/monaco/monacoVsPath.test.ts` 通过。
+- [x] AC-2: 生产 `resolveMonacoVsPath` 在 `file:///.../dist/index.html` 下得到 `file:///.../dist/monaco/vs`。
+- [x] AC-3: `dist/monaco/vs/loader.js` 存在，安装版打开 `cron_docker.sh` 能看到正文，中间不再转圈。（loader.js 已在 dist；FEATURE-346 已 done）

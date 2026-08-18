@@ -76,3 +76,27 @@ FEATURE-349 已 done 且 PR #3 已 MERGED。核验 6 条 AC 后勾选，在 feat
 ### Next Steps
 
 - FEATURE-346-follow-cwd 待用户确认本机 cd 跟随后再归档；FEATURE-346 issue 仍为 todo
+
+
+## Session 3: FEATURE-359 归档 FEATURE-346 剩余任务
+
+**Date**: 2026-08-18
+**Task**: FEATURE-359 归档 FEATURE-346 剩余任务
+**Package**: desktop
+**Branch**: `feature/FEATURE-346-upstream-sync`
+
+### Summary
+
+FEATURE-346 已 done 且 PR #5 已合入 main。核验单测 AC 后归档 input/editor/follow-cwd 三个 Trellis 任务。package-lock.json 脏文件属无关变更，未纳入。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ce2aa139` | (see git log) |
+| `c00ee0fe` | (see git log) |
+| `145b4a38` | (see git log) |
+
+### Status
+
+[OK] **Completed**
