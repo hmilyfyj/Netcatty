@@ -26,6 +26,6 @@
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `node --test --import tsx components/terminalPaneVisibility.test.tsx` 通过，且包含 group tab 用例。
-- [ ] AC-2: 主机分组 tab 激活时，当前控制台 snapshot 为 `solo|<sessionId>`，同组其它控制台为 `hidden`。
-- [ ] AC-3: 本机安装版打开远程会话后，终端可输入，右上角工具栏按钮可点。
+- [x] AC-1: `node --test --import tsx components/terminalPaneVisibility.test.tsx` 通过，且包含 group tab 用例。
+- [x] AC-2: 主机分组 tab 激活时，当前控制台 snapshot 为 `solo|<sessionId>`，同组其它控制台为 `hidden`。
+- [x] AC-3: 本机安装版打开远程会话后，终端可输入，右上角工具栏按钮可点。（FEATURE-346 已 done，代码随 PR #5 合入 main）
