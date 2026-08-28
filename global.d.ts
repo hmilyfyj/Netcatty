@@ -911,6 +911,31 @@ declare global {
       deviceType?: string;
       connected: boolean;
     }>, chatSessionId?: string): Promise<{ ok: boolean }>;
+    aiMcpUpdateHosts?(hosts: Array<{
+      id: string;
+      label: string;
+      hostname: string;
+      username?: string;
+      port?: number;
+      protocol?: string;
+      group?: string;
+      tags?: string[];
+      moshEnabled?: boolean;
+      deviceType?: string;
+      os?: string;
+    }>): Promise<{ ok: boolean }>;
+    onMcpConnectHostRequest?(callback: (payload: {
+      requestId: string;
+      hostId: string;
+      host?: unknown;
+    }) => void): () => void;
+    respondMcpConnectHost?(requestId: string, result: {
+      ok: boolean;
+      sessionId?: string;
+      groupId?: string;
+      error?: string;
+      message?: string;
+    }): Promise<{ ok: boolean }>;
     aiMcpSetToolIntegrationMode?(mode: 'mcp' | 'skills'): Promise<{ ok: boolean; error?: string }>;
     aiUserSkillsGetStatus?(): Promise<{
       ok: boolean;

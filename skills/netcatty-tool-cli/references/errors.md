@@ -1,10 +1,23 @@
-# Error Handling
+# 错误处理参考
 
-Read this when a Netcatty CLI call fails or returns a blocked state.
+当 Netcatty CLI 返回错误、超时、阻塞、需要审批或找不到 session 时阅读。
 
-## Rules
+## 处理规则
 
-- Treat Netcatty CLI errors as authoritative. Do not argue with them or try alternate launch methods.
-- If Netcatty returns `COMMAND_ALREADY_RUNNING`, wait for the in-flight command to finish instead of retrying in parallel.
-- Netcatty enforces scope, approvals, blocklists, and timeouts. Do not try to bypass those checks with wrappers or alternate shells.
-- If a direct command fails and the failure suggests the task genuinely needs branching or parsing logic, then consider a small script. Otherwise keep commands simple.
+- 报告 Netcatty 返回的 `code` 与 `message`。
+- `APP_NOT_RUNNING`：提示启动 Netcatty 桌面应用。
+- `SESSION_NOT_FOUND`：重新执行 `env --json --chat-session <chat-session-id>` 获取当前 scope 内 session。
+- `COMMAND_ALREADY_RUNNING`：等待当前 session 的在途命令完成，或使用已有 job 的 poll/stop。
+- `RPC_TIMEOUT`：说明当前调用超过 Netcatty RPC 等待时间，长任务场景切换到 `job-start`。
+- 审批拒绝或 observer 模式：报告当前权限状态。
+- 安全策略拦截：保留原始错误，选择更直接、更小的命令形态。
+
+## 输出格式
+
+```text
+Netcatty CLI 返回错误：
+code: <code>
+message: <message>
+```
+
+随后给出下一步动作，例如重新发现 session、等待任务完成、请求用户在 Netcatty UI 中调整权限。

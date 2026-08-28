@@ -44,7 +44,7 @@ if (!NETCATTY_MCP_TOKEN) {
 // Scoped session IDs (comma-separated). When set (even if empty), only listed
 // sessions are accessible. When unset, scope enforcement falls back to the
 // TCP bridge's own scoping (which also defaults to no-access when empty).
-const SCOPED_SESSION_IDS = process.env.NETCATTY_MCP_SESSION_IDS != null
+let scopedSessionIds = process.env.NETCATTY_MCP_SESSION_IDS != null
   ? process.env.NETCATTY_MCP_SESSION_IDS.split(",").map(s => s.trim()).filter(Boolean)
   : null;
 
@@ -197,9 +197,26 @@ const server = new McpServer({
 // When chatSessionId is present, let the main process resolve the current
 // workspace membership dynamically so mid-session workspace changes are visible
 // without restarting the MCP subprocess.
-const scopeParams = CHAT_SESSION_ID
-  ? { chatSessionId: CHAT_SESSION_ID }
-  : { scopedSessionIds: SCOPED_SESSION_IDS, chatSessionId: CHAT_SESSION_ID };
+function getScopeParams() {
+  return CHAT_SESSION_ID
+    ? { chatSessionId: CHAT_SESSION_ID }
+    : { scopedSessionIds, chatSessionId: CHAT_SESSION_ID };
+}
+
+function addScopedSessionId(sessionId) {
+  if (!sessionId) return;
+  if (!Array.isArray(scopedSessionIds)) scopedSessionIds = [];
+  if (!scopedSessionIds.includes(sessionId)) scopedSessionIds.push(sessionId);
+}
+
+function emptyEnvironment() {
+  return {
+    environment: "netcatty-terminal",
+    description: "No Netcatty terminal session is scoped yet. Use list_hosts to inspect saved hosts, then connect_host to open a session.",
+    hosts: [],
+    hostCount: 0,
+  };
+}
 
 // Resource: environment context
 server.resource(
@@ -207,7 +224,12 @@ server.resource(
   "netcatty://context",
   { description: "Current Netcatty workspace context: connected hosts, session IDs, and environment description." },
   async () => {
-    const ctx = await rpcCall("netcatty/getContext", scopeParams);
+    let ctx;
+    try {
+      ctx = await rpcCall("netcatty/getContext", getScopeParams());
+    } catch (err) {
+      ctx = emptyEnvironment();
+    }
     return {
       contents: [{
         uri: "netcatty://context",
@@ -218,14 +240,52 @@ server.resource(
   },
 );
 
+server.tool(
+  "list_hosts",
+  "List saved Netcatty Vault hosts that the AI can ask Netcatty to connect. The result excludes secrets and private key material. Use this when the user asks to choose or connect to a server by name, hostname, group, tag, or protocol.",
+  {},
+  async () => {
+    const result = await rpcCall("netcatty/listHosts", {});
+    if (!result.ok) {
+      return { content: [{ type: "text", text: `Error: ${result.error || "Failed to list hosts"}` }], isError: true };
+    }
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+server.tool(
+  "connect_host",
+  "Ask Netcatty to open a terminal session for a saved Vault host. Pass hostId from list_hosts. After this returns a sessionId, use get_environment or terminal_execute with that session.",
+  {
+    hostId: z.string().describe("The saved Netcatty Vault host ID returned by list_hosts."),
+  },
+  async ({ hostId }) => {
+    const guardErr = guardWriteOperation("");
+    if (guardErr) {
+      return { content: [{ type: "text", text: `Error: ${guardErr}` }], isError: true };
+    }
+    const result = await rpcCall("netcatty/connectHost", { hostId });
+    if (!result.ok) {
+      return { content: [{ type: "text", text: `Error: ${result.error || "Failed to connect host"}` }], isError: true };
+    }
+    addScopedSessionId(result.sessionId);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
 // Tool: get_environment
 server.tool(
   "get_environment",
   "Get information about the current Netcatty scope: all terminal sessions exposed by Netcatty, their session IDs, OS, shell hints, and connection status. Sessions may be remote hosts, a local terminal, Mosh-backed shells, or serial port connections (network devices, embedded systems). Serial sessions have protocol 'serial' and shellType 'raw'. SSH sessions with deviceType 'network' are network equipment (Huawei VRP, Cisco IOS, etc.) using vendor CLIs instead of a standard shell. Call this first before executing commands.",
   {},
   async () => {
-    process.stderr.write(`[netcatty-mcp] get_environment called, SCOPED_SESSION_IDS: ${JSON.stringify(SCOPED_SESSION_IDS)}, CHAT_SESSION_ID: ${CHAT_SESSION_ID}\n`);
-    const ctx = await rpcCall("netcatty/getContext", scopeParams);
+    process.stderr.write(`[netcatty-mcp] get_environment called, scopedSessionIds: ${JSON.stringify(scopedSessionIds)}, CHAT_SESSION_ID: ${CHAT_SESSION_ID}\n`);
+    let ctx;
+    try {
+      ctx = await rpcCall("netcatty/getContext", getScopeParams());
+    } catch {
+      ctx = emptyEnvironment();
+    }
     process.stderr.write(`[netcatty-mcp] get_environment result: hostCount=${ctx.hostCount}, hosts=${JSON.stringify(ctx.hosts?.map(h => h.sessionId))}\n`);
     debugLog("get_environment payload", {
       hostCount: ctx?.hostCount,
@@ -262,7 +322,7 @@ server.tool(
       debugLog("terminal_execute blocked locally", { sessionId, guardErr });
       return { content: [{ type: "text", text: `Error: ${guardErr}` }], isError: true };
     }
-    const result = await rpcCall("netcatty/exec", { ...scopeParams, sessionId, command });
+    const result = await rpcCall("netcatty/exec", { ...getScopeParams(), sessionId, command });
     debugLog("terminal_execute result", {
       sessionId,
       ok: result?.ok,
@@ -297,7 +357,7 @@ server.tool(
     if (guardErr) {
       return { content: [{ type: "text", text: `Error: ${guardErr}` }], isError: true };
     }
-    const result = await rpcCall("netcatty/jobStart", { ...scopeParams, sessionId, command });
+    const result = await rpcCall("netcatty/jobStart", { ...getScopeParams(), sessionId, command });
     if (!result.ok) {
       return { content: [{ type: "text", text: `Error: ${result.error || "Failed to start background command"}` }], isError: true };
     }
@@ -325,7 +385,7 @@ server.tool(
     offset: z.number().int().min(0).optional().describe("Character offset previously returned as nextOffset. Omit or use 0 on the first poll."),
   },
   async ({ jobId, offset }) => {
-    const result = await rpcCall("netcatty/jobPoll", { ...scopeParams, jobId, offset: offset || 0 });
+    const result = await rpcCall("netcatty/jobPoll", { ...getScopeParams(), jobId, offset: offset || 0 });
     if (!result.ok) {
       return { content: [{ type: "text", text: `Error: ${result.error || "Failed to poll background command"}` }], isError: true };
     }
@@ -340,7 +400,7 @@ server.tool(
     jobId: z.string().describe("The background job ID returned by terminal_start."),
   },
   async ({ jobId }) => {
-    const result = await rpcCall("netcatty/jobStop", { ...scopeParams, jobId });
+    const result = await rpcCall("netcatty/jobStop", { ...getScopeParams(), jobId });
     if (!result.ok) {
       return { content: [{ type: "text", text: `Error: ${result.error || "Failed to stop background command"}` }], isError: true };
     }
@@ -354,7 +414,7 @@ async function main() {
   debugLog("Starting MCP server", {
     port: NETCATTY_MCP_PORT,
     hasToken: Boolean(NETCATTY_MCP_TOKEN),
-    scopedSessionIds: SCOPED_SESSION_IDS,
+    scopedSessionIds: scopedSessionIds,
     chatSessionId: CHAT_SESSION_ID,
     permissionMode: PERMISSION_MODE,
   });

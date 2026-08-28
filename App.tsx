@@ -265,6 +265,11 @@ function App({ settings }: { settings: SettingsState }) {
     updateGroupConfigs,
   } = useVaultState();
 
+  useEffect(() => {
+    const bridge = netcattyBridge.get();
+    void bridge?.aiMcpUpdateHosts?.(hosts);
+  }, [hosts]);
+
   const {
     sessions,
     groups,
@@ -1488,7 +1493,7 @@ function App({ settings }: { settings: SettingsState }) {
         localHostname: localHost,
         saved: false,
       });
-      return;
+      return sessionId;
     }
 
     const protocol = effectiveHost.moshEnabled ? 'mosh' : (effectiveHost.protocol || 'ssh');
@@ -1506,7 +1511,37 @@ function App({ settings }: { settings: SettingsState }) {
       localHostname: localHost,
       saved: false,
     });
+    return sessionId;
   }, [addConnectionLog, connectToHost, resolveEffectiveHost, identities, keys]);
+
+  useEffect(() => {
+    const bridge = netcattyBridge.get();
+    if (!bridge?.onMcpConnectHostRequest || !bridge.respondMcpConnectHost) return;
+    return bridge.onMcpConnectHostRequest(({ requestId, hostId }) => {
+      const host = hosts.find((item) => item.id === hostId);
+      if (!host) {
+        void bridge.respondMcpConnectHost?.(requestId, {
+          ok: false,
+          error: t("pf.error.hostNotFound"),
+        });
+        return;
+      }
+      try {
+        const sessionId = handleConnectToHost(host);
+        void bridge.respondMcpConnectHost?.(requestId, {
+          ok: Boolean(sessionId),
+          sessionId: sessionId || undefined,
+          message: sessionId ? "Host connection started." : undefined,
+          error: sessionId ? undefined : "Failed to start host connection.",
+        });
+      } catch (err) {
+        void bridge.respondMcpConnectHost?.(requestId, {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    });
+  }, [handleConnectToHost, hosts, t]);
 
   // Wrap updateSessionStatus to track lastConnectedAt on successful connection
   const handleSessionStatusChange = useCallback((sessionId: string, status: TerminalSession['status']) => {

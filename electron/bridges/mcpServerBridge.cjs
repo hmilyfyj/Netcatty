@@ -72,6 +72,10 @@ let activeSftpOpSeq = 0;
 let getMainWindowFn = null; // () => BrowserWindow | null
 const pendingApprovals = new Map(); // approvalId → { resolve, chatSessionId }
 let approvalIdCounter = 0;
+const vaultHosts = new Map(); // hostId -> sanitized host summary
+const pendingHostConnectRequests = new Map(); // requestId -> { resolve, timerId }
+let hostConnectRequestCounter = 0;
+const HOST_CONNECT_TIMEOUT_MS = 60 * 1000;
 
 function setMainWindowGetter(fn) {
   getMainWindowFn = fn;
@@ -176,6 +180,73 @@ function clearPendingApprovals(chatSessionId) {
     }
   }
   notifyRendererApprovalCleared(clearedIds);
+}
+
+function sanitizeVaultHost(host) {
+  if (!host || typeof host !== "object") return null;
+  const id = typeof host.id === "string" ? host.id : "";
+  if (!id) return null;
+  return {
+    id,
+    label: typeof host.label === "string" ? host.label : "",
+    hostname: typeof host.hostname === "string" ? host.hostname : "",
+    username: typeof host.username === "string" ? host.username : "",
+    port: Number.isFinite(Number(host.port)) ? Number(host.port) : undefined,
+    protocol: typeof host.protocol === "string" ? host.protocol : "ssh",
+    group: typeof host.group === "string" ? host.group : "",
+    tags: Array.isArray(host.tags) ? host.tags.filter((tag) => typeof tag === "string") : [],
+    moshEnabled: Boolean(host.moshEnabled),
+    deviceType: typeof host.deviceType === "string" ? host.deviceType : "",
+    os: typeof host.os === "string" ? host.os : "",
+  };
+}
+
+function updateVaultHosts(hostList) {
+  vaultHosts.clear();
+  if (!Array.isArray(hostList)) return;
+  for (const host of hostList) {
+    const sanitized = sanitizeVaultHost(host);
+    if (sanitized) vaultHosts.set(sanitized.id, sanitized);
+  }
+}
+
+function listVaultHosts() {
+  return Array.from(vaultHosts.values()).sort((a, b) => {
+    const left = (a.label || a.hostname || a.id).toLowerCase();
+    const right = (b.label || b.hostname || b.id).toLowerCase();
+    return left.localeCompare(right);
+  });
+}
+
+function resolveHostConnectFromRenderer(requestId, result) {
+  const entry = pendingHostConnectRequests.get(requestId);
+  if (!entry) return;
+  pendingHostConnectRequests.delete(requestId);
+  clearTimeout(entry.timerId);
+  entry.resolve(result || { ok: false, error: "Empty connect response." });
+}
+
+function requestHostConnectFromRenderer(hostId) {
+  return new Promise((resolve) => {
+    const host = vaultHosts.get(hostId);
+    if (!host) {
+      resolve({ ok: false, error: `Host "${hostId}" is not available in Netcatty Vault.` });
+      return;
+    }
+    const mainWin = typeof getMainWindowFn === "function" ? getMainWindowFn() : null;
+    if (!mainWin || mainWin.isDestroyed()) {
+      resolve({ ok: false, error: "Netcatty main window is unavailable." });
+      return;
+    }
+    const requestId = `mcp_connect_${++hostConnectRequestCounter}_${Date.now()}`;
+    const timerId = setTimeout(() => {
+      if (!pendingHostConnectRequests.has(requestId)) return;
+      pendingHostConnectRequests.delete(requestId);
+      resolve({ ok: false, error: "Timed out waiting for Netcatty to connect host." });
+    }, HOST_CONNECT_TIMEOUT_MS);
+    pendingHostConnectRequests.set(requestId, { resolve, timerId });
+    mainWin.webContents.send("netcatty:ai:mcp:connect-host-request", { requestId, hostId, host });
+  });
 }
 
 function cancelAllPtyExecs() {
@@ -497,6 +568,11 @@ function shutdownHost({ preserveScopedMetadata = false } = {}) {
     tcpPort = null;
   }
   clearPendingApprovals();
+  for (const [id, entry] of pendingHostConnectRequests) {
+    clearTimeout(entry.timerId);
+    entry.resolve({ ok: false, error: "MCP bridge is shutting down." });
+    pendingHostConnectRequests.delete(id);
+  }
   cancelAllPtyExecs();
   void cancelAllSftpOps();
   cancelledChatSessions.clear();
@@ -867,6 +943,7 @@ async function handleMessage(socket, line) {
 
 // Methods that modify remote state — blocked in observer mode
 const WRITE_METHODS = new Set([
+  "netcatty/connectHost",
   "netcatty/exec",
   "netcatty/sftp/write",
   "netcatty/sftp/download",
@@ -918,10 +995,15 @@ async function dispatch(method, params) {
     return { ok: false, error: `Operation denied: permission mode is "observer" (read-only). Change to "confirm" or "autonomous" in Settings → AI → Safety to allow this action.` };
   }
 
-  if (WRITE_METHODS.has(method) && !params?.chatSessionId) {
+  if (
+    WRITE_METHODS.has(method)
+    && method !== "netcatty/connectHost"
+    && !params?.chatSessionId
+    && !Array.isArray(params?.scopedSessionIds)
+  ) {
     return {
       ok: false,
-      error: "chatSessionId is required for write operations.",
+      error: "chatSessionId or scopedSessionIds is required for write operations.",
     };
   }
 
@@ -969,6 +1051,10 @@ async function dispatch(method, params) {
       }
     }
     switch (method) {
+      case "netcatty/listHosts":
+        return handleListHosts();
+      case "netcatty/connectHost":
+        return handleConnectHost(params);
       case "netcatty/getContext":
         return handleGetContext(params);
       case "netcatty/getStatus":
@@ -1081,6 +1167,38 @@ function handleGetContext(params) {
   };
 }
 
+function handleListHosts() {
+  const hosts = listVaultHosts();
+  return {
+    ok: true,
+    environment: "netcatty-vault",
+    description: "Saved Netcatty Vault hosts available for AI-assisted connection.",
+    hosts,
+    hostCount: hosts.length,
+  };
+}
+
+async function handleConnectHost(params) {
+  const hostId = typeof params?.hostId === "string" ? params.hostId : "";
+  if (!hostId) {
+    return { ok: false, error: "hostId is required." };
+  }
+  const result = await requestHostConnectFromRenderer(hostId);
+  if (!result?.ok) {
+    return {
+      ok: false,
+      error: result?.error || "Failed to connect host.",
+    };
+  }
+  return {
+    ok: true,
+    hostId,
+    sessionId: result.sessionId,
+    groupId: result.groupId,
+    message: result.message || "Host connection started.",
+  };
+}
+
 function handleGetStatus() {
   return {
     ok: true,
@@ -1091,6 +1209,7 @@ function handleGetStatus() {
     maxIterations,
     tcpPort,
     sessionCount: sessions?.size || 0,
+    vaultHostCount: vaultHosts.size,
     scopedContextCount: scopedMetadata.size,
     activeExecutionCount: activePtyExecs.size,
     activeSftpOperationCount: activeSessionSftpOps.size,
@@ -1821,6 +1940,7 @@ module.exports = {
   setChatSessionCancelled,
   checkCommandSafety,
   updateSessionMetadata,
+  updateVaultHosts,
   getScopedSessionIds,
   getOrCreateHost,
   buildMcpServerConfig,
@@ -1835,6 +1955,7 @@ module.exports = {
   shutdownHost,
   setMainWindowGetter,
   resolveApprovalFromRenderer,
+  resolveHostConnectFromRenderer,
   clearPendingApprovals,
   reserveSessionExecution,
   releaseSessionExecution,

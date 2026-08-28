@@ -422,6 +422,10 @@ function init(deps) {
   cliDiscoveryFilePath = deps.cliDiscoveryFilePath || null;
   mcpServerBridge.init({ sessions, sftpClients, electronModule, cliDiscoveryFilePath });
 
+  void mcpServerBridge.getOrCreateHost().catch((err) => {
+    console.warn("[AI Bridge] Failed to initialize Netcatty tool bridge:", err?.message || err);
+  });
+
   // Wire up main window getter for MCP approval IPC
   mcpServerBridge.setMainWindowGetter(() => {
     try {
@@ -2124,6 +2128,12 @@ function registerHandlers(ipcMain) {
     return { ok: true };
   });
 
+  ipcMain.handle("netcatty:ai:mcp:update-hosts", async (event, { hosts }) => {
+    if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    mcpServerBridge.updateVaultHosts(hosts || []);
+    return { ok: true };
+  });
+
   ipcMain.handle("netcatty:ai:mcp:set-command-blocklist", async (event, { blocklist }) => {
     if (!validateSenderOrSettings(event)) return { ok: false, error: "Unauthorized IPC sender" };
     // Validate: must be an array of strings, each a valid regex pattern
@@ -2188,6 +2198,12 @@ function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:ai:mcp:approval-response", async (event, { approvalId, approved }) => {
     if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
     mcpServerBridge.resolveApprovalFromRenderer(approvalId, approved);
+    return { ok: true };
+  });
+
+  ipcMain.handle("netcatty:ai:mcp:connect-host-response", async (event, { requestId, result }) => {
+    if (!validateSender(event)) return { ok: false, error: "Unauthorized IPC sender" };
+    mcpServerBridge.resolveHostConnectFromRenderer(requestId, result);
     return { ok: true };
   });
 

@@ -1321,6 +1321,9 @@ const api = {
   aiMcpUpdateSessions: async (sessions, chatSessionId) => {
     return ipcRenderer.invoke("netcatty:ai:mcp:update-sessions", { sessions, chatSessionId });
   },
+  aiMcpUpdateHosts: async (hosts) => {
+    return ipcRenderer.invoke("netcatty:ai:mcp:update-hosts", { hosts });
+  },
   aiMcpSetCommandBlocklist: async (blocklist) => {
     return ipcRenderer.invoke("netcatty:ai:mcp:set-command-blocklist", { blocklist });
   },
@@ -1350,6 +1353,14 @@ const api = {
     const handler = (_event, payload) => cb(payload);
     ipcRenderer.on("netcatty:ai:mcp:approval-cleared", handler);
     return () => ipcRenderer.removeListener("netcatty:ai:mcp:approval-cleared", handler);
+  },
+  onMcpConnectHostRequest: (cb) => {
+    const handler = (_event, payload) => cb(payload);
+    ipcRenderer.on("netcatty:ai:mcp:connect-host-request", handler);
+    return () => ipcRenderer.removeListener("netcatty:ai:mcp:connect-host-request", handler);
+  },
+  respondMcpConnectHost: async (requestId, result) => {
+    return ipcRenderer.invoke("netcatty:ai:mcp:connect-host-response", { requestId, result });
   },
   // ACP streaming
   aiAcpStream: async (requestId, chatSessionId, acpCommand, acpArgs, prompt, cwd, providerId, model, existingSessionId, historyMessages, images, toolIntegrationMode, defaultTargetSession, userSkillsContext) => {
