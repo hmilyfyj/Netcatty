@@ -15,8 +15,8 @@
   "branch": "feature/FEATURE-346-main-integration",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": null,
-  "pr_url": null,
+  "commit": "3f9ec2d3e38ad5927a6a22bd725a49874b007aca",
+  "pr_url": "https://github.com/hmilyfyj/Netcatty/pull/7",
   "subtasks": [],
   "children": [],
   "parent": null,
@@ -26,6 +26,6 @@
     "components/sftp/SftpHostPicker.test.ts",
     "components/terminalLayer/TerminalLayerTabBridge.test.ts"
   ],
-  "notes": "Snapshot 5366c722 merged by 8d4e25c3; Node 22 quality gates passed.",
+  "notes": "Snapshot 5366c722 merged by 8d4e25c3; PR #7 merged as 3f9ec2d3; Node 22 quality gates and arm64 installation passed.",
   "meta": {}
 }
