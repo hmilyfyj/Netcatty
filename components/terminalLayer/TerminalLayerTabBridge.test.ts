@@ -8,8 +8,8 @@ test('terminal layer bridge does not dock the shared host tree', () => {
   assert.doesNotMatch(source, /hostTreeDockedInLayer/);
 });
 
-test('terminal layer is visible only for terminal sessions or workspaces', () => {
-  assert.match(source, /const isVisible = Boolean\(activeSession \|\| activeWorkspace \|\| s\.draggingSessionId\)/);
+test('terminal layer is visible for terminal sessions, workspaces, or groups', () => {
+  assert.match(source, /const isVisible = Boolean\(activeSession \|\| activeWorkspace \|\| activeGroup \|\| s\.draggingSessionId\)/);
 });
 
 test('terminal panes can gate cwd restore per session host resolution', () => {
