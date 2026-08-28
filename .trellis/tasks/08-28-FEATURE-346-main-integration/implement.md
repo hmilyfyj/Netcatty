@@ -31,18 +31,18 @@ npm run build
 
 ## 4. 提交与远端合并
 
-- [ ] 提交集成结果和 Trellis 任务产物。
-- [ ] 推送 `feature/FEATURE-346-main-integration` 到 `origin`。
-- [ ] 创建目标为 `main` 的 PR，标题包含 `FEATURE-346`。
-- [ ] 合并 PR，fetch 后确认 `origin/main` 包含集成提交。
-- [ ] 主仓根目录执行 `git merge --ff-only origin/main` 并确认干净。
+- [x] 提交集成结果和 Trellis 任务产物。
+- [x] 推送 `feature/FEATURE-346-main-integration` 到 `origin`。
+- [x] 创建目标为 `main` 的 PR，标题包含 `FEATURE-346`。
+- [x] 合并 PR，fetch 后确认 `origin/main` 包含集成提交。
+- [x] 主仓根目录执行 `git merge --ff-only origin/main` 并确认干净。
 
 ## 5. 主仓构建与安装
 
-- [ ] 退出当前 Netcatty 安装版和遗留开发版进程。
-- [ ] 在 `/Users/fengit/workspace/tools/Netcatty` 执行 `scripts/install-macos-app.sh`。
-- [ ] 校验 `file` / `lipo` 架构、bundle id、版本与两个 `app.asar` SHA-256。
-- [ ] 启动 `/Applications/Netcatty.app`，确认主进程路径和用户数据目录。
+- [x] 退出当前 Netcatty 安装版和遗留开发版进程。
+- [x] 在 `/Users/fengit/workspace/tools/Netcatty` 执行 `scripts/install-macos-app.sh`。
+- [x] 校验 `file` / `lipo` 架构、bundle id、版本与两个 `app.asar` SHA-256。
+- [x] 启动 `/Applications/Netcatty.app`，确认主进程路径和用户数据目录。
 
 ## 检查点
 

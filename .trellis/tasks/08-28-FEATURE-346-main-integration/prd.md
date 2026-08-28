@@ -37,9 +37,9 @@
 - [x] AC-2：集成 worktree 从 `origin/main@4a2fdedb` 起步并包含快照提交历史，所有冲突已解决，`git status --porcelain` 只包含本任务计划产物或为空。
 - [x] AC-3：`npm run test:skill` 通过；`mcpServerBridge.hostOpenScope`、vault service/capability 相关测试通过。
 - [x] AC-4：`npm test` 与 `npm run build` 通过；`git diff --check` 通过。
-- [ ] AC-5：集成结果通过 fork PR 合入 `origin/main`，本地主仓 `main` 可 `git merge --ff-only origin/main`，同步后工作区干净。
-- [ ] AC-6：从 `/Users/fengit/workspace/tools/Netcatty` 执行安装脚本成功，安装包为 arm64，主仓产物与 `/Applications/Netcatty.app` 的 `app.asar` SHA-256 相同。
-- [ ] AC-7：Netcatty 安装版启动成功，进程路径为 `/Applications/Netcatty.app/Contents/MacOS/Netcatty`，现有用户数据目录保持原位置。
+- [x] AC-5：集成结果通过 fork PR 合入 `origin/main`，本地主仓 `main` 可 `git merge --ff-only origin/main`，同步后工作区干净。
+- [x] AC-6：从 `/Users/fengit/workspace/tools/Netcatty` 执行安装脚本成功，安装包为 arm64，主仓产物与 `/Applications/Netcatty.app` 的 `app.asar` SHA-256 相同。
+- [x] AC-7：Netcatty 安装版启动成功，进程路径为 `/Applications/Netcatty.app/Contents/MacOS/Netcatty`，现有用户数据目录保持原位置。
 
 ## 检查证据
 
@@ -49,3 +49,6 @@
 - Node `v22.23.2` 下 `npm run test:skill`、33 项 MCP/Vault 定向测试、`npm test`（10108 通过、15 跳过）、`npm run build`、schema/contract/CodeBuddy 类型校验与 `git diff --check` 通过。
 - 质量复核修复主线 Trellis lint 自赋值、Cursor SDK 探测误加载 Electron ABI，以及两条过时结构断言；`npm run lint` 通过并保留 11 条既有 warning。
 - 本次只修复现有门禁与断言，无新增架构契约；规范回顾确认无需更新 `.trellis/spec/`。
+- PR `https://github.com/hmilyfyj/Netcatty/pull/7` 已合并，远端和本地主仓 `main` 均为 `3f9ec2d3e38ad5927a6a22bd725a49874b007aca`。
+- 主仓刷新锁定依赖后完成 arm64 覆盖安装；构建产物与安装版 `app.asar` SHA-256 均为 `cd47c2d7c420707c7bd2fdee70f1dcdc1a1f8105d4066a093c36b30f8cca5141`。
+- 安装版以 PID `37926` 从 `/Applications/Netcatty.app/Contents/MacOS/Netcatty` 启动，bundle id 为 `com.netcatty.app`。
