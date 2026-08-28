@@ -1,0 +1,5 @@
+{"file":".trellis/spec/desktop/app/index.md","reason":"核对桌面应用架构、Electron bridge、MCP/Vault 能力与质量门禁。"}
+{"file":".trellis/spec/plugin-contract/shared/index.md","reason":"生产构建会生成并校验 plugin contract。"}
+{"file":".trellis/spec/plugin-sdk/runtime/index.md","reason":"生产构建覆盖 plugin SDK workspace。"}
+{"file":".trellis/spec/plugin-cli/cli/index.md","reason":"生产构建覆盖 plugin CLI workspace。"}
+{"file":".trellis/spec/guides/index.md","reason":"执行跨层、质量与交付检查。"}

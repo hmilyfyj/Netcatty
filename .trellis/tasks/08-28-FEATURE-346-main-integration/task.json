@@ -1,0 +1,31 @@
+{
+  "id": "FEATURE-346-main-integration",
+  "name": "FEATURE-346-main-integration",
+  "title": "FEATURE-346 integrate main checkout and install",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": "desktop",
+  "package": "desktop",
+  "priority": "P2",
+  "creator": "fengit",
+  "assignee": "fengit",
+  "createdAt": "2026-08-28",
+  "completedAt": null,
+  "branch": "feature/FEATURE-346-main-integration",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    ".pi/extensions/trellis/index.ts",
+    "electron/bridges/aiBridge/agentDiscoveryHandlers.cjs",
+    "components/sftp/SftpHostPicker.test.ts",
+    "components/terminalLayer/TerminalLayerTabBridge.test.ts"
+  ],
+  "notes": "Snapshot 5366c722 merged by 8d4e25c3; Node 22 quality gates passed.",
+  "meta": {}
+}

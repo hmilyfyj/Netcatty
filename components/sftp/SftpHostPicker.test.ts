@@ -39,7 +39,7 @@ test("sftp host picker uses single-line quick switcher row layout", () => {
   );
   assert.match(
     source,
-    /<span className="text-sm font-medium truncate">\{host\.label\}<\/span>/,
+    /<span className="text-sm font-medium truncate">\{sftpHostDisplayLabel\(host\)\}<\/span>/,
   );
   assert.match(
     source,
