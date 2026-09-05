@@ -100,3 +100,28 @@ FEATURE-346 已 done 且 PR #5 已合入 main。核验单测 AC 后归档 input/
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: FEATURE-441 核验并归档 FEATURE-346 主仓集成任务
+
+**Date**: 2026-09-05
+**Task**: FEATURE-441 核验并归档 FEATURE-346 主仓集成任务
+**Package**: desktop
+**Branch**: `feature/FEATURE-346-main-integration`
+
+### Summary
+
+确认 FEATURE-346 的 PR 7/8 已合并且验收项全部完成；原 feature 分支重新运行 lint（0 错误、11 条既有 warning）、测试（10108 通过、15 跳过）、生产构建、skill 与 schema/contract 检查均通过。执行 get_context record、脏工作区检查、task archive 和本次 journal，归档交由新 PR 人工评审。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8d4e25c3` | (see git log) |
+| `00b9db26` | (see git log) |
+| `4a34d818` | (see git log) |
+| `e5cd133f` | (see git log) |
+
+### Status
+
+[OK] **Completed**
