@@ -88,7 +88,10 @@ export const TreeNode = React.memo<TreeNodeProps>(({
         className="flex min-w-0 items-center gap-1"
         style={{ paddingLeft: depth * 16 + 8 }}
       >
-        <span className="shrink-0 w-4 flex items-center justify-center">
+        <span
+          className="shrink-0 w-4 flex items-center justify-center"
+          onDoubleClick={e => { if (!isParentEntry && isDir) e.stopPropagation(); }}
+        >
           {isParentEntry ? (
             <CornerUpLeft size={14} className="text-muted-foreground" />
           ) : isDir ? (
@@ -119,6 +122,11 @@ export const TreeNode = React.memo<TreeNodeProps>(({
       {visibleColumns.type && (
         <span className="min-w-0 text-right text-muted-foreground text-xs truncate">
           {isParentEntry ? '' : (isDir ? t('sftp.kind.folder') : (entry.name.split('.').pop()?.toUpperCase() ?? '--'))}
+        </span>
+      )}
+      {visibleColumns.owner && (
+        <span className="min-w-0 text-right text-muted-foreground text-xs truncate">
+          {isParentEntry ? '' : (entry.owner || '--')}
         </span>
       )}
     </div>

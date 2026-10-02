@@ -8,6 +8,7 @@ import {
   uploadFromDataTransfer,
   uploadFromFileList,
 } from "../../lib/uploadService.ts";
+import { DEFAULT_SFTP_FILE_TRANSFER_CONCURRENCY } from "../../domain/sftpTransferConcurrency.ts";
 
 function createDataTransfer(files: File[]): DataTransfer {
   return {
@@ -195,6 +196,50 @@ test("uploads picked folder files with their relative directory structure", asyn
   assert.deepEqual(results, [
     { fileName: "folder/sub/file.txt", success: true },
   ]);
+});
+
+test("ordinary multi-file uploads use the shared transfer concurrency", async () => {
+  const countInitiallyStarted = async (fileTransferConcurrency?: number) => {
+    const started: string[] = [];
+    let releaseAll!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseAll = resolve; });
+    const files = Array.from({ length: DEFAULT_SFTP_FILE_TRANSFER_CONCURRENCY + 2 }, (_, index) => {
+      const file = new File([`file-${index}`], `file-${index}.txt`);
+      Object.defineProperty(file, "path", { value: `/local/file-${index}.txt` });
+      return file;
+    });
+
+    const uploading = uploadFromFileList(
+      files,
+      {
+        targetPath: "/target",
+        sftpId: "sftp-1",
+        fileTransferConcurrency,
+        isLocal: false,
+        bridge: {
+          mkdirSftp: async () => {},
+          startStreamTransfer: async ({ targetPath }) => {
+            started.push(targetPath);
+            await gate;
+            return { transferId: targetPath };
+          },
+        },
+        joinPath: (base, name) => `${base}/${name}`,
+      },
+    );
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const initiallyStarted = started.length;
+    releaseAll();
+    await uploading;
+    return initiallyStarted;
+  };
+
+  assert.equal(
+    await countInitiallyStarted(),
+    DEFAULT_SFTP_FILE_TRANSFER_CONCURRENCY,
+  );
+  assert.equal(await countInitiallyStarted(3), 3);
 });
 
 test("compression remains enabled for DataTransfer folder uploads that have a conflict resolver", async (t) => {
@@ -641,6 +686,39 @@ test("ENOENT from lstat still means absent destination for conflict check", asyn
           const error = new Error("No such file") as Error & { code: string };
           error.code = "ENOENT";
           throw error;
+        },
+        startStreamTransfer: async ({ targetPath: path }) => {
+          uploadedPaths.push(path);
+          return { transferId: "upload-1" };
+        },
+      },
+      joinPath: (base, name) => `${base}/${name}`,
+      resolveConflict: async () => {
+        throw new Error("absent destination must not prompt for conflict");
+      },
+    },
+  );
+
+  assert.deepEqual(uploadedPaths, ["/usr/local/bin/tool.sh"]);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].success, true);
+});
+
+test("Electron-wrapped lstat absence still means absent destination", async () => {
+  const file = new File(["new-bytes"], "tool.sh", { lastModified: 1234 });
+  Object.defineProperty(file, "path", { value: "/local/tool.sh" });
+  const uploadedPaths: string[] = [];
+
+  const results = await uploadFromFileList(
+    [file],
+    {
+      targetPath: "/usr/local/bin",
+      sftpId: "sftp-1",
+      isLocal: false,
+      bridge: {
+        mkdirSftp: async () => {},
+        lstatSftp: async () => {
+          throw new Error("Error invoking remote method 'netcatty:sftp:lstat': Error: No such file");
         },
         startStreamTransfer: async ({ targetPath: path }) => {
           uploadedPaths.push(path);

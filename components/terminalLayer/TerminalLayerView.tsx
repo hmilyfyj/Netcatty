@@ -18,10 +18,12 @@ function TerminalLayerViewInner({ ctx }: { ctx: TerminalLayerViewContext }) {
     ctx.hibernateHiddenTabs,
   );
 
+  const isBottomDock = ctx.sidePanelPosition === 'bottom';
+
   return (
     <div
       ref={ctx.workspaceOuterRef}
-      className="absolute inset-0 bg-background flex min-h-0"
+      className={`absolute inset-0 bg-background flex min-h-0${isBottomDock ? ' flex-col' : ''}`}
       data-section="terminal-workspace"
       inert={ctx.isTerminalLayerVisible ? undefined : true}
       style={{
@@ -29,8 +31,14 @@ function TerminalLayerViewInner({ ctx }: { ctx: TerminalLayerViewContext }) {
         left: hostTreeLayoutWidth,
       }}
     >
+      {/* Keep TerminalLayerSidePanelSection at a stable tree position (first
+          child) so cycling between side and bottom docks reorders it via flex
+          `order` instead of unmounting/recreating it. */}
       <TerminalLayerSidePanelSection ctx={ctx} />
-      <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+      <div
+        data-section="terminal-workspace-row"
+        className={`flex-1 min-w-0 min-h-0 flex flex-col${isBottomDock ? ' w-full' : ''}`}
+      >
         {ctx.activeGroup && ctx.activeGroupSessions?.length > 0 && (
           <TerminalGroupConsoleBar
             group={ctx.activeGroup}

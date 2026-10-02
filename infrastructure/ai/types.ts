@@ -1,5 +1,5 @@
 // AI Provider types
-import defaultCommandBlocklist from '../../lib/commandBlocklist.json';
+import commandBlocklistTable from '../../lib/commandBlocklist.json';
 import type { AgentActivity, AgentUsage } from '../../domain/agentActivity';
 import type { ProviderContinuation } from './providerContinuation';
 
@@ -27,12 +27,22 @@ export type AIProviderId =
  */
 export type ProviderStyle = 'openai' | 'anthropic' | 'google';
 
+/**
+ * OpenAI-compatible request format. Chat Completions (`/v1/chat/completions`)
+ * is the default so existing providers and OpenAI-compat proxies keep working.
+ * Responses (`/v1/responses`) is opt-in for relays that cache better on that
+ * endpoint.
+ */
+export type OpenAIApiFormat = 'chat' | 'responses';
+
 export interface ProviderAdvancedParams {
   maxTokens?: number;
   temperature?: number;       // 0–2
   topP?: number;              // 0–1
   frequencyPenalty?: number;  // -2–2
   presencePenalty?: number;   // -2–2
+  /** Provider-level default thinking depth; omitted = API default (not sent). */
+  reasoningEffort?: string;   // 'low' | 'medium' | 'high'
 }
 
 export interface ProviderConfig {
@@ -41,6 +51,11 @@ export interface ProviderConfig {
   name: string;
   /** Override the wire-protocol family; defaults from `providerId` via {@link resolveProviderStyle}. */
   style?: ProviderStyle;
+  /**
+   * OpenAI-compatible endpoint family. Only used when style resolves to `openai`.
+   * Defaults to Chat Completions via {@link resolveOpenAIApi}.
+   */
+  openaiApi?: OpenAIApiFormat;
   /** Built-in icon key (slug under public/ai/providers/), independent of providerId. */
   iconId?: string;
   /** User-supplied icon as a data URL (compressed to 64x64 webp at write time). Wins over iconId. */
@@ -48,7 +63,7 @@ export interface ProviderConfig {
   apiKey?: string;           // encrypted via credentialBridge (enc:v1: prefix)
   baseURL?: string;          // custom endpoint URL
   defaultModel?: string;
-  customHeaders?: Record<string, string>;
+  customHeaders?: Record<string, string>; // values encrypted via credentialBridge; decrypted at request boundary
   enabled: boolean;
   skipTLSVerify?: boolean;   // skip TLS certificate verification (for self-signed certs)
   /** User override for the model context window, in tokens. Wins over discovered model metadata. */
@@ -71,6 +86,11 @@ export function resolveProviderStyle(config: Pick<ProviderConfig, 'providerId' |
   }
 }
 
+/** Pick the OpenAI request format. Missing or unknown values stay on Chat Completions. */
+export function resolveOpenAIApi(config: Pick<ProviderConfig, 'openaiApi'>): OpenAIApiFormat {
+  return config.openaiApi === 'responses' ? 'responses' : 'chat';
+}
+
 export interface ModelInfo {
   id: string;
   name: string;
@@ -87,6 +107,10 @@ export interface ChatMessageAttachment {
   filename?: string;
   filePath?: string;    // original filesystem path, when available
   terminalSelection?: boolean;
+  /** Set when the attachment was created from a Vault → Notes mention. */
+  vaultNoteId?: string;
+  /** Original note title, for display and prompt labels. */
+  vaultNoteTitle?: string;
   previewText?: string;
   lineCount?: number;
 }
@@ -99,6 +123,10 @@ export interface UploadedFile {
   mediaType: string;
   filePath?: string;
   terminalSelection?: boolean;
+  /** Set when the attachment was created from a Vault → Notes mention. */
+  vaultNoteId?: string;
+  /** Original note title, for display and prompt labels. */
+  vaultNoteTitle?: string;
   previewText?: string;
   lineCount?: number;
 }
@@ -253,7 +281,7 @@ export interface ExternalAgentConfig {
   icon?: string;
   enabled: boolean;
   available?: boolean;
-  /** SDK backend key for managed agents (claude|codex|copilot|cursor|codebuddy|opencode|grok). */
+  /** SDK backend key for managed agents (claude|codex|copilot|cursor|codebuddy|opencode|grok|mimo). */
   sdkBackend?: string;
   /** Cursor only: mutually exclusive auth — API key vs local `cursor-agent` CLI login. */
   cursorAuthMode?: CursorAuthMode;
@@ -278,14 +306,14 @@ export interface ExternalAgentConfig {
   acpArgs?: string[];
   /** Internal: disabled only because the managed CLI was unavailable. */
   autoDisabledUntilAvailable?: boolean;
-  /** CodeBuddy-specific advanced options (SDK 0.3.230). */
+  /** CodeBuddy-specific advanced options (SDK 0.3.258). */
   codebuddyOptions?: CodebuddyAdvancedOptions;
 }
 
-/** Advanced options specific to the CodeBuddy backend (SDK 0.3.230+). */
+/** Advanced options specific to the CodeBuddy backend (SDK 0.3.258+). */
 export interface CodebuddyAdvancedOptions {
-  /** Effort level for model reasoning. */
-  effort?: 'low' | 'medium' | 'high' | 'xhigh';
+  /** Effort level for model reasoning (SDK 0.3.258 Effort union). */
+  effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** Maximum conversation turns per request. */
   maxTurns?: number;
   /** Maximum budget in USD per request. */
@@ -296,6 +324,14 @@ export interface CodebuddyAdvancedOptions {
   enableFileCheckpointing?: boolean;
   /** Fallback model when primary is unavailable. */
   fallbackModel?: string;
+  /**
+   * Persist the session transcript to disk. Defaults to true; set false to keep
+   * the conversation in memory only (CodeBuddy writes no session data under
+   * its config dir, and file checkpointing is skipped). Netcatty chat history
+   * and external session metadata are unaffected. Requires CodeBuddy CLI >=
+   * 2.125.1.
+   */
+  persistSession?: boolean;
 }
 
 // Discovered agent from system PATH
@@ -311,8 +347,8 @@ export interface DiscoveredAgent {
   /** @deprecated Legacy discovery field from the pre-SDK migration. */
   acpCommand?: string;
   acpArgs?: string[];
-  /** SDK backend key (claude|codex|copilot|cursor|codebuddy|opencode|grok) — the routing value. */
-  sdkBackend?: 'claude' | 'codex' | 'copilot' | 'cursor' | 'codebuddy' | 'opencode' | 'grok';
+  /** SDK backend key (claude|codex|copilot|cursor|codebuddy|opencode|grok|mimo) — the routing value. */
+  sdkBackend?: 'claude' | 'codex' | 'copilot' | 'cursor' | 'codebuddy' | 'opencode' | 'grok' | 'mimo';
   /** Absolute resolved CLI path (preferred over `path`). */
   binPath?: string;
   installed?: boolean;
@@ -363,20 +399,31 @@ export interface AISettings {
   defaultAgentId: string;
   commandBlocklist: string[];    // global command blocklist patterns
   commandTimeout: number;        // seconds, default 60
+  responseIdleTimeout: number;   // seconds without response data, default 120
   maxIterations: number;         // doom loop prevention, default 20
   webSearchConfig?: WebSearchConfig;
 }
 
 export const DEFAULT_COMMAND_BLOCKLIST = [
-  ...defaultCommandBlocklist,
+  ...commandBlocklistTable.common,
+  ...commandBlocklistTable.posixNative,
+  ...commandBlocklistTable.posix,
+  ...commandBlocklistTable.powershell,
 ];
 
 export const DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
 export const MAX_COMMAND_TIMEOUT_SECONDS = 24 * 60 * 60;
+export const DEFAULT_RESPONSE_IDLE_TIMEOUT_SECONDS = 2 * 60;
+export const MAX_RESPONSE_IDLE_TIMEOUT_SECONDS = 24 * 60 * 60;
 
 export function normalizeCommandTimeoutSeconds(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_COMMAND_TIMEOUT_SECONDS;
   return Math.min(MAX_COMMAND_TIMEOUT_SECONDS, Math.max(1, value));
+}
+
+export function normalizeResponseIdleTimeoutSeconds(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_RESPONSE_IDLE_TIMEOUT_SECONDS;
+  return Math.min(MAX_RESPONSE_IDLE_TIMEOUT_SECONDS, Math.max(1, value));
 }
 
 export const DEFAULT_AI_SETTINGS: AISettings = {
@@ -389,6 +436,7 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
   defaultAgentId: 'catty',
   commandBlocklist: [...DEFAULT_COMMAND_BLOCKLIST],
   commandTimeout: DEFAULT_COMMAND_TIMEOUT_SECONDS,
+  responseIdleTimeout: DEFAULT_RESPONSE_IDLE_TIMEOUT_SECONDS,
   maxIterations: 20,
 };
 
@@ -489,7 +537,7 @@ export interface AgentModelPreset {
   id: string;
   name: string;
   description?: string;
-  /** Codex thinking levels (model ID sent as `id/thinking`) */
+  /** Supported reasoning levels (renderer selection encoded as `id/thinking`). */
   thinkingLevels?: string[];
   /**
    * Default effort used when auto-selecting a model with thinkingLevels.
@@ -498,16 +546,41 @@ export interface AgentModelPreset {
    */
   defaultThinkingLevel?: string;
   /**
+   * When false, a stored bare model id stays unsuffixed so the driver can
+   * apply its own settings-level effort. Defaults to true.
+   */
+  encodeDefaultThinking?: boolean;
+  /**
    * Minimum agent CLI version that advertises this model (semver core).
    * Netcatty is BYO-CLI: the packaged SDK does not replace the user's binary.
    */
   minCliVersion?: string;
 }
 
+const CLAUDE_REASONING_LEVELS = ['low', 'medium', 'high', 'max'] as const;
+
 export const CLAUDE_MODEL_PRESETS: AgentModelPreset[] = [
-  { id: 'default', name: 'Opus 4.6', description: 'Recommended' },
-  { id: 'sonnet', name: 'Sonnet 4.6', description: 'Everyday tasks' },
-  { id: 'haiku', name: 'Haiku 4.5', description: 'Fastest' },
+  {
+    id: 'default',
+    name: 'Opus 4.6',
+    description: 'Recommended',
+    thinkingLevels: [...CLAUDE_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+  },
+  {
+    id: 'sonnet',
+    name: 'Sonnet 4.6',
+    description: 'Everyday tasks',
+    thinkingLevels: [...CLAUDE_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+  },
+  {
+    id: 'haiku',
+    name: 'Haiku 4.5',
+    description: 'Fastest',
+    thinkingLevels: [...CLAUDE_REASONING_LEVELS],
+    defaultThinkingLevel: 'low',
+  },
 ];
 
 // Curated codex model list (codex-sdk has no enumeration API). IDs/efforts
@@ -521,6 +594,9 @@ const CODEX_REASONING_LEVELS_5_6 = ['low', 'medium', 'high', 'xhigh', 'max', 'ul
 const CODEX_REASONING_LEVELS_5_6_LUNA = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 /** Official catalog `minimal_client_version` for GPT-5.6 family. */
 export const CODEX_GPT_5_6_MIN_CLI_VERSION = '0.144.0';
+
+/** Minimum CodeBuddy CLI version that supports `persistSession: false`. */
+export const CODEBUDDY_PERSIST_SESSION_MIN_CLI_VERSION = '2.125.1';
 
 function codexPreset(
   id: string,
@@ -601,10 +677,20 @@ export function filterAgentModelPresetsForCliVersion(
   });
 }
 
+/** Return whether the installed CodeBuddy CLI accepts session persistence options. */
+export function isCodebuddySessionPersistenceSupported(
+  cliVersionText: string | null | undefined,
+): boolean {
+  const cliSemver = extractCliSemver(cliVersionText);
+  return cliSemver !== null
+    && compareSemverCore(cliSemver, CODEBUDDY_PERSIST_SESSION_MIN_CLI_VERSION) >= 0;
+}
+
 /** Resolve the model id (with optional /effort) for auto-selection. */
 export function resolveAgentModelSelection(preset: AgentModelPreset): string {
   const levels = preset.thinkingLevels;
   if (!levels?.length) return preset.id;
+  if (preset.encodeDefaultThinking === false) return preset.id;
   const preferred = preset.defaultThinkingLevel;
   if (preferred && levels.includes(preferred)) {
     return `${preset.id}/${preferred}`;
@@ -670,31 +756,76 @@ export function resolveAgentCliVersion(
   return resolveDiscoveredAgentCliVersion(agent, discovered);
 }
 
+const CURSOR_REASONING_LEVELS = ['low', 'medium', 'high'] as const;
+
 export const CURSOR_MODEL_PRESETS: AgentModelPreset[] = [
   { id: 'auto', name: 'Auto', description: 'Recommended for CLI login / subscription quota' },
   { id: 'composer-2.5', name: 'Composer 2.5', description: 'Recommended for API key' },
-  { id: 'gpt-5.5', name: 'GPT-5.5' },
-  { id: 'gpt-5.2', name: 'GPT-5.2' },
-  { id: 'gpt-5.1', name: 'GPT-5.1' },
-  { id: 'claude-opus-4.6', name: 'Claude Opus 4.6' },
-  { id: 'claude-sonnet-4.6', name: 'Claude Sonnet 4.6' },
+  {
+    id: 'gpt-5',
+    name: 'GPT-5',
+    thinkingLevels: [...CURSOR_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+  },
+  {
+    id: 'gpt-5.5',
+    name: 'GPT-5.5',
+    thinkingLevels: [...CURSOR_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+  },
+  {
+    id: 'gpt-5.2',
+    name: 'GPT-5.2',
+    thinkingLevels: [...CURSOR_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+  },
+  {
+    id: 'gpt-5.1',
+    name: 'GPT-5.1',
+    thinkingLevels: [...CURSOR_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+  },
+  {
+    id: 'claude-opus-4.6',
+    name: 'Claude Opus 4.6',
+    thinkingLevels: [...CURSOR_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+  },
+  {
+    id: 'claude-sonnet-4.6',
+    name: 'Claude Sonnet 4.6',
+    thinkingLevels: [...CURSOR_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+  },
 ];
 
 // CodeBuddy's SDK model enumeration can be empty depending on CLI/account
 // state; keep a CLI-supported fallback list so users can still pass --model.
+const CODEBUDDY_REASONING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+function codebuddyPreset(id: string, name: string): AgentModelPreset {
+  return {
+    id,
+    name,
+    thinkingLevels: [...CODEBUDDY_REASONING_LEVELS],
+    defaultThinkingLevel: 'medium',
+    encodeDefaultThinking: false,
+  };
+}
+
 export const CODEBUDDY_MODEL_PRESETS: AgentModelPreset[] = [
-  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  { id: 'deepseek-v3-2-volc', name: 'DeepSeek V3.2' },
-  { id: 'glm-5.1', name: 'GLM 5.1' },
-  { id: 'glm-5.0', name: 'GLM 5.0' },
-  { id: 'glm-5.0-turbo', name: 'GLM 5.0 Turbo' },
-  { id: 'glm-5v-turbo', name: 'GLM 5V Turbo' },
-  { id: 'glm-4.7', name: 'GLM 4.7' },
-  { id: 'minimax-m3-pay', name: 'MiniMax M3' },
-  { id: 'minimax-m2.7', name: 'MiniMax M2.7' },
-  { id: 'kimi-k2.6', name: 'Kimi K2.6' },
-  { id: 'hy3-preview', name: 'Hy3 Preview' },
+  codebuddyPreset('deepseek-v4-pro', 'DeepSeek V4 Pro'),
+  codebuddyPreset('deepseek-v4-flash', 'DeepSeek V4 Flash'),
+  codebuddyPreset('deepseek-v3-2-volc', 'DeepSeek V3.2'),
+  codebuddyPreset('glm-5.1', 'GLM 5.1'),
+  codebuddyPreset('glm-5.0', 'GLM 5.0'),
+  codebuddyPreset('glm-5.0-turbo', 'GLM 5.0 Turbo'),
+  codebuddyPreset('glm-5v-turbo', 'GLM 5V Turbo'),
+  codebuddyPreset('glm-4.7', 'GLM 4.7'),
+  codebuddyPreset('minimax-m3-pay', 'MiniMax M3'),
+  codebuddyPreset('minimax-m2.7', 'MiniMax M2.7'),
+  codebuddyPreset('kimi-k2.6', 'Kimi K2.6'),
+  codebuddyPreset('hy3-preview', 'Hy3 Preview'),
 ];
 
 export const OPENCODE_MODEL_PRESETS: AgentModelPreset[] = [
@@ -705,10 +836,45 @@ export const OPENCODE_MODEL_PRESETS: AgentModelPreset[] = [
   { id: 'ollama/llama3.3', name: 'Ollama Llama 3.3' },
 ];
 
+// Curated MiMo Code models when live discovery is unavailable. IDs read from
+// the CLI's own catalog (`mimo serve` + `config.providers()`) on v0.1.15: the
+// vendor provider is `xiaomi` and ids are lower-case, provider-prefixed.
+// Live discovery still overrides.
+export const MIMO_MODEL_PRESETS: AgentModelPreset[] = [
+  { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
+  { id: 'xiaomi/mimo-v2.6-pro', name: 'MiMo V2.6 Pro' },
+  { id: 'xiaomi/mimo-v2.6-flash', name: 'MiMo V2.6 Flash' },
+];
+
 // Curated Grok Build models when `grok models` is unavailable. IDs mirror the
 // public Grok Build / xAI coding agent lineup; live discovery still overrides.
 export const GROK_MODEL_PRESETS: AgentModelPreset[] = [
-  { id: 'grok-4.5', name: 'Grok 4.5', description: 'Default' },
+  {
+    id: 'grok-4.7',
+    name: 'Grok 4.7',
+    description: 'Latest',
+    thinkingLevels: ['xhigh', 'high', 'medium', 'low'],
+    defaultThinkingLevel: 'high',
+  },
+  {
+    id: 'grok-4.7-build-fast',
+    name: 'Grok 4.7 Build Fast',
+    thinkingLevels: ['xhigh', 'high', 'medium', 'low'],
+    defaultThinkingLevel: 'high',
+  },
+  {
+    id: 'grok-4.5',
+    name: 'Grok 4.5',
+    description: 'Default',
+    thinkingLevels: ['high', 'medium', 'low'],
+    defaultThinkingLevel: 'high',
+  },
+  {
+    id: 'grok-4.6',
+    name: 'Grok 4.6',
+    thinkingLevels: ['xhigh', 'high', 'medium', 'low'],
+    defaultThinkingLevel: 'high',
+  },
 ];
 
 export function getAgentModelPresets(
@@ -724,6 +890,7 @@ export function getAgentModelPresets(
   if (backend === 'codebuddy') return CODEBUDDY_MODEL_PRESETS;
   if (backend === 'opencode') return OPENCODE_MODEL_PRESETS;
   if (backend === 'grok') return GROK_MODEL_PRESETS;
+  if (backend === 'mimo') return MIMO_MODEL_PRESETS;
 
   if (!agentCommand) return [];
   // Split on both POSIX (/) and Windows (\) separators so command paths like
@@ -743,6 +910,7 @@ export function getAgentModelPresets(
   if (basename.startsWith('codebuddy')) return CODEBUDDY_MODEL_PRESETS;
   if (basename.startsWith('opencode')) return OPENCODE_MODEL_PRESETS;
   if (basename.startsWith('grok')) return GROK_MODEL_PRESETS;
+  if (basename.startsWith('mimo')) return MIMO_MODEL_PRESETS;
   return [];
 }
 

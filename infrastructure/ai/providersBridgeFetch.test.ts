@@ -13,6 +13,7 @@ test('buffers stream events emitted before the Response stream starts', async (t
 
   const dataHandlers = new Map<string, (data: string) => void>();
   const endHandlers = new Map<string, () => void>();
+  let receivedIdleTimeoutMs: number | undefined;
 
   (globalThis as typeof globalThis & { window?: unknown }).window = {
     netcatty: {
@@ -27,7 +28,15 @@ test('buffers stream events emitted before the Response stream starts', async (t
         return () => endHandlers.delete(requestId);
       },
       onAiStreamError: () => () => undefined,
-      aiChatStream: async (requestId: string) => {
+      aiChatStream: async (
+        requestId: string,
+        _url: string,
+        _headers: Record<string, string>,
+        _body: string,
+        _providerId?: string,
+        idleTimeoutMs?: number,
+      ) => {
+        receivedIdleTimeoutMs = idleTimeoutMs;
         const emit = dataHandlers.get(requestId);
         assert.ok(emit, 'stream data handler should be registered before aiChatStream starts');
         emit(JSON.stringify({
@@ -41,7 +50,9 @@ test('buffers stream events emitted before the Response stream starts', async (t
     },
   };
 
-  const fetch = createBridgeFetchForSDK('deepseek-custom');
+  const fetch = createBridgeFetchForSDK('deepseek-custom', {
+    streamIdleTimeoutMs: 10 * 60 * 1000,
+  });
   const response = await fetch('https://api.example.test/v1/chat/completions', {
     method: 'POST',
     body: JSON.stringify({
@@ -52,6 +63,7 @@ test('buffers stream events emitted before the Response stream starts', async (t
 
   const text = await response.text();
   assert.match(text, /"content":"fast"/);
+  assert.equal(receivedIdleTimeoutMs, 10 * 60 * 1000);
 });
 
 test('captures OpenAI-compatible reasoning_content before the tool follow-up request', async (t) => {
@@ -1222,3 +1234,74 @@ test('re-injects the remembered tool name when the SDK missed the naming chunk',
   assert.deepEqual(executedCommands, ['pwd']);
   assert.equal(text, 'tool completed');
 });
+
+for (const indexes of [[0], [1], [1, 4], [4, 1]]) {
+  test(`completes terminal_execute with streamed tool indexes ${indexes.join(',')} (#3274)`, async (t) => {
+    const globals = globalThis as unknown as { window?: unknown };
+    const originalWindow = globals.window;
+    t.after(() => { globals.window = originalWindow; });
+    const dataHandlers = new Map<string, (data: string) => void>();
+    const endHandlers = new Map<string, () => void>();
+    const sentBodies: Array<Record<string, unknown>> = [];
+    globals.window = {
+      netcatty: {
+        aiChatCancel: async () => true,
+        onAiStreamData: (id: string, cb: (data: string) => void) => {
+          dataHandlers.set(id, cb);
+          return () => dataHandlers.delete(id);
+        },
+        onAiStreamEnd: (id: string, cb: () => void) => {
+          endHandlers.set(id, cb);
+          return () => endHandlers.delete(id);
+        },
+        onAiStreamError: () => () => undefined,
+        aiChatStream: async (id: string, _url: string, _headers: unknown, body: string) => {
+          sentBodies.push(JSON.parse(body));
+          const emit = (delta: unknown, finishReason: string | null = null) => dataHandlers.get(id)?.(JSON.stringify({
+            id: 'chatcmpl-sparse', object: 'chat.completion.chunk', created: 0, model: 'test',
+            choices: [{ index: 0, delta, finish_reason: finishReason }],
+          }));
+          if (sentBodies.length === 1) {
+            emit({ content: 'Checking.' });
+            for (const index of indexes) {
+              emit({ tool_calls: [{ index, id: `call_${index}`, type: 'function',
+                function: { name: 'terminal_execute', arguments: '{"command":' } }] });
+            }
+            // Interleave continuations in reverse order to verify stable correlation.
+            for (const index of [...indexes].reverse()) {
+              emit({ tool_calls: [{ index, function: { arguments: `"echo ${index}"}` } }] });
+            }
+            emit({}, 'tool_calls');
+          } else {
+            emit({ content: 'Done.' });
+            emit({}, 'stop');
+          }
+          endHandlers.get(id)?.();
+          return { ok: true, statusCode: 200, statusText: 'OK' };
+        },
+      },
+    };
+    const executed: string[] = [];
+    const result = streamText({
+      model: createModelFromConfig({ id: 'sparse-test', providerId: 'custom', name: 'Test',
+        apiKey: 'test', baseURL: 'https://example.test/v1', defaultModel: 'test', enabled: true }),
+      messages: [{ role: 'user', content: 'Check the terminal' }],
+      tools: { terminal_execute: tool({ inputSchema: z.object({ command: z.string() }),
+        execute: async ({ command }) => { executed.push(command); return { ok: true }; } }) },
+      stopWhen: isStepCount(2),
+    });
+    const errors: unknown[] = [];
+    let text = '';
+    for await (const part of result.stream) {
+      if (part.type === 'error') errors.push(part.error);
+      if (part.type === 'text-delta') text += part.text;
+    }
+    assert.deepEqual(errors, []);
+    assert.deepEqual(executed.sort(), indexes.map(index => `echo ${index}`).sort());
+    assert.equal(text, 'Checking.Done.');
+    assert.equal(sentBodies.length, 2);
+    const messages = sentBodies[1].messages as Array<{ role: string; tool_call_id?: string }>;
+    assert.deepEqual(messages.filter(message => message.role === 'tool').map(message => message.tool_call_id).sort(),
+      indexes.map(index => `call_${index}`).sort());
+  });
+}

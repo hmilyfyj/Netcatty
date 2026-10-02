@@ -1,3 +1,4 @@
+import { decryptProviderHeaders, encryptProviderHeaders } from '../infrastructure/ai/providerHeaderCredentials';
 /**
  * Sync Payload Builders - Single source of truth for constructing and applying
  * the encrypted cloud-sync payload.
@@ -24,8 +25,11 @@ import {
   SYNC_PAYLOAD_ENTITY_KEYS,
   SYNC_STORAGE_KEYS,
   hasSyncPayloadEntityData,
+  retainLocalHostLastConnectedAt,
+  sanitizeHostsForSync,
   type SyncPayload,
 } from '../domain/sync';
+import { migrateLegacyCommandBlocklist } from '../domain/commandBlocklist';
 import { migrateHostsFromLegacyLineTimestamps } from '../domain/host';
 import { toPersistedPortForwardingRules } from '../domain/portForwardingPersistence';
 import {
@@ -41,8 +45,13 @@ import { localStorageAdapter } from '../infrastructure/persistence/localStorageA
 import { decryptField, encryptField } from '../infrastructure/persistence/secureFieldAdapter';
 import { sanitizeQuickMessages } from '../infrastructure/ai/quickMessages';
 import { emitAIStateChanged } from './state/aiStateEvents';
+import {
+  persistCommandBlocklistSetting,
+  readCommandBlocklistSetting,
+} from './state/commandBlocklistSettings';
 import { rehydrateGlobalSftpBookmarks } from './state/sftp/globalSftpBookmarks';
 import {
+  clampTerminalFontSizeValue,
   nextTerminalFontSizeSyncVersion,
   parseTerminalFontSizeRecord,
   serializeTerminalFontSizeRecord,
@@ -51,6 +60,7 @@ import {
   parseCustomAccentRecord,
   serializeCustomAccentRecord,
 } from './state/customAccentSync';
+import { isValidHslToken } from './state/settingsStateDefaults';
 import {
   STORAGE_KEY_THEME,
   STORAGE_KEY_UI_THEME_LIGHT,
@@ -69,6 +79,8 @@ import {
   STORAGE_KEY_TERM_SETTINGS,
   STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN,
   STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB,
+  STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN,
+  STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB,
   STORAGE_KEY_CUSTOM_KEY_BINDINGS,
   STORAGE_KEY_EDITOR_WORD_WRAP,
   STORAGE_KEY_SFTP_DOUBLE_CLICK_BEHAVIOR,
@@ -99,13 +111,18 @@ import {
   STORAGE_KEY_AI_DEFAULT_AGENT,
   STORAGE_KEY_AI_COMMAND_BLOCKLIST,
   STORAGE_KEY_AI_COMMAND_TIMEOUT,
+  STORAGE_KEY_AI_RESPONSE_IDLE_TIMEOUT,
   STORAGE_KEY_AI_MAX_ITERATIONS,
   STORAGE_KEY_AI_AGENT_MODEL_MAP,
   STORAGE_KEY_AI_AGENT_PROVIDER_MAP,
+  STORAGE_KEY_AI_AGENT_THINKING_MAP,
   STORAGE_KEY_AI_WEB_SEARCH,
   STORAGE_KEY_AI_QUICK_MESSAGES,
   STORAGE_KEY_AI_SHOW_TERMINAL_SELECTION_ACTION,
   STORAGE_KEY_PORT_FORWARDING,
+  STORAGE_KEY_VAULT_NOTES_FONT_FAMILY,
+  STORAGE_KEY_VAULT_NOTES_FONT_SIZE,
+  STORAGE_KEY_VAULT_NOTES_CODE_FONT_SIZE,
 } from '../infrastructure/config/storageKeys';
 import { isTerminalSidePanelAutoOpenTab } from '../domain/terminalSidePanelAutoOpen';
 import { prepareRestoredPayloadConvergentWrites } from './convergentSyncReplica';
@@ -207,6 +224,8 @@ export function sanitizePortForwardingRulesForSync(
   }));
 }
 
+export { retainLocalHostLastConnectedAt, sanitizeHostsForSync };
+
 export function getEffectivePortForwardingRulesForSync(
   rules: PortForwardingRule[] | undefined,
 ): PortForwardingRule[] | undefined {
@@ -240,17 +259,19 @@ const SYNCABLE_TERMINAL_KEYS = [
   'startupCommandDelayMs',
   'scrollback', 'drawBoldInBrightColors', 'terminalEmulationType',
   'fontLigatures', 'fontSmoothing', 'fontWeight', 'fontWeightBold', 'fallbackFont',
-  'linePadding', 'cursorShape', 'cursorBlink', 'highlightCursorLine', 'minimumContrastRatio',
+  'linePadding', 'cursorShape', 'cursorBlink', 'cursorBarWidth', 'highlightCursorLine', 'minimumContrastRatio',
   'altAsMeta', 'optionArrowWordJump', 'shiftEnterNewlineEnabled', 'shiftEnterNewlineText',
+  'shiftEnterForceText',
   'kittyKeyboardProtocolEnabled',
   'scrollOnInput', 'scrollOnOutput', 'scrollOnKeyPress', 'scrollOnPaste',
   'smoothScrolling',
-  'rightClickBehavior', 'showContextMenuOverFullscreenApps', 'middleClickBehavior', 'copyOnSelect', 'normalizeTextOnCopy', 'middleClickPaste', 'wordSeparators',
+  'rightClickBehavior', 'rightClickLongPressMenu', 'showContextMenuOverFullscreenApps', 'middleClickBehavior', 'copyOnSelect', 'normalizeTextOnCopy', 'middleClickPaste', 'wordSeparators',
   'linkModifier', 'keywordHighlightEnabled', 'keywordHighlightRules',
   'keepaliveInterval', 'keepaliveCountMax', 'disableBracketedPaste', 'clearWipesScrollback',
   'autoUploadClipboardImageOnPaste',
-  'preserveSelectionOnInput', 'forcePromptNewLine', 'osc52Clipboard', 'dynamicTabTitleMode',
-  'autoCloseOnExit',
+  'confirmBeforeMultilinePaste', 'multilinePasteConfirmMinLines',
+  'preserveSelectionOnInput', 'forcePromptNewLine', 'osc52Clipboard', 'oscNotifications', 'dynamicTabTitleMode', 'tabDoubleClickBehavior',
+  'autoCloseOnExit', 'disconnectedNoticeMode',
   'showHostInfoBar', 'hostInfoBarTitleMode', 'showServerStats',
   'serverStatsRefreshInterval',
   'systemManagerProcessRefreshInterval', 'systemManagerTmuxRefreshInterval',
@@ -273,6 +294,9 @@ export const SYNCABLE_SETTING_STORAGE_KEYS = [
   STORAGE_KEY_UI_FONT_FAMILY,
   STORAGE_KEY_UI_LANGUAGE,
   STORAGE_KEY_CUSTOM_CSS,
+  STORAGE_KEY_VAULT_NOTES_FONT_FAMILY,
+  STORAGE_KEY_VAULT_NOTES_FONT_SIZE,
+  STORAGE_KEY_VAULT_NOTES_CODE_FONT_SIZE,
   STORAGE_KEY_TERM_THEME,
   STORAGE_KEY_TERM_FOLLOW_APP_THEME,
   STORAGE_KEY_TERM_THEME_DARK,
@@ -282,6 +306,8 @@ export const SYNCABLE_SETTING_STORAGE_KEYS = [
   STORAGE_KEY_TERM_SETTINGS,
   STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN,
   STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB,
+  STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN,
+  STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB,
   STORAGE_KEY_CUSTOM_THEMES,
   STORAGE_KEY_CUSTOM_KEY_BINDINGS,
   STORAGE_KEY_EDITOR_WORD_WRAP,
@@ -310,9 +336,11 @@ export const SYNCABLE_SETTING_STORAGE_KEYS = [
   STORAGE_KEY_AI_DEFAULT_AGENT,
   STORAGE_KEY_AI_COMMAND_BLOCKLIST,
   STORAGE_KEY_AI_COMMAND_TIMEOUT,
+  STORAGE_KEY_AI_RESPONSE_IDLE_TIMEOUT,
   STORAGE_KEY_AI_MAX_ITERATIONS,
   STORAGE_KEY_AI_AGENT_MODEL_MAP,
   STORAGE_KEY_AI_AGENT_PROVIDER_MAP,
+  STORAGE_KEY_AI_AGENT_THINKING_MAP,
   STORAGE_KEY_AI_WEB_SEARCH,
   STORAGE_KEY_AI_QUICK_MESSAGES,
   STORAGE_KEY_AI_SHOW_TERMINAL_SELECTION_ACTION,
@@ -380,13 +408,13 @@ const mergeAiProvidersPreservingLocalApiKeys = (
     if (typeof provider?.id === 'string') localById.set(provider.id, provider);
   }
   return incoming.map((provider) => {
-    if (provider.apiKey != null) return provider;
     const id = typeof provider.id === 'string' ? provider.id : undefined;
     const localProvider = id != null ? localById.get(id) : undefined;
-    if (localProvider && typeof localProvider.apiKey === 'string') {
-      return { ...provider, apiKey: localProvider.apiKey };
-    }
-    return provider;
+    return {
+      ...provider,
+      ...(provider.apiKey == null && typeof localProvider?.apiKey === 'string' ? { apiKey: localProvider.apiKey } : {}),
+      ...(provider.customHeaders == null && localProvider?.customHeaders != null ? { customHeaders: localProvider.customHeaders } : {}),
+    };
   });
 };
 
@@ -428,6 +456,12 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
   if (lang) settings.uiLanguage = lang;
   const css = localStorageAdapter.readString(STORAGE_KEY_CUSTOM_CSS);
   if (css != null) settings.customCSS = css;
+  const noteFontFamily = localStorageAdapter.readString(STORAGE_KEY_VAULT_NOTES_FONT_FAMILY);
+  if (noteFontFamily != null) settings.noteFontFamily = noteFontFamily;
+  const noteFontSize = localStorageAdapter.readNumber(STORAGE_KEY_VAULT_NOTES_FONT_SIZE);
+  if (noteFontSize != null && noteFontSize >= 10 && noteFontSize <= 32) settings.noteFontSize = noteFontSize;
+  const noteCodeFontSize = localStorageAdapter.readNumber(STORAGE_KEY_VAULT_NOTES_CODE_FONT_SIZE);
+  if (noteCodeFontSize != null && noteCodeFontSize >= 10 && noteCodeFontSize <= 32) settings.noteCodeFontSize = noteCodeFontSize;
 
   // Terminal
   const termTheme = localStorageAdapter.readString(STORAGE_KEY_TERM_THEME);
@@ -451,6 +485,12 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
   const terminalSidePanelAutoOpenTab = localStorageAdapter.readString(STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB);
   if (isTerminalSidePanelAutoOpenTab(terminalSidePanelAutoOpenTab)) {
     settings.terminalSidePanelAutoOpenTab = terminalSidePanelAutoOpenTab;
+  }
+  const localShellSidePanelAutoOpen = localStorageAdapter.readBoolean(STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN);
+  if (localShellSidePanelAutoOpen != null) settings.localShellSidePanelAutoOpen = localShellSidePanelAutoOpen;
+  const localShellSidePanelAutoOpenTab = localStorageAdapter.readString(STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB);
+  if (isTerminalSidePanelAutoOpenTab(localShellSidePanelAutoOpenTab)) {
+    settings.localShellSidePanelAutoOpenTab = localShellSidePanelAutoOpenTab;
   }
 
   // Terminal settings (syncable subset only)
@@ -534,7 +574,11 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
 
   const ai: NonNullable<SyncPayload['settings']>['ai'] = {};
   const providers = readArraySetting(STORAGE_KEY_AI_PROVIDERS);
-  if (providers) ai.providers = providers.map(stripDeviceBoundApiKey);
+  if (providers) ai.providers = providers.map((provider) => {
+    const next = { ...stripDeviceBoundApiKey(provider) };
+    delete next.customHeaders;
+    return next;
+  });
   const activeProviderId = localStorageAdapter.readString(STORAGE_KEY_AI_ACTIVE_PROVIDER);
   if (activeProviderId != null) ai.activeProviderId = activeProviderId;
   const activeModelId = localStorageAdapter.readString(STORAGE_KEY_AI_ACTIVE_MODEL);
@@ -552,16 +596,24 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
   // externalAgents intentionally not collected: command/args/env are device-local.
   const defaultAgentId = localStorageAdapter.readString(STORAGE_KEY_AI_DEFAULT_AGENT);
   if (defaultAgentId != null) ai.defaultAgentId = defaultAgentId;
-  const commandBlocklist = localStorageAdapter.read<string[]>(STORAGE_KEY_AI_COMMAND_BLOCKLIST);
-  if (Array.isArray(commandBlocklist)) ai.commandBlocklist = commandBlocklist;
+  const storedCommandBlocklist = localStorageAdapter.read<string[]>(STORAGE_KEY_AI_COMMAND_BLOCKLIST);
+  if (Array.isArray(storedCommandBlocklist)) {
+    ai.commandBlocklist = readCommandBlocklistSetting();
+  }
   const commandTimeout = localStorageAdapter.readNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT);
   if (commandTimeout != null && Number.isFinite(commandTimeout)) ai.commandTimeout = commandTimeout;
+  const responseIdleTimeout = localStorageAdapter.readNumber(STORAGE_KEY_AI_RESPONSE_IDLE_TIMEOUT);
+  if (responseIdleTimeout != null && Number.isFinite(responseIdleTimeout)) {
+    ai.responseIdleTimeout = responseIdleTimeout;
+  }
   const maxIterations = localStorageAdapter.readNumber(STORAGE_KEY_AI_MAX_ITERATIONS);
   if (maxIterations != null && Number.isFinite(maxIterations)) ai.maxIterations = maxIterations;
   const agentModelMap = readRecordSetting<Record<string, string>>(STORAGE_KEY_AI_AGENT_MODEL_MAP);
   if (agentModelMap) ai.agentModelMap = agentModelMap;
   const agentProviderMap = readRecordSetting<Record<string, string>>(STORAGE_KEY_AI_AGENT_PROVIDER_MAP);
   if (agentProviderMap) ai.agentProviderMap = agentProviderMap;
+  const agentThinkingMap = readRecordSetting<Record<string, string>>(STORAGE_KEY_AI_AGENT_THINKING_MAP);
+  if (agentThinkingMap) ai.agentThinkingMap = agentThinkingMap;
   const webSearchConfig = readRecordSetting(STORAGE_KEY_AI_WEB_SEARCH);
   if (webSearchConfig) ai.webSearchConfig = stripDeviceBoundApiKey(webSearchConfig);
   const quickMessages = readArraySetting(STORAGE_KEY_AI_QUICK_MESSAGES);
@@ -588,7 +640,12 @@ export async function collectCloudSyncableSettings(): Promise<SyncPayload['setti
   };
 
   if (providers) {
-    ai.providers = await Promise.all(providers.map(withPortableApiKey));
+    ai.providers = await Promise.all(providers.map(async (provider) => {
+      const next = await withPortableApiKey(provider);
+      return isRecord(provider.customHeaders)
+        ? { ...next, customHeaders: await decryptProviderHeaders(provider.customHeaders as Record<string, string>) }
+        : next;
+    }));
   }
   if (webSearchConfig) {
     ai.webSearchConfig = await withPortableApiKey(webSearchConfig);
@@ -625,26 +682,46 @@ function collectLocalBackupSettings(): SyncPayload['settings'] {
  * Apply synced settings to localStorage. Merges terminal settings
  * to preserve platform-specific fields.
  */
-async function applySyncableSettings(settings: NonNullable<SyncPayload['settings']>): Promise<void> {
+async function applySyncableSettings(
+  settings: NonNullable<SyncPayload['settings']>,
+  preparedProviders: Record<string, unknown>[] | undefined,
+): Promise<void> {
   // Theme & Appearance
   if (settings.theme != null) localStorageAdapter.writeString(STORAGE_KEY_THEME, settings.theme);
   if (settings.lightUiThemeId != null) localStorageAdapter.writeString(STORAGE_KEY_UI_THEME_LIGHT, settings.lightUiThemeId);
   if (settings.darkUiThemeId != null) localStorageAdapter.writeString(STORAGE_KEY_UI_THEME_DARK, settings.darkUiThemeId);
   if (settings.accentMode != null) localStorageAdapter.writeString(STORAGE_KEY_ACCENT_MODE, settings.accentMode);
   if (settings.customAccent != null) {
-    const existing = parseCustomAccentRecord(localStorageAdapter.readString(STORAGE_KEY_COLOR));
-    localStorageAdapter.writeString(
-      STORAGE_KEY_COLOR,
-      serializeCustomAccentRecord({
-        color: parseCustomAccentRecord(settings.customAccent).color,
-        // Bump so peer windows' version gates accept the synced value.
-        version: Math.max(existing.version, 0) + 1,
-      }),
+    const storedColor = localStorageAdapter.readString(STORAGE_KEY_COLOR);
+    const existing = parseCustomAccentRecord(storedColor);
+    const incomingColor = parseCustomAccentRecord(settings.customAccent).color;
+    // A missing or malformed record parses to the fallback color, but still
+    // needs to be replaced by an explicit incoming value.
+    const storedColorIsValid = storedColor !== null && (
+      isValidHslToken(storedColor.trim())
+      || storedColor === serializeCustomAccentRecord(existing)
     );
+    if (!storedColorIsValid || incomingColor !== existing.color) {
+      localStorageAdapter.writeString(
+        STORAGE_KEY_COLOR,
+        serializeCustomAccentRecord({
+          color: incomingColor,
+          // Bump so peer windows' version gates accept the synced value.
+          version: Math.max(existing.version, 0) + 1,
+        }),
+      );
+    }
   }
   if (settings.uiFontFamilyId != null) localStorageAdapter.writeString(STORAGE_KEY_UI_FONT_FAMILY, settings.uiFontFamilyId);
   if (settings.uiLanguage != null) localStorageAdapter.writeString(STORAGE_KEY_UI_LANGUAGE, settings.uiLanguage);
   if (settings.customCSS != null) localStorageAdapter.writeString(STORAGE_KEY_CUSTOM_CSS, settings.customCSS);
+  if (settings.noteFontFamily != null) localStorageAdapter.writeString(STORAGE_KEY_VAULT_NOTES_FONT_FAMILY, settings.noteFontFamily);
+  if (settings.noteFontSize != null && settings.noteFontSize >= 10 && settings.noteFontSize <= 32) {
+    localStorageAdapter.writeNumber(STORAGE_KEY_VAULT_NOTES_FONT_SIZE, settings.noteFontSize);
+  }
+  if (settings.noteCodeFontSize != null && settings.noteCodeFontSize >= 10 && settings.noteCodeFontSize <= 32) {
+    localStorageAdapter.writeNumber(STORAGE_KEY_VAULT_NOTES_CODE_FONT_SIZE, settings.noteCodeFontSize);
+  }
 
   // Terminal
   if (settings.terminalTheme != null) localStorageAdapter.writeString(STORAGE_KEY_TERM_THEME, settings.terminalTheme);
@@ -655,24 +732,38 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
   if (settings.terminalThemeLight != null) localStorageAdapter.writeString(STORAGE_KEY_TERM_THEME_LIGHT, settings.terminalThemeLight);
   if (settings.terminalFontFamily != null) localStorageAdapter.writeString(STORAGE_KEY_TERM_FONT_FAMILY, settings.terminalFontFamily);
   if (settings.terminalFontSize != null) {
-    const existing = parseTerminalFontSizeRecord(
-      localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_SIZE),
+    const storedFontSize = localStorageAdapter.readString(STORAGE_KEY_TERM_FONT_SIZE);
+    const existing = parseTerminalFontSizeRecord(storedFontSize);
+    const incomingFontSize = clampTerminalFontSizeValue(settings.terminalFontSize);
+    // A missing or malformed record parses to the default font size. A
+    // supported legacy number remains valid without forcing migration.
+    const storedFontSizeIsValid = storedFontSize !== null && (
+      storedFontSize.trim() === String(existing.fontSize)
+      || storedFontSize === serializeTerminalFontSizeRecord(existing)
     );
-    localStorageAdapter.writeString(
-      STORAGE_KEY_TERM_FONT_SIZE,
-      serializeTerminalFontSizeRecord({
-        fontSize: settings.terminalFontSize,
-        // Bump so peer windows' version gates accept the synced value.
-        version: nextTerminalFontSizeSyncVersion(existing.version, existing.version),
-        origin: 'sync-payload',
-      }),
-    );
+    if (!storedFontSizeIsValid || incomingFontSize !== existing.fontSize) {
+      localStorageAdapter.writeString(
+        STORAGE_KEY_TERM_FONT_SIZE,
+        serializeTerminalFontSizeRecord({
+          fontSize: incomingFontSize,
+          // Bump so peer windows' version gates accept the synced value.
+          version: nextTerminalFontSizeSyncVersion(existing.version, existing.version),
+          origin: 'sync-payload',
+        }),
+      );
+    }
   }
   if (settings.terminalSidePanelAutoOpen != null) {
     localStorageAdapter.writeBoolean(STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN, settings.terminalSidePanelAutoOpen);
   }
   if (isTerminalSidePanelAutoOpenTab(settings.terminalSidePanelAutoOpenTab)) {
     localStorageAdapter.writeString(STORAGE_KEY_TERMINAL_SIDE_PANEL_AUTO_OPEN_TAB, settings.terminalSidePanelAutoOpenTab);
+  }
+  if (settings.localShellSidePanelAutoOpen != null) {
+    localStorageAdapter.writeBoolean(STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN, settings.localShellSidePanelAutoOpen);
+  }
+  if (isTerminalSidePanelAutoOpenTab(settings.localShellSidePanelAutoOpenTab)) {
+    localStorageAdapter.writeString(STORAGE_KEY_LOCAL_SHELL_SIDE_PANEL_AUTO_OPEN_TAB, settings.localShellSidePanelAutoOpenTab);
   }
 
   // Terminal settings - merge with existing to preserve platform-specific keys
@@ -714,17 +805,21 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
 
   // Keyboard
   if (settings.customKeyBindings != null) {
-    const previous = parseCustomKeyBindingsStorageRecord(
-      localStorageAdapter.readString(STORAGE_KEY_CUSTOM_KEY_BINDINGS),
-    );
-    localStorageAdapter.writeString(
-      STORAGE_KEY_CUSTOM_KEY_BINDINGS,
-      serializeCustomKeyBindingsStorageRecord({
-        version: nextCustomKeyBindingsSyncVersion(previous?.version || 0),
-        origin: CUSTOM_KEY_BINDINGS_SYNC_PAYLOAD_ORIGIN,
-        bindings: settings.customKeyBindings,
-      }),
-    );
+    const storedBindings = localStorageAdapter.readString(STORAGE_KEY_CUSTOM_KEY_BINDINGS);
+    const previous = parseCustomKeyBindingsStorageRecord(storedBindings);
+    // Keep an explicit empty binding set when this device has no record.
+    const incomingBindings = JSON.stringify(settings.customKeyBindings);
+    const existingBindings = JSON.stringify(previous?.bindings ?? []);
+    if (previous === null || incomingBindings !== existingBindings) {
+      localStorageAdapter.writeString(
+        STORAGE_KEY_CUSTOM_KEY_BINDINGS,
+        serializeCustomKeyBindingsStorageRecord({
+          version: nextCustomKeyBindingsSyncVersion(previous?.version || 0),
+          origin: CUSTOM_KEY_BINDINGS_SYNC_PAYLOAD_ORIGIN,
+          bindings: settings.customKeyBindings,
+        }),
+      );
+    }
   }
 
   // Editor
@@ -776,11 +871,10 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
 
   const ai = settings.ai;
   if (ai) {
-    if (ai.providers != null) {
-      const providers = await Promise.all(ai.providers.map(withLocalEncryptedApiKey));
+    if (preparedProviders != null) {
       localStorageAdapter.write(
         STORAGE_KEY_AI_PROVIDERS,
-        mergeAiProvidersPreservingLocalApiKeys(providers),
+        mergeAiProvidersPreservingLocalApiKeys(preparedProviders),
       );
     }
     if (ai.activeProviderId != null) localStorageAdapter.writeString(STORAGE_KEY_AI_ACTIVE_PROVIDER, ai.activeProviderId);
@@ -791,11 +885,17 @@ async function applySyncableSettings(settings: NonNullable<SyncPayload['settings
     // externalAgents intentionally not applied: device-local. Legacy snapshots
     // that still carry an `externalAgents` field are silently ignored.
     if (ai.defaultAgentId != null) localStorageAdapter.writeString(STORAGE_KEY_AI_DEFAULT_AGENT, ai.defaultAgentId);
-    if (ai.commandBlocklist != null) localStorageAdapter.write(STORAGE_KEY_AI_COMMAND_BLOCKLIST, ai.commandBlocklist);
+    if (ai.commandBlocklist != null) {
+      persistCommandBlocklistSetting(migrateLegacyCommandBlocklist(ai.commandBlocklist));
+    }
     if (ai.commandTimeout != null) localStorageAdapter.writeNumber(STORAGE_KEY_AI_COMMAND_TIMEOUT, ai.commandTimeout);
+    if (ai.responseIdleTimeout != null) {
+      localStorageAdapter.writeNumber(STORAGE_KEY_AI_RESPONSE_IDLE_TIMEOUT, ai.responseIdleTimeout);
+    }
     if (ai.maxIterations != null) localStorageAdapter.writeNumber(STORAGE_KEY_AI_MAX_ITERATIONS, ai.maxIterations);
     if (ai.agentModelMap != null) localStorageAdapter.write(STORAGE_KEY_AI_AGENT_MODEL_MAP, ai.agentModelMap);
     if (ai.agentProviderMap != null) localStorageAdapter.write(STORAGE_KEY_AI_AGENT_PROVIDER_MAP, ai.agentProviderMap);
+    if (ai.agentThinkingMap != null) localStorageAdapter.write(STORAGE_KEY_AI_AGENT_THINKING_MAP, ai.agentThinkingMap);
     if (ai.webSearchConfig !== undefined) {
       if (ai.webSearchConfig === null) {
         localStorageAdapter.remove(STORAGE_KEY_AI_WEB_SEARCH);
@@ -845,8 +945,10 @@ function notifyAIStateAfterSync(ai: NonNullable<SyncPayload['settings']>['ai']):
   if (ai.defaultAgentId != null) touched.push(STORAGE_KEY_AI_DEFAULT_AGENT);
   if (ai.commandBlocklist != null) touched.push(STORAGE_KEY_AI_COMMAND_BLOCKLIST);
   if (ai.commandTimeout != null) touched.push(STORAGE_KEY_AI_COMMAND_TIMEOUT);
+  if (ai.responseIdleTimeout != null) touched.push(STORAGE_KEY_AI_RESPONSE_IDLE_TIMEOUT);
   if (ai.maxIterations != null) touched.push(STORAGE_KEY_AI_MAX_ITERATIONS);
   if (ai.agentModelMap != null) touched.push(STORAGE_KEY_AI_AGENT_MODEL_MAP);
+  if (ai.agentThinkingMap != null) touched.push(STORAGE_KEY_AI_AGENT_THINKING_MAP);
   // agentProviderMap is *always* potentially mutated because the reconcile
   // step may have pruned it even if the payload didn't ship one.
   touched.push(STORAGE_KEY_AI_AGENT_PROVIDER_MAP);
@@ -916,7 +1018,7 @@ export function buildSyncPayload(
   portForwardingRules?: PortForwardingRule[],
 ): SyncPayload {
   return {
-    hosts: vault.hosts,
+    hosts: sanitizeHostsForSync(vault.hosts),
     keys: vault.keys,
     identities: vault.identities,
     proxyProfiles: vault.proxyProfiles,
@@ -1001,7 +1103,7 @@ export async function buildCloudSyncPayload(
   },
 ): Promise<SyncPayload> {
   const base: SyncPayload = {
-    hosts: vault.hosts,
+    hosts: sanitizeHostsForSync(vault.hosts),
     keys: vault.keys,
     identities: vault.identities,
     proxyProfiles: vault.proxyProfiles,
@@ -1027,6 +1129,8 @@ export function buildLocalVaultPayload(
 ): SyncPayload {
   const base: SyncPayload = {
     ...buildSyncPayload(vault, portForwardingRules),
+    // Keep device-local recent-connection timestamps in protective backups.
+    hosts: vault.hosts,
     settings: collectLocalBackupSettings(),
     knownHosts: vault.knownHosts,
   };
@@ -1087,23 +1191,37 @@ export async function buildLocalVaultPayloadAsync(
  * This ensures both vault data and port-forwarding rules are imported
  * consistently across windows.
  */
-function applyPayload(
+async function preparePayloadApply(
   payload: SyncPayload,
   importers: SyncPayloadImporters,
   options: {
     includeLocalOnlyData: boolean;
     applyPluginSidecars?: PluginSyncSidecarApplier;
+    currentHosts?: Host[];
   },
-): Promise<void> {
+): Promise<() => Promise<void>> {
   // Portable payloads must never keep device-bound enc:v1 blobs. Strip them
   // so a previously poisoned cloud/backup snapshot can still restore host
   // shells and let the user re-enter secrets (#2702).
   const sanitizedPayload = stripSyncPayloadEncryptedCredentials(payload);
+  // Prepare credentials before any vault or settings mutation. Encryption can
+  // fail when local credential storage is unavailable; reuse the result below.
+  const providers = sanitizedPayload.settings?.ai?.providers;
+  const preparedProviders = providers == null ? undefined : await Promise.all(providers.map(async (provider) => {
+    const next = await withLocalEncryptedApiKey(provider);
+    return isRecord(provider.customHeaders)
+      ? { ...next, customHeaders: await encryptProviderHeaders(await decryptProviderHeaders(provider.customHeaders as Record<string, string>)) }
+      : next;
+  }));
   const legacyLineTimestampsEnabled = sanitizedPayload.settings?.terminalSettings?.showLineTimestamps === true;
+  let hosts = migrateHostsFromLegacyLineTimestamps(sanitizedPayload.hosts, legacyLineTimestampsEnabled);
+  if (!options.includeLocalOnlyData) {
+    hosts = retainLocalHostLastConnectedAt(hosts, options.currentHosts) ?? hosts;
+  }
   // Build the vault import object. Cloud sync intentionally ignores
   // local-only trust records even if legacy cloud snapshots still carry them.
   const vaultImport: Record<string, unknown> = {
-    hosts: migrateHostsFromLegacyLineTimestamps(sanitizedPayload.hosts, legacyLineTimestampsEnabled),
+    hosts,
     keys: sanitizedPayload.keys,
     identities: sanitizedPayload.identities,
     proxyProfiles: sanitizedPayload.proxyProfiles,
@@ -1126,7 +1244,7 @@ function applyPayload(
     vaultImport.groupConfigs = sanitizedPayload.groupConfigs;
   }
 
-  return Promise.resolve(importers.importVaultData(JSON.stringify(vaultImport))).then(async () => {
+  return () => Promise.resolve(importers.importVaultData(JSON.stringify(vaultImport))).then(async () => {
     // Only import port-forwarding rules when the payload explicitly carries
     // them.  Absent field = "payload was created before this feature existed",
     // so local rules are preserved.  Explicitly present [] = "remote has no
@@ -1137,7 +1255,7 @@ function applyPayload(
 
     // Apply synced settings
     if (sanitizedPayload.settings) {
-      await applySyncableSettings(sanitizedPayload.settings);
+      await applySyncableSettings(sanitizedPayload.settings, preparedProviders);
       // Rehydrate in-memory bookmark snapshot after localStorage was updated
       if (sanitizedPayload.settings.sftpGlobalBookmarks != null) rehydrateGlobalSftpBookmarks();
       importers.onSettingsApplied?.();
@@ -1152,17 +1270,26 @@ function applyPayload(
   });
 }
 
-export function applySyncPayload(
+export function prepareSyncPayloadApply(
   payload: SyncPayload,
   importers: SyncPayloadImporters,
   options?: {
     applyPluginSidecars?: PluginSyncSidecarApplier;
+    currentHosts?: Host[];
   },
-): Promise<void> {
-  return applyPayload(payload, importers, {
+): Promise<() => Promise<void>> {
+  return preparePayloadApply(payload, importers, {
     includeLocalOnlyData: false,
     applyPluginSidecars: options?.applyPluginSidecars,
+    currentHosts: options?.currentHosts,
   });
+}
+
+export async function applySyncPayload(
+  ...args: Parameters<typeof prepareSyncPayloadApply>
+): Promise<void> {
+  const applyPreparedPayload = await prepareSyncPayloadApply(...args);
+  await applyPreparedPayload();
 }
 
 export async function prepareLocalVaultPayloadApply(
@@ -1179,9 +1306,10 @@ export async function prepareLocalVaultPayloadApply(
   const sanitizedPayload = stripSyncPayloadEncryptedCredentials(payload);
   const prepareConvergentRestore = dependencies.prepareConvergentRestore
     ?? prepareRestoredPayloadConvergentWrites;
+  const applyPreparedPayload = await preparePayloadApply(sanitizedPayload, importers, { includeLocalOnlyData: true });
   const commitConvergentRestore = await prepareConvergentRestore(sanitizedPayload);
   return async () => {
-    await applyPayload(sanitizedPayload, importers, { includeLocalOnlyData: true });
+    await applyPreparedPayload();
     await commitConvergentRestore();
   };
 }

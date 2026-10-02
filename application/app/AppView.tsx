@@ -29,12 +29,14 @@ import {
   useSettingsChromeActions,
   useSettingsChromeStore,
 } from '../state/settingsChromeStore';
+import { getAppAppLockRuntime, useAppLockChrome } from '../state/appRuntimeBridge';
 import { useAppThemeStyle } from './useAppThemeStyle';
 import { useMainWindowInputFocusRecovery } from '../state/useMainWindowInputFocusRecovery';
 import { useExternalMcpToggleState } from '../state/useExternalMcpToggleState';
 import { selectPluginThemeTokens } from '../state/pluginContributionEnvironment';
 import { netcattyBridge } from '../../infrastructure/services/netcattyBridge';
 import { resolveEffectiveTerminalHost } from '../../domain/terminalHostResolution';
+import { getAvailablePaneMagnificationController } from '../../domain/paneMagnification';
 import { pluginViewTabStore, usePluginViewTabs } from '../state/pluginViewTabStore';
 import { buildPluginSettingScopeCatalog } from '../state/usePluginSettingScopeCatalog';
 import { useWorkSurfaceHostEditor } from '../state/useWorkSurfaceHostEditor';
@@ -258,7 +260,7 @@ function AppViewInner({ domains }: AppViewProps) {
 
   const {
     addShellHistoryEntry, removeShellHistoryEntry, addSessionToWorkspace, addToWorkspaceDialog, appendHostToWorkspace, appendLocalTerminalToWorkspace,
-    clearAndRemoveSource, clearAndRemoveSources, closeLogView, closeSession, closeTabsBatch, closeWorkspace, commitPluginImporterData, commitVaultImportTransaction, commitVaultGroupMutation, copySessionToNewWindowWithCurrentShell, copySessionWithCurrentShell, copyWorkspaceWithCurrentShell,
+    clearAndRemoveSource, clearAndRemoveSources, closeLogView, closeSession, closeTabsBatch, closeWorkspace, commitPluginImporterData, commitVaultImportTransaction, commitVaultGroupMutation, copySessionToNewWindowWithCurrentShell, copySessionWithCurrentShell, duplicateSessionWithCurrentShell, copyWorkspaceWithCurrentShell,
     convertKnownHostToHost, createWorkspaceFromSessions, createWorkspaceFromTargets, createWorkspaceWithHosts,
     customGroups, currentTerminalTheme, deepLinkHostDraft, draggingSessionId, effectiveKnownHosts, editorTabs, editorWordWrap, emptyVaultConflict,
     followAppTerminalTheme,
@@ -266,7 +268,7 @@ function AppViewInner({ domains }: AppViewProps) {
     handleEndSessionDrag, handleFollowAppTerminalThemeChange, handleHostConnectWithProtocolCheck, handleHotkeyAction, handleKeyboardInteractiveCancel, handleKeyboardInteractiveSubmit,
     handleOpenHostFromVaultNote, handleOpenQuickSwitcher, handleOpenSettings, handleOpenVaultHostFromChat, handleOpenVaultNoteFromChat, handleOpenVaultSectionFromChat, handleOpenVaultSnippetFromChat, handleRootContextMenu, handlePassphraseCancel, handlePassphraseSkip, handlePassphraseSubmit, handleProtocolSelect,
     handleRequestCloseEditorTabRef, handleSessionStatusChange, handleSyncNowManual, handleTerminalDataCapture, handleUpdateHostFromTerminal,
-    hostById, hosts, terminalHosts, updateTerminalHosts, hotkeyScheme, identities, importOrReuseKey, isBroadcastEnabled, isCreateWorkspaceOpen, isMacClient, isQuickSwitcherOpen,
+    hostById, hosts, terminalHosts, updateTerminalHosts, hotkeyScheme, identities, importOrReuseKey, isBroadcastEnabled, isGlobalBroadcastEnabled, onToggleGlobalBroadcast, canUseGlobalBroadcast, isCreateWorkspaceOpen, isMacClient, isQuickSwitcherOpen,
     keyBindings, keyboardInteractiveQueue, keys, logViews, managedSources, navigateToSection, openLogView, openNoteRequest, orderedTabsWithEditors, orphanSessions, groups, createConsoleInGroup, selectConsoleInGroup, closeGroup,
     passphraseQueue, protocolSelectHost, proxyProfiles, portForwardingRules, quickResults, quickSearch, removeSessionFromWorkspace, reorderWorkTabs, reorderWorkspaceSessions,
     resolveEmptyVaultConflict, resolveSessionAppearance, runSnippet, sessionLogsDir, sessionLogsEnabled, sessionLogsFormat, sessionLogsTimestampsEnabled, sessionRenameTarget, sshDebugLogsEnabled,
@@ -275,7 +277,7 @@ function AppViewInner({ domains }: AppViewProps) {
     setWorkspaceFocusedSession, sftpAutoOpenSidebar, sftpFollowTerminalCwd, setSftpFollowTerminalCwd, sftpAutoSync, sftpDefaultViewMode, sftpDoubleClickBehavior,
     sftpShowHiddenFiles, sftpUseCompressedUpload, snippetPackages, snippets, splitSessionWithCurrentShell, startSessionRename,
     startWorkspaceRename, submitSessionRename, submitWorkspaceRename, t, terminalFontFamilyId, terminalFontSize, terminalSettings, terminalThemeId, themeById,
-    toggleBroadcast, toggleScriptsSidePanelRef, toggleSidePanelRef, toggleWorkspaceViewMode, unmanageSource,
+    toggleBroadcast, toggleScriptsSidePanelRef, toggleSidePanelRef, terminalPaneMagnificationRef, sftpPaneMagnificationRef, toggleWorkspaceViewMode, unmanageSource,
     readPersistedHosts, readPersistedManagedSources, updateCustomGroups, updateGroupConfigs, updateHostDistro, updateHosts, updateIdentities, updateKeys, updateKnownHosts, updateManagedSources,
     updateProxyProfiles, updateSnippetPackages, updateSnippets, updateSplitSizes, updateTerminalSetting, vaultFocusRequest, workspaceRenameTarget, workspaces,
     VaultViewContainer, SftpViewMount, TerminalLayerMount, LogViewWrapper,
@@ -298,8 +300,36 @@ function AppViewInner({ domains }: AppViewProps) {
     restoreTerminalCwd,
     terminalSidePanelAutoOpen,
     terminalSidePanelAutoOpenTab,
+    localShellSidePanelAutoOpen,
+    localShellSidePanelAutoOpenTab,
   } = useSettingsChromeStore();
   const { setTheme, setWindowOpacity } = useSettingsChromeActions();
+
+  const paneMagnificationController = getAvailablePaneMagnificationController([
+    sftpPaneMagnificationRef?.current,
+    terminalPaneMagnificationRef?.current,
+  ]);
+  const paneMagnificationState = paneMagnificationController?.getState() ?? 'unavailable';
+  const handleMagnifyCurrentPane = () => {
+    getAvailablePaneMagnificationController([
+      sftpPaneMagnificationRef?.current,
+      terminalPaneMagnificationRef?.current,
+    ])?.focus();
+  };
+  const handleRestoreMagnifiedPane = () => {
+    getAvailablePaneMagnificationController([
+      sftpPaneMagnificationRef?.current,
+      terminalPaneMagnificationRef?.current,
+    ])?.restore();
+  };
+
+  // App Lock chrome: narrow slice published by AppLockRuntimePublisher; the
+  // lock action reads the full runtime imperatively so the callback stays
+  // stable across gate re-renders.
+  const { appLockEnabled } = useAppLockChrome();
+  const handleLockApp = useCallback(() => {
+    getAppAppLockRuntime()?.lockNow('manual');
+  }, []);
 
   const handleTerminalCommandExecuted = useCallback((
     command: string,
@@ -478,6 +508,8 @@ function AppViewInner({ domains }: AppViewProps) {
         onCloseSession={closeSession}
         onRenameSession={startSessionRename}
         onCopySession={copySessionWithCurrentShell}
+        onDuplicateSession={duplicateSessionWithCurrentShell}
+        tabDoubleClickBehavior={terminalSettings.tabDoubleClickBehavior}
         onCopySessionToNewWindow={copySessionToNewWindowWithCurrentShell}
         onEditHost={handleEditHostFromOverlay}
         onRenameWorkspace={startWorkspaceRename}
@@ -488,6 +520,8 @@ function AppViewInner({ domains }: AppViewProps) {
         onOpenQuickSwitcher={handleOpenQuickSwitcher}
         onThemeChange={setTheme}
         onOpenSettings={handleOpenSettings}
+        onLockApp={handleLockApp}
+        appLockEnabled={appLockEnabled}
         externalMcpEnabled={externalMcpToggle.enabled}
         onToggleExternalMcp={externalMcpToggle.setEnabled}
         showExternalMcpToggle={!isPeerSessionWindow}
@@ -636,6 +670,7 @@ function AppViewInner({ domains }: AppViewProps) {
           editorWordWrap={editorWordWrap}
           setEditorWordWrap={setEditorWordWrap}
           terminalSettings={terminalSettings}
+          paneMagnificationRef={sftpPaneMagnificationRef}
         />
 
         <TerminalLayerMount
@@ -700,6 +735,7 @@ function AppViewInner({ domains }: AppViewProps) {
           onReorderWorkspaceSessions={reorderWorkspaceSessions}
           onReorderTabs={reorderWorkTabs}
           onCopySession={copySessionWithCurrentShell}
+          onDuplicateSession={duplicateSessionWithCurrentShell}
           onCopySessionToNewWindow={copySessionToNewWindowWithCurrentShell}
           onSplitSession={splitSessionWithCurrentShell}
           onConnectToHost={handleConnectToHost}
@@ -711,6 +747,9 @@ function AppViewInner({ domains }: AppViewProps) {
           onCreateLocalTerminal={handleCreateLocalTerminal}
           isBroadcastEnabled={isBroadcastEnabled}
           onToggleBroadcast={toggleBroadcast}
+          isGlobalBroadcastEnabled={isGlobalBroadcastEnabled}
+          onToggleGlobalBroadcast={onToggleGlobalBroadcast}
+          canUseGlobalBroadcast={canUseGlobalBroadcast}
           updateHosts={updateTerminalHosts}
           updateSnippets={updateSnippets}
           updateSnippetPackages={updateSnippetPackages}
@@ -722,6 +761,8 @@ function AppViewInner({ domains }: AppViewProps) {
           sftpAutoOpenSidebar={sftpAutoOpenSidebar}
           terminalSidePanelAutoOpen={terminalSidePanelAutoOpen}
           terminalSidePanelAutoOpenTab={terminalSidePanelAutoOpenTab}
+          localShellSidePanelAutoOpen={localShellSidePanelAutoOpen}
+          localShellSidePanelAutoOpenTab={localShellSidePanelAutoOpenTab}
           sftpFollowTerminalCwd={sftpFollowTerminalCwd}
           setSftpFollowTerminalCwd={setSftpFollowTerminalCwd}
           editorWordWrap={editorWordWrap}
@@ -734,6 +775,7 @@ function AppViewInner({ domains }: AppViewProps) {
           showHostTreeSidebar={showHostTreeSidebar}
           toggleScriptsSidePanelRef={toggleScriptsSidePanelRef}
           toggleSidePanelRef={toggleSidePanelRef}
+          paneMagnificationRef={terminalPaneMagnificationRef}
           onStartSessionRename={startSessionRename}
           onSubmitSessionRename={submitSessionRename}
           onRemoveSessionFromWorkspace={removeSessionFromWorkspace}
@@ -885,6 +927,9 @@ function AppViewInner({ domains }: AppViewProps) {
               }}
               keyBindings={keyBindings}
               terminalSettings={terminalSettings}
+              paneMagnificationState={paneMagnificationState}
+              onMagnifyCurrentPane={handleMagnifyCurrentPane}
+              onRestoreMagnifiedPane={handleRestoreMagnifiedPane}
             />
           </Suspense>
         </LazyLoadBoundary>

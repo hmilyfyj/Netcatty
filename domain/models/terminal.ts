@@ -13,6 +13,7 @@ import {
   TERMINAL_INLINE_IMAGE_SEQUENCE_LIMIT_MB_DEFAULT,
   TERMINAL_INLINE_IMAGE_STORAGE_LIMIT_MB_DEFAULT,
 } from '../terminalInlineImages';
+import { normalizeMultilinePasteConfirmMinLines } from '../terminalPasteConfirm';
 
 // Terminal appearance settings
 export type CursorShape = 'block' | 'bar' | 'underline';
@@ -41,6 +42,15 @@ export type PasswordPromptAssistMode = 'off' | 'hint' | 'picker';
  * - global: commands recorded across all hosts
  */
 export type AutocompleteHistoryScope = 'host' | 'global';
+/**
+ * When remote programs emit OSC 9 / 777 / 99 desktop-notification sequences.
+ * - off: ignore
+ * - unfocused: notify only when this session is not the focused pane or the window is in the background
+ * - always: honor every notification (default; matches iTerm2 / Ghostty / Codex osc9)
+ */
+export type OscNotificationMode = 'off' | 'unfocused' | 'always';
+/** How an established terminal session reports a later disconnect. */
+export type DisconnectedNoticeMode = 'terminal' | 'dialog';
 
 export const DEFAULT_TERMINAL_WORD_SEPARATORS = ' ()[]{}\'"';
 
@@ -57,6 +67,8 @@ export interface KeywordHighlightRule {
   // and the rule picks up new built-in patterns added in later versions.
   customized?: boolean;
 }
+
+export type TerminalTabDoubleClickBehavior = 'duplicate' | 'copy' | 'disabled';
 
 export interface TerminalSettings {
   // Rendering
@@ -76,6 +88,8 @@ export interface TerminalSettings {
   // Cursor
   cursorShape: CursorShape;
   cursorBlink: boolean;
+  /** Width in pixels for a bar cursor; applications can still choose the shape. */
+  cursorBarWidth: number;
   /** Highlight the buffer row under the cursor (WindTerm-style decoration). */
   highlightCursorLine: boolean;
 
@@ -87,6 +101,7 @@ export interface TerminalSettings {
   optionArrowWordJump: boolean; // macOS: Option+←/→ send Meta-b/f for word jump
   shiftEnterNewlineEnabled: boolean; // Send configured text on Shift+Enter
   shiftEnterNewlineText: string; // Backslash-escaped text sent by Shift+Enter
+  shiftEnterForceText: boolean; // Send Shift+Enter text even when ConPTY Win32 input mode is active
   kittyKeyboardProtocolEnabled: boolean; // Enable Kitty keyboard protocol support
   scrollOnInput: boolean; // Scroll terminal to bottom on input
   scrollOnOutput: boolean; // Scroll terminal to bottom on output
@@ -97,6 +112,7 @@ export interface TerminalSettings {
 
   // Mouse
   rightClickBehavior: RightClickBehavior;
+  rightClickLongPressMenu?: boolean;
   // Show the app context menu even when a fullscreen app (tmux/vim) holds mouse tracking
   showContextMenuOverFullscreenApps: boolean;
   middleClickBehavior: MiddleClickBehavior;
@@ -111,6 +127,9 @@ export interface TerminalSettings {
   wordSeparators: string; // Characters for word selection
   linkModifier: LinkModifier; // Modifier key to click links
   autoCloseOnExit: boolean; // Automatically close terminal UI after eligible session exits
+  disconnectedNoticeMode: DisconnectedNoticeMode; // Non-blocking terminal line or legacy dialog after disconnect
+  /** Action when double-clicking a terminal session tab. */
+  tabDoubleClickBehavior: TerminalTabDoubleClickBehavior;
 
   // Keyword Highlighting
   keywordHighlightEnabled: boolean;
@@ -154,6 +173,14 @@ export interface TerminalSettings {
   // instead of falling back to a text paste. Remote SSH sessions only.
   autoUploadClipboardImageOnPaste: boolean;
 
+  // When true, pasting multiple lines first shows a confirmation dialog with
+  // a line/character summary, an editable preview, and send / send-line-by-line
+  // / cancel actions. Protects network-device CLIs (Cisco IOS, Huawei VRP,
+  // H3C Comware) that do not implement bracketed paste (#3398).
+  confirmBeforeMultilinePaste: boolean;
+  /** Minimum line count that triggers the multi-line paste confirmation. */
+  multilinePasteConfirmMinLines: number;
+
   // Shell `clear` command behavior — controls whether CSI 3 J (erase scrollback)
   // from the shell is honored. Default true matches POSIX/ncurses since 2013:
   // `clear` clears both visible screen and scrollback. Disable to keep history
@@ -173,6 +200,9 @@ export interface TerminalSettings {
 
   // Clipboard
   osc52Clipboard: 'off' | 'write-only' | 'read-write' | 'prompt'; // OSC-52 clipboard access: off, write-only (default), read-write, or prompt on read
+
+  // Desktop notifications from OSC 9 / OSC 777 notify / OSC 99
+  oscNotifications: OscNotificationMode;
 
   // Tab titles
   dynamicTabTitleMode: DynamicTabTitleMode; // off, agent-only, or all shell-reported titles
@@ -344,6 +374,12 @@ const isDynamicTabTitleMode = (value: unknown): value is DynamicTabTitleMode => 
   value === 'all'
 );
 
+const isTerminalTabDoubleClickBehavior = (value: unknown): value is TerminalTabDoubleClickBehavior => (
+  value === 'duplicate' ||
+  value === 'copy' ||
+  value === 'disabled'
+);
+
 const isHostInfoBarTitleMode = (value: unknown): value is HostInfoBarTitleMode => (
   value === 'address' ||
   value === 'label'
@@ -359,6 +395,21 @@ const isAutocompleteHistoryScope = (value: unknown): value is AutocompleteHistor
   value === 'host' ||
   value === 'global'
 );
+
+const isOscNotificationMode = (value: unknown): value is OscNotificationMode => (
+  value === 'off' ||
+  value === 'unfocused' ||
+  value === 'always'
+);
+
+const isDisconnectedNoticeMode = (value: unknown): value is DisconnectedNoticeMode => (
+  value === 'terminal' || value === 'dialog'
+);
+
+export const normalizeCursorBarWidth = (value: unknown): number => {
+  const width = typeof value === 'number' ? value : DEFAULT_TERMINAL_SETTINGS.cursorBarWidth;
+  return Number.isFinite(width) ? Math.min(4, Math.max(1, Math.round(width))) : DEFAULT_TERMINAL_SETTINGS.cursorBarWidth;
+};
 
 export const normalizeTerminalSettings = (
   settings?: Partial<TerminalSettings> | null,
@@ -377,9 +428,13 @@ export const normalizeTerminalSettings = (
     middleClickPaste: middleClickBehavior === 'paste',
     wordSeparators,
     shiftEnterNewlineText,
+    cursorBarWidth: normalizeCursorBarWidth(settings?.cursorBarWidth),
     dynamicTabTitleMode: isDynamicTabTitleMode(settings?.dynamicTabTitleMode)
       ? settings.dynamicTabTitleMode
       : DEFAULT_TERMINAL_SETTINGS.dynamicTabTitleMode,
+    tabDoubleClickBehavior: isTerminalTabDoubleClickBehavior(settings?.tabDoubleClickBehavior)
+      ? settings.tabDoubleClickBehavior
+      : DEFAULT_TERMINAL_SETTINGS.tabDoubleClickBehavior,
     hostInfoBarTitleMode: isHostInfoBarTitleMode(settings?.hostInfoBarTitleMode)
       ? settings.hostInfoBarTitleMode
       : DEFAULT_TERMINAL_SETTINGS.hostInfoBarTitleMode,
@@ -389,6 +444,12 @@ export const normalizeTerminalSettings = (
     autocompleteHistoryScope: isAutocompleteHistoryScope(settings?.autocompleteHistoryScope)
       ? settings.autocompleteHistoryScope
       : DEFAULT_TERMINAL_SETTINGS.autocompleteHistoryScope,
+    oscNotifications: isOscNotificationMode(settings?.oscNotifications)
+      ? settings.oscNotifications
+      : DEFAULT_TERMINAL_SETTINGS.oscNotifications,
+    disconnectedNoticeMode: isDisconnectedNoticeMode(settings?.disconnectedNoticeMode)
+      ? settings.disconnectedNoticeMode
+      : DEFAULT_TERMINAL_SETTINGS.disconnectedNoticeMode,
   };
 
   // Migrate legacy 'canvas' renderer to 'dom' (canvas removed in xterm.js 6.0)
@@ -406,6 +467,9 @@ export const normalizeTerminalSettings = (
     ...mergedSettings,
     rendererType,
     autocompleteMaxSuggestions,
+    multilinePasteConfirmMinLines: normalizeMultilinePasteConfirmMinLines(
+      mergedSettings.multilinePasteConfirmMinLines,
+    ),
     hibernateHiddenTabsDelaySec: normalizeHibernateHiddenTabsDelaySec(
       mergedSettings.hibernateHiddenTabsDelaySec,
     ),
@@ -449,12 +513,14 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   fallbackFont: '',
   cursorShape: 'block',
   cursorBlink: true,
+  cursorBarWidth: 2,
   highlightCursorLine: false,
   minimumContrastRatio: 1,
   altAsMeta: false,
   optionArrowWordJump: false,
   shiftEnterNewlineEnabled: true,
   shiftEnterNewlineText: '\\n',
+  shiftEnterForceText: false,
   kittyKeyboardProtocolEnabled: false,
   scrollOnInput: true,
   scrollOnOutput: false,
@@ -462,6 +528,7 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   scrollOnPaste: true,
   smoothScrolling: false,
   rightClickBehavior: 'context-menu',
+  rightClickLongPressMenu: false,
   showContextMenuOverFullscreenApps: false,
   middleClickBehavior: 'paste',
   copyOnSelect: false,
@@ -470,6 +537,8 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   wordSeparators: DEFAULT_TERMINAL_WORD_SEPARATORS,
   linkModifier: 'none',
   autoCloseOnExit: true,
+  // Issue #3087: keep terminal history visible after an established session disconnects.
+  disconnectedNoticeMode: 'terminal',
   keywordHighlightEnabled: true,
   keywordHighlightRules: DEFAULT_KEYWORD_HIGHLIGHT_RULES,
   localShell: '', // Empty = use system default
@@ -496,11 +565,16 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   systemManagerDockerStatsRefreshInterval: 3,
   disableBracketedPaste: false, // Bracketed paste enabled by default
   autoUploadClipboardImageOnPaste: false, // Opt-in: image in clipboard auto-uploads on paste (remote sessions)
+  confirmBeforeMultilinePaste: false, // Opt-in: ask before pasting multiple lines (#3398)
+  multilinePasteConfirmMinLines: 2, // Paste of 2+ lines asks for confirmation
   clearWipesScrollback: true, // POSIX-standard: shell `clear` clears scrollback too
   preserveSelectionOnInput: false, // Opt-in: keep selection alive when typing
   forcePromptNewLine: false, // Opt-in: keep the next shell prompt visually separated from unterminated final output lines
   osc52Clipboard: 'write-only', // OSC-52: allow remote programs to write clipboard by default
+  oscNotifications: 'always', // Honor OSC 9/777/99 desktop notifications by default
   dynamicTabTitleMode: 'agent',
+  // Prefer an independent SSH login so a double-click never restores the source cwd.
+  tabDoubleClickBehavior: 'duplicate',
   rendererType: 'auto', // Auto-detect best renderer based on hardware
   hibernateHiddenTabs: false,
   hibernateHiddenTabsDelaySec: 5,
@@ -537,6 +611,13 @@ export interface TerminalTheme {
   colors: {
     background: string;
     foreground: string;
+    /**
+     * Optional intense variant for bold text drawn with the default foreground
+     * (SGR 1 / SGR 39;1). When set and different from `foreground`, bold text
+     * without an explicit ANSI color renders with this color instead (#3352).
+     * Explicit ANSI colors keep the existing normal/bright palette behavior.
+     */
+    foregroundIntense?: string;
     cursor: string;
     selection: string;
     black: string;
@@ -599,6 +680,11 @@ export interface TerminalSession {
   // falls back to a fresh connection — so this also applies on reconnect: a
   // reconnect reuses the source again if still connected, else dials fresh.
   reuseConnectionFromSessionId?: string;
+  // Marker for "Duplicate Session" clones: never multiplex onto any live,
+  // parked, or in-flight pooled transport (including the source's own
+  // connection) — always dial a brand-new connection with fresh auth. The
+  // starter turns this into `reuseTransport: false` on every attempt.
+  requireFreshConnection?: boolean;
   // Per-pane font size override (workspace splits only; not persisted to vault hosts).
   fontSize?: number;
   fontSizeOverride?: boolean;

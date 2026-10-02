@@ -68,8 +68,16 @@ import type { SessionRestorePayload } from '../../domain/sessionRestore';
 import { resolveRestorePreviousSessionSetting } from './sessionRestoreSettings';
 import type { CodingCliProviderId } from '../../domain/codingCliProviders';
 import { normalizeCodingCliDynamicTitleForStorage } from '../../domain/codingCliTitleParse';
-import { DEFAULT_WORKSPACE_TITLE } from '../../domain/sessionTabTitle';
+import {
+  DEFAULT_WORKSPACE_TITLE,
+  buildMergedWorkspaceTitle,
+  buildMergedWorkspaceTitleFromSessions,
+  getSessionConnectionLabel,
+} from '../../domain/sessionTabTitle';
 import { cleanupClosedTerminalSessions } from './aiStateSnapshots';
+import { syncSessionHostLabels } from '../../domain/syncSessionHostLabels';
+import { resolveGlobalBroadcastSessionIds } from '../../domain/terminalBroadcast';
+import { useVaultSnapshotField } from './vaultSnapshotStore';
 
 export function addWorkspaceIfMissing(
   workspaces: Workspace[],
@@ -240,6 +248,8 @@ export const useSessionState = ({
   const [tabOrder, setTabOrder] = useState<string[]>(initialRestoreState.tabOrder);
   // Broadcast mode: stores workspace IDs that have broadcast enabled
   const [broadcastWorkspaceIds, setBroadcastWorkspaceIds] = useState<Set<string>>(new Set());
+  // Global broadcast spans visible standalone tabs and each host group's active console.
+  const [globalBroadcastEnabled, setGlobalBroadcastEnabled] = useState<boolean>(false);
   // Log views: stores open log replay tabs
   const [logViews, setLogViews] = useState<LogView[]>([]);
   const [restorePreviousSessionRevision, setRestorePreviousSessionRevision] = useState(0);
@@ -271,6 +281,55 @@ export const useSessionState = ({
       activeTabStore.setActiveTabId(initialRestoreState.activeTabId);
     }
   }, [initialRestoreState.activeTabId]);
+
+  // Keep open sessions' connection label in sync with the vault. Sessions
+  // snapshot `hostLabel` at connect time, so renaming a host would otherwise
+  // leave its already-open tabs (and merged-workspace titles derived from
+  // those labels) showing the old name until the session is closed. The
+  // generated-title sync effect below re-runs on this session change and
+  // refreshes synthesized workspace titles too.
+  const vaultHosts = useVaultSnapshotField('hosts');
+  useEffect(() => {
+    if (vaultHosts.length === 0) return;
+    // The helper returns the same array reference when nothing changed, so
+    // React bails out of the state update.
+    setSessions(prev => syncSessionHostLabels(prev, vaultHosts));
+  }, [vaultHosts]);
+
+  // Keep generated merged-workspace titles (e.g. "01/02" after dragging tab
+  // "02" onto "01") synchronized with the workspace's current membership and
+  // each pane's connection label. `autoTitle: false` makes
+  // resolveWorkspaceTabLabel treat the composed title as a user-chosen name,
+  // so without this pass a pane rename or a pane being added/removed would
+  // leave the label stale. Runs off session changes and only touches
+  // workspaces still flagged `generatedTitle` (a user rename clears it).
+  useEffect(() => {
+    setWorkspaces(prev => {
+      let changed = false;
+      const next = prev.map(ws => {
+        if (!ws.generatedTitle) return ws;
+        // Order members by the workspace's pane tree (base/join or split
+        // layout), not by global session creation order — merging a newer tab
+        // onto an older one must keep the merged title as created (e.g.
+        // "02/01"), while `sessions.filter` would rewrite it to "01/02".
+        const rootIds = collectSessionIds(ws.root);
+        const members = [
+          ...rootIds
+            .map(id => sessions.find(s => s.id === id))
+            .filter((s): s is TerminalSession => Boolean(s)),
+          // Safety net for transient membership: any session assigned to this
+          // workspace whose pane has not landed in `root` yet keeps its
+          // previous (creation-order) position after the pane-tree members.
+          ...sessions.filter(s => s.workspaceId === ws.id && !rootIds.includes(s.id)),
+        ];
+        const recomputed = buildMergedWorkspaceTitleFromSessions(members) ?? DEFAULT_WORKSPACE_TITLE;
+        if (recomputed === ws.title) return ws;
+        changed = true;
+        return { ...ws, title: recomputed };
+      });
+      return changed ? next : prev;
+    });
+  }, [sessions]);
 
   useEffect(() => {
     const handleRestorePreviousSessionChanged = (key?: string) => {
@@ -663,11 +722,16 @@ export const useSessionState = ({
   }, []);
 
   const submitWorkspaceRename = useCallback((workspaceId?: string, name?: string) => {
+    // A user rename takes ownership of the title: clear `generatedTitle` so a
+    // previously synthesized merged title ("01/02") stops being auto-updated.
+    const applyRename = (w: Workspace, trimmed: string): Workspace => (
+      { ...w, title: trimmed, autoTitle: false, generatedTitle: false }
+    );
     if (workspaceId !== undefined && name !== undefined) {
       const trimmed = name.trim();
       if (!trimmed) return;
       setWorkspaces(prev => prev.map(w => (
-        w.id === workspaceId ? { ...w, title: trimmed, autoTitle: false } : w
+        w.id === workspaceId ? applyRename(w, trimmed) : w
       )));
       return;
     }
@@ -678,7 +742,7 @@ export const useSessionState = ({
 
       setWorkspaceRenameTarget(prevTarget => {
         if (!prevTarget) return prevTarget;
-        setWorkspaces(prev => prev.map(w => w.id === prevTarget.id ? { ...w, title: trimmed, autoTitle: false } : w));
+        setWorkspaces(prev => prev.map(w => w.id === prevTarget.id ? applyRename(w, trimmed) : w));
         return null;
       });
 
@@ -770,7 +834,29 @@ export const useSessionState = ({
     hint: SplitHint
   ) => {
     if (!hint || baseSessionId === joiningSessionId) return;
-    const newWorkspace = createWorkspaceEntity(baseSessionId, joiningSessionId, hint);
+    // Name the merged workspace after both tabs' connection labels (e.g.
+    // "01/02") so the window title and the rename dialog show the merged
+    // identity instead of the generic "Workspace". Falls back to the default
+    // auto title when neither tab has a label. The explicit `autoTitle: false`
+    // makes tab labels use this composed name too; `generatedTitle: true`
+    // marks it as synthesized so it keeps tracking membership/renames (see the
+    // generated-title sync effect below) instead of going stale.
+    // Compose the title from the created pane-tree order (not base/join
+    // order): for left/top merges `createWorkspaceEntity` places the joining
+    // pane before the base pane in `root`, and the generated-title sync
+    // effect above recomputes from `root` order — building the initial title
+    // in tree order keeps it stable instead of renaming itself right after
+    // creation.
+    const created = createWorkspaceEntity(baseSessionId, joiningSessionId, hint);
+    const treeLabels = collectSessionIds(created.root).map((id) =>
+      getSessionConnectionLabel(
+        sessionsRef.current.find(s => s.id === id) ?? { customName: '', hostLabel: '' },
+      ),
+    );
+    const mergedTitle = buildMergedWorkspaceTitle(treeLabels[0] ?? '', treeLabels[1] ?? '');
+    const newWorkspace = mergedTitle
+      ? { ...created, title: mergedTitle, autoTitle: false, generatedTitle: true }
+      : created;
 
     setSessions((prevSessions) => {
       const base = prevSessions.find((s) => s.id === baseSessionId);
@@ -1107,6 +1193,7 @@ export const useSessionState = ({
   const createConsoleInGroup = useCallback((groupId: string, baseSessionId?: string, options?: {
     localShellType?: TerminalSession['shellType'];
     inheritedCwd?: string;
+    reuseConnection?: boolean;
   }) => {
     const group = groupsRef.current.find((item) => item.id === groupId);
     if (!group) return null;
@@ -1122,6 +1209,7 @@ export const useSessionState = ({
       groupId,
       groupConsoleIndex: group.nextConsoleIndex,
       groupTitle: group.title,
+      reuseConnection: options?.reuseConnection,
     });
     setSessions((prev) => [...prev, newSession]);
     setGroups((prev) => addConsoleToGroup(prev, groupId, newSessionId));
@@ -1134,6 +1222,15 @@ export const useSessionState = ({
     if (!group) return;
     closeSessions(group.sessionIds);
   }, [closeSessions]);
+  const canUseGlobalBroadcast = useMemo(
+    () => resolveGlobalBroadcastSessionIds(sessions, groups).length >= 2,
+    [sessions, groups],
+  );
+
+  // Losing the group must disarm broadcast before another tab can join it.
+  if (!canUseGlobalBroadcast && globalBroadcastEnabled) {
+    setGlobalBroadcastEnabled(false);
+  }
 
   const openLogView = useCallback((log: ConnectionLog) => {
     const tabId = getLogViewTabId(log);
@@ -1155,6 +1252,8 @@ export const useSessionState = ({
   const copySession = useCallback((sessionId: string, options?: {
     localShellType?: TerminalSession['shellType'];
     inheritedCwd?: string;
+    /** When false, open a brand-new connection instead of reusing the source's SSH channel. */
+    reuseConnection?: boolean;
   }) => {
     // Pre-allocate the new id outside the updater so StrictMode's
     // double-invocation of the functional updater doesn't mint two ids.
@@ -1165,6 +1264,7 @@ export const useSessionState = ({
       createConsoleInGroup(groupedSource.groupId, sessionId, {
         localShellType: options?.localShellType,
         inheritedCwd: options?.inheritedCwd,
+        reuseConnection: options?.reuseConnection,
       });
       return;
     }
@@ -1178,6 +1278,7 @@ export const useSessionState = ({
         id: newSessionId,
         localShellType: options?.localShellType,
         inheritedCwd: options?.inheritedCwd,
+        reuseConnection: options?.reuseConnection,
       });
 
       // Schedule the activeTab + tabOrder updates only when creation
@@ -1289,6 +1390,14 @@ export const useSessionState = ({
   const isBroadcastEnabled = useCallback((workspaceId: string) => {
     return broadcastWorkspaceIds.has(workspaceId);
   }, [broadcastWorkspaceIds]);
+
+  // Toggle global broadcast mode for orphan sessions
+  const toggleGlobalBroadcast = useCallback(() => {
+    setGlobalBroadcastEnabled(prev => !prev);
+  }, []);
+
+  // Global broadcast enabled state - direct boolean value
+  const isGlobalBroadcastEnabled = globalBroadcastEnabled;
 
   const baseWorkTabIds = useMemo(() => [
     ...groups.map(g => g.id),
@@ -1415,9 +1524,12 @@ export const useSessionState = ({
     moveFocusInWorkspace,
     runSnippet,
     orphanSessions,
+    canUseGlobalBroadcast,
     // Broadcast mode
     toggleBroadcast,
     isBroadcastEnabled,
+    toggleGlobalBroadcast,
+    isGlobalBroadcastEnabled,
     orderedTabs,
     getOrderedWorkTabs,
     reorderTabs,

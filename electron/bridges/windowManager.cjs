@@ -640,7 +640,7 @@ function attachOAuthLoadingOverlay(win) {
   });
 }
 
-function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true } = {}) {
+function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true, startHidden = false } = {}) {
   const webContentsId = (() => {
     try {
       return win?.webContents?.id;
@@ -660,6 +660,20 @@ function setupDeferredShow(win, { timeoutMs = 3000, waitForRendererReady = true 
     if (timer) clearTimeout(timer);
     timer = null;
     if (webContentsId) rendererReadyCallbacksByWebContentsId.delete(webContentsId);
+    if (startHidden) {
+      // Cold start via the OS login item ("--hidden"): stay hidden. The tray
+      // icon is guaranteed (and pinned open regardless of close-to-tray)
+      // by mainWindow.cjs right after bridges register, which runs before
+      // this can fire (ready-to-show/renderer-ready always come later), so
+      // electronModule is safely initialized by then. Pin here too as a
+      // belt-and-suspenders fallback in case that ordering ever changes.
+      try {
+        getGlobalShortcutBridge().pinTrayForHiddenLaunch?.();
+      } catch (err) {
+        console.warn("[WindowManager] Failed to create tray for hidden launch:", err?.message || err);
+      }
+      return;
+    }
     try {
       if (!win.isDestroyed()) win.show();
     } catch {
@@ -1019,7 +1033,11 @@ const terminalPopupWindowApi = createTerminalPopupWindowApi({
   unregisterAppContentWindow,
   notifyAppContentWindowClosed,
 });
-const { openTerminalPopupWindow, closeTerminalPopupWindow } = terminalPopupWindowApi;
+const {
+  openTerminalPopupWindow,
+  closeTerminalPopupWindow,
+  getTerminalPopupWindows,
+} = terminalPopupWindowApi;
 
 /**
  * Register window control IPC handlers (only once)
@@ -1056,6 +1074,13 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   });
 
   ipcMain.handle("netcatty:window:close", (event) => {
+    try {
+      if (typeof menuDeps?.isAppLocked === "function" && menuDeps.isAppLocked()) {
+        return { success: false, reason: "app-locked" };
+      }
+    } catch {
+      // ignore
+    }
     const win = getWindowForIpcEvent(event);
     if (win && !win.isDestroyed()) {
       debugLog("window:close", {
@@ -1097,6 +1122,13 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   ipcMain.handle("netcatty:window:setTitle", (event, title) => {
     const win = getWindowForIpcEvent(event);
     if (!win || win.isDestroyed()) return false;
+    try {
+      if (typeof menuDeps?.setAppLockWindowTitle === "function") {
+        return menuDeps.setAppLockWindowTitle(win, title) === true;
+      }
+    } catch {
+      // Ignore title-guard failures and keep normal title behavior.
+    }
     const value = typeof title === "string" ? title.trim() : "";
     try {
       win.setTitle(value || "Netcatty");
@@ -1139,13 +1171,21 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
   ipcMain.handle("netcatty:setAppIconVariant", (_event, variant) => {
     const { app, BrowserWindow, nativeImage } = require("electron");
     const appIconManager = require("./appIconManager.cjs");
-    return appIconManager.applyAppIconVariant(variant, {
+    const applied = appIconManager.applyAppIconVariant(variant, {
       app,
       BrowserWindow,
       nativeImage,
       appPath: app.getAppPath(),
       isMac: process.platform === "darwin",
     });
+    if (applied && process.platform === "win32") {
+      try {
+        getGlobalShortcutBridge().updateTrayIcon?.();
+      } catch {
+        // The tray is optional; the taskbar icon still updated.
+      }
+    }
+    return applied;
   });
 
   ipcMain.handle("netcatty:setLanguage", (_event, language) => {
@@ -1231,13 +1271,40 @@ function registerWindowHandlers(ipcMain, nativeTheme) {
 /**
  * Build the application menu
  */
-function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
+function buildAppMenu(Menu, app, isMac, language = currentLanguage, options = {}) {
   // Save deps so later language changes can rebuild the menu.
-  menuDeps = { Menu, app, isMac };
-  const closeFocusedWindow = (_menuItem, browserWindow) => {
+  menuDeps = {
+    Menu,
+    app,
+    isMac,
+    isAppLocked: typeof options.isAppLocked === "function"
+      ? options.isAppLocked
+      : (typeof menuDeps?.isAppLocked === "function" ? menuDeps.isAppLocked : undefined),
+    setAppLockWindowTitle: typeof options.setAppLockWindowTitle === "function"
+      ? options.setAppLockWindowTitle
+      : (typeof menuDeps?.setAppLockWindowTitle === "function"
+        ? menuDeps.setAppLockWindowTitle
+        : undefined),
+  };
+  const closeFocusedWindow = (_menuItem, browserWindow, event) => {
+    // Block native Close while app lock is visible so popups/sessions are not
+    // torn down behind the overlay (Codex P2 on 79603979).
+    try {
+      if (typeof menuDeps?.isAppLocked === "function" && menuDeps.isAppLocked()) return;
+    } catch {
+      // ignore
+    }
     // 只有主窗口/设置窗口会接收 command-close；其他 BrowserWindow 直接关闭。
     if (browserWindow && !isMainWindow(browserWindow) && browserWindow !== settingsWindow) {
       closeBrowserWindow(browserWindow);
+      return;
+    }
+
+    // Selecting Close Window with the mouse remains an explicit window-close
+    // action. Only the menu accelerator is routed through the configurable
+    // close-tab shortcut in the renderer.
+    if (event?.triggeredByAccelerator === false) {
+      closeBrowserWindow(browserWindow || getMainWindow());
       return;
     }
 
@@ -1276,8 +1343,26 @@ function buildAppMenu(Menu, app, isMac, language = currentLanguage) {
     {
       label: tMenu(language, "view"),
       submenu: [
-        { label: tMenu(language, "reload"), click: (_, win) => { if (win) win.reload(); } },
-        { role: "toggleDevTools" },
+        {
+          label: tMenu(language, "reload"),
+          click: (_, win) => {
+            // Block reload while app lock is up so lock cannot be bypassed.
+            try {
+              if (typeof menuDeps?.isAppLocked === "function" && menuDeps.isAppLocked()) return;
+            } catch { /* ignore */ }
+            if (win) win.reload();
+          },
+        },
+        {
+          label: "Toggle Developer Tools",
+          accelerator: "Alt+CommandOrControl+I",
+          click: (_, win) => {
+            try {
+              if (typeof menuDeps?.isAppLocked === "function" && menuDeps.isAppLocked()) return;
+            } catch { /* ignore */ }
+            if (win && !win.isDestroyed?.()) win.webContents?.toggleDevTools?.();
+          },
+        },
         { type: "separator" },
         { role: "resetZoom" },
         { role: "zoomIn" },
@@ -1405,6 +1490,7 @@ module.exports = {
   closeSettingsWindow,
   openTerminalPopupWindow,
   closeTerminalPopupWindow,
+  getTerminalPopupWindows,
   prewarmSettingsWindow,
   buildAppMenu,
   getCurrentLanguage,

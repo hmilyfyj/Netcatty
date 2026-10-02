@@ -8,8 +8,10 @@ import {
 } from "../../../application/state/sftp/transferConcurrency";
 import { logger } from "../../../lib/logger";
 import { toast } from "../../ui/toast";
+import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
 import { getFileExtension, getLanguageId, FileOpenerType, SystemAppInfo } from "../../../lib/sftpFileUtils";
 import { isNavigableDirectory } from "../utils";
+import { resolveDownloadSourceSnapshot } from "../../../application/state/sftp/downloadSourceSnapshot";
 import { reportSftpUploadResults } from "../reportSftpUploadResults";
 import { editorTabStore } from "../../../application/state/editorTabStore";
 import { toEditorTabId, activeTabStore } from "../../../application/state/activeTabStore";
@@ -35,6 +37,8 @@ export const useSftpViewFileOps = ({
   showSaveDialog,
   selectDirectory,
   getSftpIdForConnection,
+  statSftp,
+  listSftp,
 }: UseSftpViewFileOpsParams): UseSftpViewFileOpsResult => {
   const [permissionsState, setPermissionsState] = useState<{
     file: SftpFileEntry;
@@ -403,7 +407,7 @@ export const useSftpViewFileOps = ({
       if (!pane.connection) return;
 
       const resolvedFullPath = fullPath ?? sftpRef.current.joinPath(pane.connection.currentPath, file.name);
-      const isDirectory = isNavigableDirectory(file);
+      let isDirectory = isNavigableDirectory(file);
 
       try {
         // For local files, use blob download.
@@ -441,6 +445,18 @@ export const useSftpViewFileOps = ({
           throw new Error("SFTP session not found");
         }
 
+        // The listed entry can be stale when the file was deleted / recreated
+        // in the terminal without refreshing the side panel. Re-stat so the
+        // planned snapshot size and entry type match the real source.
+        const sourceSnapshot = await resolveDownloadSourceSnapshot(
+          statSftp,
+          sftpId,
+          resolvedFullPath,
+          pane.filenameEncoding,
+          listSftp,
+        );
+        isDirectory = sourceSnapshot.isDirectory;
+
         if (isDirectory) {
           if (!selectDirectory) {
             toast.error(t("sftp.error.downloadFailed"), "SFTP");
@@ -450,6 +466,15 @@ export const useSftpViewFileOps = ({
           const selectedDirectory = await selectDirectory(t("sftp.context.download"));
           if (!selectedDirectory) return;
 
+          // The picker may stay open while the remote entry changes again.
+          const selectedSnapshot = await resolveDownloadSourceSnapshot(
+            statSftp,
+            sftpId, resolvedFullPath, pane.filenameEncoding,
+            listSftp,
+          );
+          if (!selectedSnapshot.isDirectory) {
+            throw new Error("Remote source changed while choosing the download target");
+          }
           const targetPath = joinFsPath(selectedDirectory, file.name);
 
           try {
@@ -480,14 +505,17 @@ export const useSftpViewFileOps = ({
 
           return;
         }
-        // Show save dialog to get target path
         const targetPath = await showSaveDialog(file.name);
-        if (!targetPath) {
-          // User cancelled
-          return;
-        }
+        if (!targetPath) return;
 
-        const fileSize = typeof file.size === "string" ? parseInt(file.size, 10) || 0 : (file.size || 0);
+        const selectedSnapshot = await resolveDownloadSourceSnapshot(
+          statSftp,
+          sftpId, resolvedFullPath, pane.filenameEncoding,
+          listSftp,
+        );
+        if (selectedSnapshot.isDirectory) {
+          throw new Error("Remote source changed while choosing the download target");
+        }
         // Route through downloadToLocal so FileZilla-style transfer pool
         // sessions are used (browse session stays free for listing).
         const status = await sftpRef.current.downloadToLocal({
@@ -500,7 +528,7 @@ export const useSftpViewFileOps = ({
           sourceHostLabel: pane.connection.hostLabel,
           sourceEncoding: pane.filenameEncoding,
           isDirectory: false,
-          totalBytes: fileSize,
+          totalBytes: selectedSnapshot.size,
         });
         if (status === "completed") {
           toast.success(`${t("sftp.context.download")}: ${file.name}`, "SFTP");
@@ -522,6 +550,8 @@ export const useSftpViewFileOps = ({
       showSaveDialog,
       selectDirectory,
       getSftpIdForConnection,
+      statSftp,
+      listSftp,
     ],
   );
 
@@ -533,6 +563,52 @@ export const useSftpViewFileOps = ({
   const onDownloadFileRight = useCallback(
     (file: SftpFileEntry, fullPath?: string) => handleDownloadFileForSide("right", file, fullPath),
     [handleDownloadFileForSide],
+  );
+
+  const handleExtractArchiveForSide = useCallback(
+    async (side: "left" | "right", file: SftpFileEntry, fullPath?: string) => {
+      const pane = side === "left" ? sftpRef.current.leftPane : sftpRef.current.rightPane;
+      if (!pane.connection) return;
+
+      const resolvedPath = fullPath ?? sftpRef.current.joinPath(pane.connection.currentPath, file.name);
+      toast.info(t("sftp.extract.extracting", { fileName: file.name }), "SFTP");
+      try {
+        const bridge = netcattyBridge.get();
+        if (pane.connection.isLocal) {
+          if (!bridge?.extractLocalArchive) {
+            throw new Error("Local extract unavailable");
+          }
+          await bridge.extractLocalArchive(resolvedPath);
+        } else {
+          const sftpId = getSftpIdForConnection?.(pane.connection.id);
+          if (!sftpId || !bridge?.extractSftpArchive) {
+            throw new Error("SFTP session not found");
+          }
+          await bridge.extractSftpArchive(sftpId, resolvedPath, pane.filenameEncoding);
+        }
+        await sftpRef.current.refresh(side);
+        toast.success(t("sftp.extract.success", { fileName: file.name }), "SFTP");
+      } catch (e) {
+        logger.error("[SftpView] Failed to extract archive:", e);
+        toast.error(
+          t("sftp.extract.error", {
+            fileName: file.name,
+            error: e instanceof Error ? e.message : String(e),
+          }),
+          "SFTP",
+        );
+      }
+    },
+    [getSftpIdForConnection, sftpRef, t],
+  );
+
+  const onExtractArchiveLeft = useCallback(
+    (file: SftpFileEntry, fullPath?: string) => handleExtractArchiveForSide("left", file, fullPath),
+    [handleExtractArchiveForSide],
+  );
+  const onExtractArchiveRight = useCallback(
+    (file: SftpFileEntry, fullPath?: string) => handleExtractArchiveForSide("right", file, fullPath),
+    [handleExtractArchiveForSide],
   );
 
   // Multi-file download. For local panes, each file auto-downloads as a blob
@@ -586,8 +662,16 @@ export const useSftpViewFileOps = ({
           try {
             const sourcePath = sftpRef.current.joinPath(pane.connection.currentPath, file.name);
             const targetPath = joinFsPath(selectedDirectory, file.name);
-            const isDirectory = isNavigableDirectory(file);
-            const fileSize = typeof file.size === "string" ? parseInt(file.size, 10) || 0 : (file.size || 0);
+            // Re-stat each root: the listed entries can be stale after
+            // terminal-side delete + recreate without a refresh.
+            const sourceSnapshot = await resolveDownloadSourceSnapshot(
+              statSftp,
+              sftpId,
+              sourcePath,
+              pane.filenameEncoding,
+              listSftp,
+            );
+            const isDirectory = sourceSnapshot.isDirectory;
 
             const status = await sftpRef.current.downloadToLocal({
               fileName: file.name,
@@ -599,7 +683,7 @@ export const useSftpViewFileOps = ({
               sourceHostLabel: pane.connection.hostLabel,
               sourceEncoding: pane.filenameEncoding,
               isDirectory,
-              totalBytes: isDirectory ? undefined : fileSize,
+              totalBytes: isDirectory ? undefined : sourceSnapshot.size,
             });
             results[index] = { status: "fulfilled", value: { file, status } };
           } catch (reason) {
@@ -632,6 +716,8 @@ export const useSftpViewFileOps = ({
       t,
       selectDirectory,
       getSftpIdForConnection,
+      statSftp,
+      listSftp,
       handleDownloadFileForSide,
     ],
   );
@@ -738,6 +824,8 @@ export const useSftpViewFileOps = ({
     onOpenFileWithRight,
     onDownloadFileLeft,
     onDownloadFileRight,
+    onExtractArchiveLeft,
+    onExtractArchiveRight,
     onDownloadFilesLeft,
     onDownloadFilesRight,
     onUploadExternalFilesLeft,

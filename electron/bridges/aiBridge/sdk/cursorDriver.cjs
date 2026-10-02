@@ -5,8 +5,15 @@
  *
  * Cursor SDK local agents use Agent.create({ apiKey, model, local:{cwd},
  * mcpServers }) and stream SDKMessage events from run.stream().
+ * Each local turn runs in its own utility process with a host-supplied environment.
+ * Stopping a stalled SDK startup cannot block another chat or leak its tenant.
  */
 const { mcpEnvPairsToObject } = require("./injectMcp.cjs");
+const {
+  applyTemporaryProcessEnv,
+  withExclusiveProcessEnv,
+  withTemporaryProcessEnv,
+} = require("./processEnvGate.cjs");
 
 const DEFAULT_CURSOR_MODEL = "composer-2.5";
 
@@ -24,18 +31,49 @@ function toCursorMcpServers(injectedMcpServers) {
   return servers;
 }
 
+const CURSOR_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh"]);
+const CURSOR_FALLBACK_THINKING = {
+  "gpt-5.5": ["low", "medium", "high"],
+  "gpt-5.2": ["low", "medium", "high"],
+  "gpt-5.1": ["low", "medium", "high"],
+  "gpt-5": ["low", "medium", "high"],
+  "claude-opus-4.6": ["low", "medium", "high"],
+  "claude-sonnet-4.6": ["low", "medium", "high"],
+};
+
 function parseCursorModelSelection(model) {
   const raw = String(model || DEFAULT_CURSOR_MODEL).trim() || DEFAULT_CURSOR_MODEL;
   const queryIndex = raw.indexOf("?");
-  if (queryIndex < 0) return { id: raw };
-
-  const id = raw.slice(0, queryIndex);
-  const search = new URLSearchParams(raw.slice(queryIndex + 1));
-  const params = [];
-  for (const [paramId, value] of search.entries()) {
-    if (paramId && value) params.push({ id: paramId, value });
+  if (queryIndex >= 0) {
+    const id = raw.slice(0, queryIndex);
+    const search = new URLSearchParams(raw.slice(queryIndex + 1));
+    const params = [];
+    for (const [paramId, value] of search.entries()) {
+      if (paramId && value) params.push({ id: paramId, value });
+    }
+    return params.length > 0 ? { id, params } : { id };
   }
-  return params.length > 0 ? { id, params } : { id };
+  const slash = raw.lastIndexOf("/");
+  if (slash > 0) {
+    const effort = raw.slice(slash + 1).toLowerCase();
+    if (CURSOR_REASONING_EFFORTS.has(effort)) {
+      return { id: raw.slice(0, slash), params: [{ id: "effort", value: effort }] };
+    }
+  }
+  return { id: raw };
+}
+
+function encodeCursorCliModel(model) {
+  const raw = String(model || "").trim();
+  if (!raw) return "";
+  const selection = parseCursorModelSelection(raw);
+  if (!selection.params?.length) return selection.id || "";
+  const search = new URLSearchParams();
+  for (const param of selection.params) {
+    if (param?.id && param?.value) search.set(param.id, param.value);
+  }
+  const qs = search.toString();
+  return qs ? `${selection.id}?${qs}` : (selection.id || "");
 }
 
 function buildCursorAgentOptions({ apiKey, env, model, cwd, injectedMcpServers }) {
@@ -51,32 +89,6 @@ function buildCursorAgentOptions({ apiKey, env, model, cwd, injectedMcpServers }
   const mcpServers = toCursorMcpServers(injectedMcpServers);
   if (Object.keys(mcpServers).length > 0) options.mcpServers = mcpServers;
   return options;
-}
-
-function applyTemporaryProcessEnv(env) {
-  if (!env || typeof env !== "object") return () => {};
-  const previous = new Map();
-  for (const [key, value] of Object.entries(env)) {
-    if (typeof value !== "string") continue;
-    previous.set(key, Object.prototype.hasOwnProperty.call(process.env, key) ? process.env[key] : undefined);
-    process.env[key] = value;
-  }
-
-  return () => {
-    for (const [key, value] of previous.entries()) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  };
-}
-
-async function withTemporaryProcessEnv(env, fn) {
-  const restore = applyTemporaryProcessEnv(env);
-  try {
-    return await fn();
-  } finally {
-    restore();
-  }
 }
 
 function buildCursorSendMessage(prompt, attachments) {
@@ -301,7 +313,13 @@ async function abortable(promise, signal, onLateResolve) {
   }
 }
 
-async function runCursorTurn({
+function runCursorTurn(options) {
+  // Injected SDK modules are used by the in-process driver tests only.
+  if (options.sdkModule) return runCursorTurnInProcess(options);
+  return require("./cursorWorkerHost.cjs").runCursorWorkerTurn(options);
+}
+
+async function runCursorTurnInProcess({
   prompt, attachments, agentOptions, runtimeEnv, resumeSessionId, emitter, signal, sdkModule,
 }) {
   let resolvedModule = sdkModule;
@@ -319,9 +337,14 @@ async function runCursorTurn({
   let run = null;
   let sessionId = resumeSessionId || null;
   try {
-    const restoreCreateEnv = applyTemporaryProcessEnv(runtimeEnv);
-    try {
-      const createAgent = () => Agent.create(agentOptions);
+    // Local Cursor agents inherit process.env; serialize the mutation so
+    // concurrent chats cannot swap NETCATTY_CLI_CHAT_SESSION_ID mid-spawn.
+    agent = await abortable(withExclusiveProcessEnv(runtimeEnv, async () => {
+      if (signal?.aborted) throw new CursorTurnAbortError();
+      const createAgent = () => {
+        if (signal?.aborted) throw new CursorTurnAbortError();
+        return Agent.create(agentOptions);
+      };
       let agentPromise;
       if (resumeSessionId && typeof Agent.resume === "function") {
         agentPromise = Agent.resume(resumeSessionId, agentOptions).catch((error) => {
@@ -339,27 +362,23 @@ async function runCursorTurn({
       } else {
         agentPromise = createAgent();
       }
-      agent = await abortable(agentPromise, signal, (lateAgent) => {
-        try { lateAgent?.close?.(); } catch { /* best effort */ }
-      });
-    } finally {
-      restoreCreateEnv();
-    }
+      return agentPromise;
+    }), signal, (lateAgent) => {
+      try { lateAgent?.close?.(); } catch { /* best effort */ }
+    });
     sessionId = agent.agentId || sessionId;
     if (sessionId) emitter.sessionId(sessionId);
     if (signal?.aborted) return { sessionId };
 
     const sendMessage = buildCursorSendMessage(prompt, attachments);
-    const restoreSendEnv = applyTemporaryProcessEnv(runtimeEnv);
-    try {
-      run = await abortable(agent.send(sendMessage), signal, (lateRun) => {
-        if (lateRun && typeof lateRun.cancel === "function") {
-          void lateRun.cancel().catch(() => {});
-        }
-      });
-    } finally {
-      restoreSendEnv();
-    }
+    run = await abortable(withExclusiveProcessEnv(runtimeEnv, () => {
+      if (signal?.aborted) throw new CursorTurnAbortError();
+      return agent.send(sendMessage);
+    }), signal, (lateRun) => {
+      if (lateRun && typeof lateRun.cancel === "function") {
+        void lateRun.cancel().catch(() => {});
+      }
+    });
     const state = { reasoningOpen: false };
     let hasContent = false;
     let failed = false;
@@ -425,18 +444,50 @@ function modelVariantId(modelId, params) {
   return qs ? `${modelId}?${qs}` : modelId;
 }
 
+function collectCursorEffortLevels(model) {
+  const levels = [];
+  const add = (raw) => {
+    const level = String(raw || "").toLowerCase();
+    if (CURSOR_REASONING_EFFORTS.has(level) && !levels.includes(level)) levels.push(level);
+  };
+  const effortParam = (model.parameters || []).find((param) => param?.id === "effort");
+  if (effortParam && Array.isArray(effortParam.values) && effortParam.values.length > 0) {
+    for (const item of effortParam.values) add(item?.value);
+    return levels;
+  }
+  for (const level of CURSOR_FALLBACK_THINKING[model.id] || []) add(level);
+  if (levels.length > 0) return levels;
+  for (const variant of model.variants || []) {
+    const params = Array.isArray(variant.params) ? variant.params : [];
+    const effortOnly = params.length === 1 && params[0]?.id === "effort" && params[0]?.value;
+    if (effortOnly) add(params[0].value);
+  }
+  return levels;
+}
+
 function mapCursorModels(models) {
   const out = [];
   if (!Array.isArray(models)) return out;
   for (const model of models) {
     if (!model?.id) continue;
     const name = model.displayName || model.name || model.id;
+    const extraVariants = [];
+    for (const variant of model.variants || []) {
+      const params = Array.isArray(variant.params) ? variant.params : [];
+      const effortOnly = params.length === 1 && params[0]?.id === "effort" && params[0]?.value;
+      if (!effortOnly) extraVariants.push(variant);
+    }
+    const thinkingLevels = collectCursorEffortLevels(model);
     out.push({
       id: model.id,
       name,
       ...(model.description ? { description: model.description } : {}),
+      ...(thinkingLevels.length > 0 ? {
+        thinkingLevels,
+        defaultThinkingLevel: thinkingLevels.includes("medium") ? "medium" : thinkingLevels[0],
+      } : {}),
     });
-    for (const variant of model.variants || []) {
+    for (const variant of extraVariants) {
       const id = modelVariantId(model.id, variant.params || []);
       if (id === model.id) continue;
       out.push({
@@ -488,7 +539,9 @@ module.exports = {
   listCursorModels,
   mapCursorModels,
   parseCursorModelSelection,
+  encodeCursorCliModel,
   runCursorTurn,
+  runCursorTurnInProcess,
   toCursorMcpServers,
   translateCursorEvent,
   withTemporaryProcessEnv,

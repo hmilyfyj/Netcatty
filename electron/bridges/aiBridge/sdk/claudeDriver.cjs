@@ -78,10 +78,31 @@ function parseClaudeSettings(settings) {
   return str;
 }
 
+const CLAUDE_REASONING_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+
+function splitClaudeModelSelection(model) {
+  if (typeof model !== "string" || !model) {
+    return { model: undefined, effort: undefined };
+  }
+  const slash = model.lastIndexOf("/");
+  if (slash <= 0) return { model, effort: undefined };
+  const effort = model.slice(slash + 1);
+  if (!CLAUDE_REASONING_LEVELS.has(effort)) return { model, effort: undefined };
+  return { model: model.slice(0, slash), effort };
+}
+
+function mergeClaudeEffortSettings(settings, effort) {
+  if (!effort) return settings;
+  if (settings == null) return { effort };
+  if (typeof settings === "object") return { ...settings, effort };
+  return settings;
+}
+
 function buildClaudeQueryOptions({
   cwd, model, env, pathToClaudeCodeExecutable, abortController, injectedMcpServers, settings, resume,
   toolIntegrationMode,
 }) {
+  const { model: resolvedModel, effort } = splitClaudeModelSelection(model);
   const options = {
     cwd,
     includePartialMessages: true,
@@ -97,7 +118,8 @@ function buildClaudeQueryOptions({
     env,
     abortController,
   };
-  if (model) options.model = model;
+  if (resolvedModel) options.model = resolvedModel;
+  if (effort) options.effort = effort;
   // Resume the prior session so context carries ACROSS turns. Without this the
   // SDK starts a fresh session every turn (full amnesia). The session id is
   // emitted on system-init (before any turn work), so a mid-turn Stop can't lose
@@ -108,7 +130,7 @@ function buildClaudeQueryOptions({
     options.pathToClaudeCodeExecutable = pathToClaudeCodeExecutable;
   }
   // Optional settings.json path / inline object — additive to CLAUDE_CONFIG_DIR.
-  const parsedSettings = parseClaudeSettings(settings);
+  const parsedSettings = mergeClaudeEffortSettings(parseClaudeSettings(settings), effort);
   if (parsedSettings !== undefined) options.settings = parsedSettings;
   return options;
 }
@@ -264,9 +286,47 @@ async function runClaudeTurn({ prompt, attachments, options, emitter, queryFn })
 /** Map claude-agent-sdk ModelInfo[] -> renderer preset shape {id,name,description}. */
 function mapClaudeModels(models) {
   if (!Array.isArray(models)) return [];
-  return models
-    .filter((m) => m && m.value)
-    .map((m) => ({ id: m.value, name: m.displayName || m.value, description: m.description }));
+  // SDK types declare {value, displayName, description}, but Claude Code's
+  // supportedModels() control response actually returns {id, name} at runtime
+  // (same CLI lineage as CodeBuddy — see mapCodebuddyModels). Accept both
+  // shapes so a live catalog is never filtered into an empty list, which
+  // would silently degrade the picker to build-time curated presets (#3496).
+  const presets = models
+    .map((m) => {
+      if (!m) return null;
+      const id = m.value || m.id || m.modelId;
+      if (!id) return null;
+      const advertisedLevels = m.supportedEffortLevels || m.thinking?.effort_options;
+      const thinkingLevels = m.supportsEffort === false
+        ? []
+        : Array.isArray(advertisedLevels)
+          ? advertisedLevels.filter((level) => CLAUDE_REASONING_LEVELS.has(level))
+          : ["low", "medium", "high", "max"];
+      return {
+        id,
+        name: m.displayName || m.name || id,
+        description: m.description,
+        thinkingLevels,
+        ...(thinkingLevels.length > 0 ? { defaultThinkingLevel: thinkingLevels.includes("medium") ? "medium" : thinkingLevels[0] } : {}),
+      };
+    })
+    .filter(Boolean);
+  const nameCounts = new Map();
+  for (const preset of presets) {
+    nameCounts.set(preset.name, (nameCounts.get(preset.name) || 0) + 1);
+  }
+  const usedNames = new Set(presets.map((preset) => preset.name));
+  return presets.map((preset) => {
+    if (nameCounts.get(preset.name) === 1) return preset;
+    let suffix = 1;
+    let name = `[${preset.id}] ${preset.name}`;
+    while (usedNames.has(name)) {
+      suffix += 1;
+      name = `[${preset.id} #${suffix}] ${preset.name}`;
+    }
+    usedNames.add(name);
+    return { ...preset, name };
+  });
 }
 
 /**
@@ -345,6 +405,8 @@ async function listClaudeModels({
 module.exports = {
   buildClaudeQueryOptions,
   parseClaudeSettings,
+  splitClaudeModelSelection,
+  mergeClaudeEffortSettings,
   translateClaudeMessage,
   classifyClaudeSpawnError,
   buildClaudePromptInput,

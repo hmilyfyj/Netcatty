@@ -4,8 +4,12 @@ import assert from 'node:assert/strict';
 import {
   buildCursorListModelsAgentEnv,
   buildSdkRuntimeModelCacheKey,
+  canonicalizeEffortEncodedModelId,
   createSdkRuntimeModelCache,
+  agentModelPresetsShallowEqual,
+  mergeFallbackThinkingLevels,
   modelPresetsContainId,
+  normalizeStoredAgentModelSelection,
   normalizeSdkRuntimeModelPresets,
   shouldAdoptSdkCurrentModel,
   shouldLoadSdkRuntimeModels,
@@ -66,6 +70,51 @@ test('Cursor auth mode changes invalidate the SDK model cache key', () => {
   assert.notEqual(apiKey, cliLogin);
 });
 
+test('canonicalizeEffortEncodedModelId collapses Cursor query-string effort', () => {
+  assert.equal(canonicalizeEffortEncodedModelId('gpt-5?effort=low'), 'gpt-5/low');
+  assert.equal(canonicalizeEffortEncodedModelId('gpt-5/high'), 'gpt-5/high');
+  assert.equal(canonicalizeEffortEncodedModelId('gpt-5?effort=low&mode=fast'), 'gpt-5?effort=low&mode=fast');
+});
+
+test('mergeFallbackThinkingLevels fills missing runtime effort catalogs', () => {
+  const merged = mergeFallbackThinkingLevels(
+    [{ id: 'gpt-5.5', name: 'GPT-5.5' }, { id: 'auto', name: 'Auto' }],
+    [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low', 'medium', 'high'], defaultThinkingLevel: 'medium' }],
+  );
+  assert.deepEqual(merged[0]?.thinkingLevels, ['low', 'medium', 'high']);
+  assert.equal(merged[0]?.defaultThinkingLevel, 'medium');
+  assert.equal(merged[1]?.thinkingLevels, undefined);
+  const partial = mergeFallbackThinkingLevels(
+    [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low'] }],
+    [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low', 'medium', 'high'], defaultThinkingLevel: 'medium' }],
+  );
+  assert.deepEqual(partial[0]?.thinkingLevels, ['low']);
+  const unsupported = mergeFallbackThinkingLevels(
+    [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: [] }],
+    [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low', 'high'] }],
+  );
+  assert.deepEqual(unsupported[0]?.thinkingLevels, []);
+  assert.deepEqual(mergeFallbackThinkingLevels([], [{ id: 'gpt-5.5', name: 'GPT-5.5' }]), []);
+  const alreadyFilled = [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low'] }];
+  assert.equal(
+    mergeFallbackThinkingLevels(
+      alreadyFilled,
+      [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low', 'medium', 'high'] }],
+    ),
+    alreadyFilled,
+  );
+});
+
+test('agentModelPresetsShallowEqual ignores array identity when contents match', () => {
+  const left = [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low', 'high'] }];
+  const right = [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low', 'high'] }];
+  assert.equal(agentModelPresetsShallowEqual(left, right), true);
+  assert.equal(
+    agentModelPresetsShallowEqual(left, [{ id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['high'] }]),
+    false,
+  );
+});
+
 test('modelPresetsContainId matches plain and thinking-level model ids', () => {
   const presets: AgentModelPreset[] = [
     { id: 'gpt-5.5', name: 'GPT-5.5', thinkingLevels: ['low', 'high'] },
@@ -73,6 +122,7 @@ test('modelPresetsContainId matches plain and thinking-level model ids', () => {
   ];
 
   assert.equal(modelPresetsContainId(presets, 'gpt-5.5/high'), true);
+  assert.equal(modelPresetsContainId(presets, 'gpt-5.5?effort=high'), true);
   assert.equal(modelPresetsContainId(presets, 'claude-sonnet'), true);
   assert.equal(modelPresetsContainId(presets, 'gpt-5.5/medium'), false);
 });
@@ -92,7 +142,7 @@ test('shouldLoadSdkRuntimeModels includes SDK agents with model catalogs', () =>
   assert.equal(shouldLoadSdkRuntimeModels(agent('codebuddy')), true);
   assert.equal(shouldLoadSdkRuntimeModels(agent('opencode')), true);
   assert.equal(shouldLoadSdkRuntimeModels(agent('grok')), true);
-  assert.equal(shouldLoadSdkRuntimeModels(agent('codex')), false);
+  assert.equal(shouldLoadSdkRuntimeModels(agent('codex')), true);
   assert.equal(shouldLoadSdkRuntimeModels({ ...agent('codex'), codexRuntime: 'app-server' }), true);
   assert.equal(shouldLoadSdkRuntimeModels(undefined), false);
 });
@@ -111,6 +161,44 @@ test('Codex App Server model discovery uses a separate cache identity', () => {
     codexRuntime: 'app-server',
   });
   assert.notEqual(sdk, appServer);
+  assert.notEqual(
+    buildSdkRuntimeModelCacheKey({ id: 'discovered_codex', sdkBackend: 'codex', command: '/bin/codex', env: { HOME: '/shared', CODEX_HOME: '/profiles/a' } }),
+    buildSdkRuntimeModelCacheKey({ id: 'discovered_codex', sdkBackend: 'codex', command: '/bin/codex', env: { HOME: '/shared', CODEX_HOME: '/profiles/b' } }),
+  );
+});
+
+test('Claude model cache keys isolate configuration directories under one home', () => {
+  const agent = { id: 'discovered_claude', sdkBackend: 'claude', command: '/bin/claude' };
+  assert.notEqual(
+    buildSdkRuntimeModelCacheKey({ ...agent, env: { HOME: '/shared', CLAUDE_CONFIG_DIR: '/profiles/a' } }),
+    buildSdkRuntimeModelCacheKey({ ...agent, env: { HOME: '/shared', CLAUDE_CONFIG_DIR: '/profiles/b' } }),
+  );
+});
+
+test('MiMo model cache reloads after its config directory changes', async () => {
+  const agent = { id: 'discovered_mimo', sdkBackend: 'mimo', command: '/bin/mimo' };
+  const firstKey = buildSdkRuntimeModelCacheKey({ ...agent, env: { MIMOCODE_HOME: '/profiles/a' } });
+  const secondKey = buildSdkRuntimeModelCacheKey({ ...agent, env: { MIMOCODE_HOME: '/profiles/b' } });
+  const cache = createSdkRuntimeModelCache();
+  let loads = 0;
+  const load = async () => ({ currentModelId: String(++loads), models: [] });
+  assert.deepEqual(await cache.refresh(firstKey, load), { currentModelId: '1', models: [] });
+  assert.deepEqual(await cache.refresh(secondKey, load), { currentModelId: '2', models: [] });
+  assert.equal(loads, 2);
+  assert.notEqual(
+    buildSdkRuntimeModelCacheKey({ ...agent, env: { MIMOCODE_CONFIG: '/profiles/a/mimocode.json' } }),
+    buildSdkRuntimeModelCacheKey({ ...agent, env: { MIMOCODE_CONFIG: '/profiles/b/mimocode.json' } }),
+  );
+});
+
+test('Claude model cache keys isolate credentials without exposing them', () => {
+  const agent = { id: 'discovered_claude', sdkBackend: 'claude', command: '/bin/claude' };
+  for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN']) {
+    const first = buildSdkRuntimeModelCacheKey({ ...agent, env: { [name]: 'secret-one' } });
+    const second = buildSdkRuntimeModelCacheKey({ ...agent, env: { [name]: 'secret-two' } });
+    assert.notEqual(first, second, `${name} must separate cache entries`);
+    assert.doesNotMatch(first, /secret-one/);
+  }
 });
 
 test('shouldAdoptSdkCurrentModel keeps SDK defaults when no runtime list is returned', () => {
@@ -123,6 +211,55 @@ test('shouldAdoptSdkCurrentModel keeps SDK defaults when no runtime list is retu
     false,
   );
   assert.equal(shouldAdoptSdkCurrentModel(null, undefined, []), false);
+});
+
+test('normalizeStoredAgentModelSelection rewrites Cursor query effort but not extra params', () => {
+  const presets: AgentModelPreset[] = [{
+    id: 'gpt-5.5',
+    name: 'GPT-5.5',
+    thinkingLevels: ['low', 'medium', 'high'],
+    defaultThinkingLevel: 'medium',
+  }];
+  assert.equal(normalizeStoredAgentModelSelection('gpt-5.5?effort=low', presets), 'gpt-5.5/low');
+  assert.equal(normalizeStoredAgentModelSelection('gpt-5.5/high', presets), 'gpt-5.5/high');
+  assert.equal(
+    normalizeStoredAgentModelSelection('gpt-5.5?effort=low&mode=fast', presets),
+    undefined,
+  );
+});
+
+test('normalizeStoredAgentModelSelection keeps bare CodeBuddy ids unsuffixed', () => {
+  const presets: AgentModelPreset[] = [{
+    id: 'glm-5.1',
+    name: 'GLM 5.1',
+    thinkingLevels: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+    defaultThinkingLevel: 'medium',
+    encodeDefaultThinking: false,
+  }];
+  assert.equal(normalizeStoredAgentModelSelection('glm-5.1', presets), 'glm-5.1');
+  assert.equal(normalizeStoredAgentModelSelection('glm-5.1/high', presets), 'glm-5.1/high');
+});
+
+test('legacy plain model selections keep their model and gain its default reasoning effort', () => {
+  const presets: AgentModelPreset[] = [{
+    id: 'grok-4.5',
+    name: 'Grok 4.5',
+    thinkingLevels: ['high', 'medium', 'low'],
+    defaultThinkingLevel: 'high',
+  }, {
+    id: 'grok-4.6',
+    name: 'Grok 4.6',
+    thinkingLevels: ['xhigh', 'high', 'medium', 'low'],
+    defaultThinkingLevel: 'high',
+  }];
+
+  assert.equal(modelPresetsContainId(presets, 'grok-4.5'), true);
+  assert.equal(normalizeStoredAgentModelSelection('grok-4.5', presets), 'grok-4.5/high');
+  assert.equal(normalizeStoredAgentModelSelection('grok-4.5/medium', presets), 'grok-4.5/medium');
+  assert.equal(
+    shouldAdoptSdkCurrentModel('grok-4.6/high', 'grok-4.5', presets),
+    false,
+  );
 });
 
 test('normalizeSdkRuntimeModelPresets preserves SDK current model without a catalog', () => {

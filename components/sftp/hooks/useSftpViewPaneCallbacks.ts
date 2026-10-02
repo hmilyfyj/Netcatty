@@ -28,6 +28,7 @@ interface UseSftpViewPaneCallbacksParams {
   showSaveDialog?: (defaultPath: string, filters?: Array<{ name: string; extensions: string[] }>) => Promise<string | null>;
   selectDirectory?: (title?: string, defaultPath?: string) => Promise<string | null>;
   getSftpIdForConnection?: (connectionId: string) => string | undefined;
+  statSftp?: (sftpId: string, path: string, encoding?: SftpFilenameEncoding) => Promise<SftpStatResult>;
   listLocalFiles: (path: string) => Promise<RemoteFile[]>;
   mkdirLocal?: (path: string) => Promise<void>;
   deleteLocalFile?: (path: string) => Promise<void>;
@@ -45,6 +46,7 @@ export const useSftpViewPaneCallbacks = ({
   showSaveDialog,
   selectDirectory,
   getSftpIdForConnection,
+  statSftp,
   listLocalFiles,
   listDrives,
 }: UseSftpViewPaneCallbacksParams) => {
@@ -59,6 +61,8 @@ export const useSftpViewPaneCallbacks = ({
     showSaveDialog,
     selectDirectory,
     getSftpIdForConnection,
+    statSftp,
+    listSftp,
   });
 
   const listLocalFilesRef = useRef(listLocalFiles);
@@ -90,6 +94,7 @@ export const useSftpViewPaneCallbacks = ({
               lastModified: ms,
               lastModifiedFormatted: formatDate(ms),
               permissions: f.permissions,
+              owner: f.owner,
               linkTarget: f.linkTarget as 'file' | 'directory' | null | undefined,
               hidden: f.hidden,
             };
@@ -154,6 +159,7 @@ export const useSftpViewPaneCallbacks = ({
       onOpenFileWith: fileOps.onOpenFileWithLeft,
       onDownloadFile: fileOps.onDownloadFileLeft,
       onDownloadFiles: fileOps.onDownloadFilesLeft,
+      onExtractArchive: fileOps.onExtractArchiveLeft,
       onUploadExternalFiles: fileOps.onUploadExternalFilesLeft,
       onUploadExternalFileList: fileOps.onUploadExternalFileListLeft,
       onUploadExternalFolder: fileOps.onUploadExternalFolderLeft,
@@ -196,6 +202,7 @@ export const useSftpViewPaneCallbacks = ({
       onOpenFileWith: fileOps.onOpenFileWithRight,
       onDownloadFile: fileOps.onDownloadFileRight,
       onDownloadFiles: fileOps.onDownloadFilesRight,
+      onExtractArchive: fileOps.onExtractArchiveRight,
       onUploadExternalFiles: fileOps.onUploadExternalFilesRight,
       onUploadExternalFileList: fileOps.onUploadExternalFileListRight,
       onUploadExternalFolder: fileOps.onUploadExternalFolderRight,

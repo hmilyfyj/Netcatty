@@ -2,8 +2,12 @@ import { createOpenAI } from '@ai-sdk/openai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createGoogle } from '@ai-sdk/google';
 import type { ProviderConfig, ProviderStyle } from '../types';
-import { resolveProviderStyle } from '../types';
+import { resolveOpenAIApi, resolveProviderStyle } from '../types';
 import { normalizeAnthropicSdkBaseURL } from '../anthropicCompatBaseUrl';
+import { buildSdkRequestHeaders } from '../providerRequestHeaders';
+import { normalizeOllamaSdkBaseURL } from '../ollamaCompatBaseUrl';
+
+export { normalizeOllamaSdkBaseURL };
 import {
   applyOpenAIChatContinuationToBody,
   extractProviderContinuationFromRawChunk,
@@ -15,6 +19,9 @@ import {
 
 export interface ProviderRequestContext {
   getOpenAIChatAssistantFields?: () => Array<OpenAIChatAssistantFields | undefined>;
+  streamIdleTimeoutMs?: number;
+  /** Stable per-conversation id; used e.g. for OpenCode's x-opencode-session header. */
+  chatSessionId?: string;
 }
 
 /**
@@ -39,6 +46,7 @@ interface BridgeAPI {
     headers: Record<string, string>,
     body: string,
     providerId?: string,
+    idleTimeoutMs?: number,
   ): Promise<{ ok: boolean; statusCode?: number; statusText?: string; error?: string; aborted?: boolean }>;
   onAiStreamData(requestId: string, cb: (data: string) => void): () => void;
   onAiStreamEnd(requestId: string, cb: () => void): () => void;
@@ -128,6 +136,7 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
   // Keys forwarded inside choices array position 0 — the only element the
   // AI SDK reads. Tool calls living at position > 0 are invisible to it.
   const sdkVisibleKeys = new Set<string>();
+  const sdkIndexesByKey = new Map<string, number>();
   const requestIdToken = requestId.replace(/[^a-zA-Z0-9_-]/g, '_');
 
   return (data: string): string => {
@@ -157,6 +166,23 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
       const choiceIndex = typeof choiceRecord.index === 'number' ? choiceRecord.index : choicePosition;
       let deltaChanged = false;
       const normalizedToolCalls: unknown[] = [];
+      const forwardToolCall = (toolCall: Record<string, unknown>, key: string) => {
+        // The SDK reads only choices[0] and stores calls in a dense array.
+        // Assign indexes only when forwarding a named call to that array.
+        if (choicePosition === 0) {
+          let sdkIndex = sdkIndexesByKey.get(key);
+          if (sdkIndex === undefined) {
+            sdkIndex = sdkIndexesByKey.size;
+            sdkIndexesByKey.set(key, sdkIndex);
+          }
+          if (toolCall.index !== sdkIndex) {
+            toolCall = { ...toolCall, index: sdkIndex };
+            changed = true;
+            deltaChanged = true;
+          }
+        }
+        normalizedToolCalls.push(toolCall);
+      };
       for (const [toolCallPosition, toolCall] of deltaRecord.tool_calls.entries()) {
         if (!toolCall || typeof toolCall !== 'object') {
           normalizedToolCalls.push(toolCall);
@@ -201,11 +227,11 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
             normalizedToolCall.function === toolCallRecord.function &&
             (!rememberedName || hasFunctionName(toolCallRecord))
           ) {
-            normalizedToolCalls.push(toolCall);
+            forwardToolCall(toolCallRecord, key);
           } else {
             changed = true;
             deltaChanged = true;
-            normalizedToolCalls.push(normalizedToolCall);
+            forwardToolCall(normalizedToolCall, key);
           }
           continue;
         }
@@ -246,13 +272,13 @@ function createOpenAIChatToolCallNormalizer(requestId: string): (data: string) =
           normalizedToolCall.type === toolCallRecord.type &&
           normalizedToolCall.function === toolCallRecord.function
         ) {
-          normalizedToolCalls.push(toolCall);
+          forwardToolCall(toolCallRecord, key);
           continue;
         }
 
         changed = true;
         deltaChanged = true;
-        normalizedToolCalls.push(normalizedToolCall);
+        forwardToolCall(normalizedToolCall, key);
       }
 
       if (!deltaChanged) return choice;
@@ -549,6 +575,7 @@ export function createBridgeFetchForSDK(
         headers,
         requestBody || '',
         providerId,
+        requestContext?.streamIdleTimeoutMs,
       );
 
       if (!result.ok) {
@@ -623,9 +650,10 @@ export function createBridgeFetchForSDK(
  *
  * The URL fallback fires regardless of style — the user picked this
  * providerId for a reason, even if they overrode the wire format. The
- * ollama `'ollama'` throwaway apiKey is style-specific: it's only meaningful
- * to the OpenAI-compat client, since Anthropic/Google clients need a real
- * key on their own URL.
+ * ollama `'ollama'` throwaway apiKey is only for unauthenticated local
+ * OpenAI-compat servers: Anthropic/Google need a real key, and Ollama
+ * Cloud must keep the IPC placeholder so the main process can inject
+ * the decrypted cloud key.
  */
 export function resolveProviderEndpoint(
   config: ProviderConfig,
@@ -635,8 +663,8 @@ export function resolveProviderEndpoint(
   let baseURL = config.baseURL;
   let apiKey = safeApiKey;
   if (config.providerId === 'ollama') {
-    baseURL = baseURL || 'http://localhost:11434/v1';
-    if (style === 'openai') {
+    baseURL = normalizeOllamaSdkBaseURL(baseURL || 'http://localhost:11434/v1');
+    if (style === 'openai' && !apiKey) {
       apiKey = 'ollama';
     }
   } else if (config.providerId === 'openrouter') {
@@ -662,21 +690,29 @@ export function createModelFromConfig(
   const modelId = config.defaultModel || '';
   const style = resolveProviderStyle(config);
   const { baseURL, apiKey } = resolveProviderEndpoint(config, style, safeApiKey);
+  const sdkHeaders = buildSdkRequestHeaders(config, requestContext?.chatSessionId);
 
   switch (style) {
-    case 'openai':
-      // Use .chat() to force Chat Completions API (not Responses API)
-      return createOpenAI({
+    case 'openai': {
+      const openai = createOpenAI({
         apiKey,
         baseURL,
         fetch: customFetch,
-      }).chat(modelId);
+        headers: sdkHeaders,
+      });
+      // Chat Completions stays the default so OpenAI-compatible proxies keep
+      // working. Responses is opt-in for relays that cache better on /v1/responses.
+      return resolveOpenAIApi(config) === 'responses'
+        ? openai.responses(modelId)
+        : openai.chat(modelId);
+    }
 
     case 'anthropic':
       return createAnthropic({
         apiKey,
         baseURL,
         fetch: customFetch,
+        headers: sdkHeaders,
       })(modelId);
 
     case 'google':
@@ -684,6 +720,7 @@ export function createModelFromConfig(
         apiKey,
         baseURL,
         fetch: customFetch,
+        headers: sdkHeaders,
       })(modelId);
 
     default: {

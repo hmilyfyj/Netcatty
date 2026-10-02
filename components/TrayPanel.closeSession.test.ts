@@ -4,6 +4,22 @@ import { readFileSync } from "node:fs";
 
 const source = readFileSync(new URL("./TrayPanel.tsx", import.meta.url), "utf8");
 
+test("tray remote groups and workspaces both wire the session close callback", () => {
+  const groups = source.match(/<WorkspaceGroup\s[\s\S]*?\/>/g) ?? [];
+  assert.equal(groups.length, 2);
+  for (const group of groups) {
+    assert.match(group, /onCloseSession=\{handleCloseSession\}/);
+  }
+});
+
+test("tray panel does not paint a CSS drop shadow on the host card", () => {
+  // BrowserWindow already has hasShadow. CSS shadow-lg on a transparent
+  // macOS overlay double-composites as an extra outline under the card.
+  const rootOpenTag = source.match(/<div id="tray-panel-root"[^>]*>/);
+  assert.ok(rootOpenTag, "expected tray-panel-root");
+  assert.doesNotMatch(rootOpenTag[0], /shadow-lg|shadow-md|shadow-xl/);
+});
+
 test("tray session close actions are discoverable without mouse hover", () => {
   const keyboardVisible = source.match(/focus-visible:opacity-100/g) ?? [];
   const touchVisible = source.match(/\[@media\(hover:none\)\]:opacity-100/g) ?? [];

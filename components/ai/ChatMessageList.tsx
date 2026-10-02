@@ -6,7 +6,7 @@
  * No avatars. Thinking blocks are collapsible.
  */
 
-import { AlertCircle, FileText, RotateCcw, SquareTerminal, X, ZoomIn, ZoomOut } from 'lucide-react';
+import { AlertCircle, BookOpen, FileText, RotateCcw, SquareTerminal, X, ZoomIn, ZoomOut } from 'lucide-react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useI18n } from '../../application/i18n/I18nProvider';
 import type { ChatMessage, ToolCall as AgentToolCall } from '../../infrastructure/ai/types';
@@ -18,6 +18,12 @@ import {
 } from '../ai-elements/conversation';
 import { LazyMessageResponse } from '../ai-elements/LazyMessageResponse';
 import { Message, MessageContent } from '../ai-elements/messageShell';
+import {
+  AI_MARKDOWN_WARMUP_INITIAL_DELAY_MS,
+  AI_MARKDOWN_WARMUP_RESUME_DELAY_MS,
+  isAiComposerTyping,
+  scheduleAiMarkdownWarmup,
+} from './aiMarkdownWarmup';
 import { ToolCall } from '../ai-elements/tool-call';
 import ThinkingBlock from './ThinkingBlock';
 import AgentActivityGroup from './AgentActivityGroup';
@@ -371,6 +377,23 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({
     setPendingJumpMessageId(null);
   }, [activeSessionId]);
 
+  const hasAssistantMarkdown = useMemo(
+    () => messages.some((message) => message.role === 'assistant' && Boolean(message.content)),
+    [messages],
+  );
+
+  // Do not start Streamdown on expand. Import cannot be cancelled, and idle
+  // right after open collides with the first few keystrokes. History stays
+  // plaintext until send, composer blur, or a long unfocused delay.
+  useEffect(() => {
+    if (!hasAssistantMarkdown) return undefined;
+    return scheduleAiMarkdownWarmup({
+      isBusy: isAiComposerTyping,
+      initialDelayMs: AI_MARKDOWN_WARMUP_INITIAL_DELAY_MS,
+      resumeDelayMs: AI_MARKDOWN_WARMUP_RESUME_DELAY_MS,
+    });
+  }, [hasAssistantMarkdown]);
+
   const visibleMessages = useMemo(
     () => messages.filter((message) => message.role !== 'system'),
     [messages],
@@ -678,6 +701,14 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({
                           <SquareTerminal size={12} className="text-muted-foreground/60 shrink-0" />
                           <span className="truncate max-w-[150px]">{att.filename || 'terminal selection'}</span>
                         </div>
+                      ) : att.vaultNoteId ? (
+                        <div
+                          key={att.filename ? `${att.filename}-${i}` : `att-${message.id}-${i}`}
+                          className="inline-flex items-center gap-1.5 h-7 px-2 rounded-md bg-muted/20 border border-border/20 text-[11px] text-foreground/70"
+                        >
+                          <BookOpen size={12} className="text-muted-foreground/60 shrink-0" />
+                          <span className="truncate max-w-[150px]">{att.vaultNoteTitle || att.filename || 'note'}</span>
+                        </div>
                       ) : att.mediaType.startsWith('image/') ? (
                         <img
                           key={att.filename ? `${att.filename}-${i}` : `att-${message.id}-${i}`}
@@ -714,7 +745,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({
                       : (
                           <React.Profiler {...getAIPanelProfilerProps('AIChatPanel.Markdown')}>
                             <div data-ai-content="markdown">
-                              <LazyMessageResponse isAnimating={!!isThisStreaming}>
+                              <LazyMessageResponse deferUntilWarm isAnimating={!!isThisStreaming}>
                                 {message.content}
                               </LazyMessageResponse>
                             </div>
@@ -812,6 +843,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = ({
                   <ToolCall
                     name={req.toolName}
                     args={req.args}
+                    approvalTarget={req.target}
                     isLoading={false}
                     isInterrupted={false}
                     approvalStatus={'pending'}

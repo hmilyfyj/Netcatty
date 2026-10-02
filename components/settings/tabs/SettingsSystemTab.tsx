@@ -4,6 +4,8 @@
 import { ChevronDown, ChevronRight, Download, ExternalLink, FolderOpen, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import React, { useCallback, useEffect, useState } from "react";
 import { useI18n } from "../../../application/i18n/I18nProvider";
+import type { AppLockSystemUnlockStatus } from "../../../application/state/useAppLockState";
+import type { AppLockSettings, AppLockSettingsChangeError, AppLockTimeoutMinutes } from "../../../domain/appLock";
 import { getCredentialProtectionAvailability } from "../../../infrastructure/services/credentialProtection";
 import { netcattyBridge } from "../../../infrastructure/services/netcattyBridge";
 import type { UpdateState } from '../../../application/state/useUpdateCheck';
@@ -11,8 +13,10 @@ import { SessionLogFormat, keyEventToString } from "../../../domain/models";
 import type { HttpNetworkProxyMode, HttpNetworkProxySettings } from "../../../domain/httpNetworkProxy";
 import { Button } from "../../ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../ui/tooltip";
-import { Toggle, Select, SettingRow, SectionHeader, SettingCard, SettingsAnchor, SettingsTabContent } from "../settings-ui";
+import { Toggle, Select, SettingRow, SectionHeader, SettingCard, SettingHint, SettingsAnchor, SettingsTabContent } from "../settings-ui";
 import { cn } from "../../../lib/utils";
+import { isAppLockOverlayActive } from '../../../infrastructure/appLockOverlayDom';
+import { AppLockSettingsSection } from './AppLockSettingsSection';
 
 interface CrashLogFile {
   fileName: string;
@@ -77,6 +81,19 @@ function formatLastChecked(
 }
 
 interface SettingsSystemTabProps {
+  appLockSettings: AppLockSettings;
+  setAppLockTimeoutMinutes: (timeoutMinutes: AppLockTimeoutMinutes) => void;
+  requestAppLockDisable: (currentPassword: string) => Promise<AppLockSettings | { ok: false; error: AppLockSettingsChangeError }>;
+  requestAppLockPasswordChange: (input: {
+    currentPassword?: string;
+    nextPassword: string;
+  }) => Promise<AppLockSettings | { ok: false; error: AppLockSettingsChangeError }>;
+  appLockSystemUnlockStatus?: AppLockSystemUnlockStatus;
+  setAppLockSystemUnlockEnabled?: (input: {
+    enabled: boolean;
+    currentPassword?: string;
+    autoPromptEnabled?: boolean;
+  }) => Promise<AppLockSettings | { ok: false; error: 'empty-current' | 'incorrect' | 'locked' | 'unsupported' | 'unavailable' | 'cancelled' | 'failed' }>;
   sessionLogsEnabled: boolean;
   setSessionLogsEnabled: (enabled: boolean) => void;
   sessionLogsDir: string;
@@ -104,6 +121,11 @@ interface SettingsSystemTabProps {
   setToggleWindowHotkey: (hotkey: string) => void;
   closeToTray: boolean;
   setCloseToTray: (enabled: boolean) => void;
+  showTrayIcon: boolean;
+  setShowTrayIcon: (enabled: boolean) => void;
+  autoLaunchEnabled: boolean;
+  setAutoLaunchEnabled: (enabled: boolean) => void;
+  autoLaunchSupported: boolean;
   httpNetworkProxy: HttpNetworkProxySettings;
   setHttpNetworkProxy: (settings: HttpNetworkProxySettings | ((prev: HttpNetworkProxySettings) => HttpNetworkProxySettings)) => void;
   hotkeyRegistrationError: string | null;
@@ -120,6 +142,12 @@ interface SettingsSystemTabProps {
 }
 
 const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
+  appLockSettings,
+  setAppLockTimeoutMinutes,
+  requestAppLockDisable,
+  requestAppLockPasswordChange,
+  appLockSystemUnlockStatus,
+  setAppLockSystemUnlockEnabled,
   sessionLogsEnabled,
   setSessionLogsEnabled,
   sessionLogsDir,
@@ -147,6 +175,11 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
   setToggleWindowHotkey,
   closeToTray,
   setCloseToTray,
+  showTrayIcon,
+  setShowTrayIcon,
+  autoLaunchEnabled,
+  setAutoLaunchEnabled,
+  autoLaunchSupported,
   httpNetworkProxy,
   setHttpNetworkProxy,
   hotkeyRegistrationError,
@@ -403,6 +436,7 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
     if (!isRecordingHotkey) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isAppLockOverlayActive()) return;
       e.preventDefault();
       e.stopPropagation();
 
@@ -441,7 +475,6 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
     { value: "raw", label: t("settings.sessionLogs.formatRaw") },
     { value: "html", label: t("settings.sessionLogs.formatHtml") },
   ];
-
   return (
     <SettingsTabContent value="system">
           <SectionHeader title={t('settings.update.title')} anchorId="system-update" />
@@ -569,7 +602,7 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                 />
               </SettingRow>
             </SettingCard>
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {updateState.lastCheckedAt && (
                 <span>
                   {t('settings.update.lastCheckedPrefix')}
@@ -578,7 +611,26 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                 </span>
               )}
               {t('settings.update.hint')}
-            </p>
+            </SettingHint>
+
+          <SectionHeader title={t("settings.autoLaunch.title")} />
+            <SettingCard className="py-4">
+              <SettingRow
+                anchorId="system-auto-launch"
+                label={t("settings.autoLaunch.enabled")}
+                description={
+                  autoLaunchSupported
+                    ? t("settings.autoLaunch.enabledDesc")
+                    : t("settings.autoLaunch.unsupportedDesc")
+                }
+              >
+                <Toggle
+                  checked={autoLaunchEnabled}
+                  onChange={setAutoLaunchEnabled}
+                  disabled={!autoLaunchSupported}
+                />
+              </SettingRow>
+            </SettingCard>
 
           <SectionHeader title={t("settings.system.networkProxy.title")} />
             <SettingCard className="space-y-4 py-4">
@@ -639,9 +691,18 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                 </>
               )}
             </SettingCard>
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.system.networkProxy.hint")}
-            </p>
+            </SettingHint>
+
+          <AppLockSettingsSection
+            appLockSettings={appLockSettings}
+            setAppLockTimeoutMinutes={setAppLockTimeoutMinutes}
+            requestAppLockDisable={requestAppLockDisable}
+            requestAppLockPasswordChange={requestAppLockPasswordChange}
+            appLockSystemUnlockStatus={appLockSystemUnlockStatus}
+            setAppLockSystemUnlockEnabled={setAppLockSystemUnlockEnabled}
+          />
 
           <SectionHeader title={t("settings.system.credentials.title")} />
             <SettingsAnchor anchorId="system-credentials">
@@ -832,9 +893,9 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               )}
             </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.system.crashLogs.hint")}
-            </p>
+            </SettingHint>
             </SettingsAnchor>
 
           <SectionHeader title={t("settings.system.tempDirectory")} />
@@ -915,9 +976,9 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               )}
             </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.system.tempDirectoryHint")}
-            </p>
+            </SettingHint>
             </SettingsAnchor>
 
           <SectionHeader title={t("settings.sessionRestore.title")} />
@@ -1068,9 +1129,9 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               </div>
             </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.sessionLogs.hint")}
-            </p>
+            </SettingHint>
 
           <SectionHeader title={t('settings.sshDeepLink.title')} />
             <SettingCard>
@@ -1183,9 +1244,9 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               </div>
             </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.sshDebugLogs.hint")}
-            </p>
+            </SettingHint>
 
           <SectionHeader title={t("settings.globalHotkey.title")} />
             <SettingCard className="space-y-4 py-4">
@@ -1256,11 +1317,28 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
                   onChange={setCloseToTray}
                 />
               </SettingRow>
+
+              {/* Show System Tray Icon */}
+              <SettingRow
+                anchorId="system-show-tray-icon"
+                label={t("settings.globalHotkey.showTrayIcon")}
+                description={t("settings.globalHotkey.showTrayIconDesc")}
+              >
+                <Toggle
+                  checked={showTrayIcon}
+                  onChange={setShowTrayIcon}
+                />
+              </SettingRow>
+              {!showTrayIcon && (
+                <p className="text-sm text-muted-foreground">
+                  {t("settings.globalHotkey.showTrayIconHiddenHint")}
+                </p>
+              )}
             </SettingCard>
 
-            <p className="text-xs text-muted-foreground">
+            <SettingHint>
               {t("settings.globalHotkey.hint")}
-            </p>
+            </SettingHint>
     </SettingsTabContent>
   );
 };

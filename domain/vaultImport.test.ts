@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createCipheriv, createHash } from "node:crypto";
 
 import {
   importVaultHostsFromText,
@@ -17,6 +18,79 @@ const mobaXtermSshSession = (
   port = 22,
   username = "root",
 ) => `#109#0%${hostname}%${port}%${username}%%-1%-1%%%%%0%0%0%%%-1%0%0%0%%1080%%0%0%1%#MobaFont%10%0%0%-1#0# #-1`;
+
+const JAVA_RANDOM_MULTIPLIER = 0x5deece66dn;
+const JAVA_RANDOM_ADDEND = 0xbn;
+const JAVA_RANDOM_MASK = (1n << 48n) - 1n;
+
+class TestJavaRandom {
+  private seed: bigint;
+
+  constructor(seed: bigint) {
+    this.seed = (BigInt.asIntN(64, seed) ^ JAVA_RANDOM_MULTIPLIER) & JAVA_RANDOM_MASK;
+  }
+
+  private next(bits: number): number {
+    this.seed = (this.seed * JAVA_RANDOM_MULTIPLIER + JAVA_RANDOM_ADDEND) & JAVA_RANDOM_MASK;
+    return Number(this.seed >> BigInt(48 - bits));
+  }
+
+  nextInt(bound: number): number {
+    if ((bound & -bound) === bound) {
+      return Math.floor((bound * this.next(31)) / 0x80000000);
+    }
+    let bits: number;
+    let value: number;
+    do {
+      bits = this.next(31);
+      value = bits % bound;
+    } while (((bits - value + (bound - 1)) | 0) < 0);
+    return value;
+  }
+
+  nextLong(): bigint {
+    const high = BigInt.asIntN(32, BigInt(this.next(32)));
+    const low = BigInt.asIntN(32, BigInt(this.next(32)));
+    return BigInt.asIntN(64, (high << 32n) + low);
+  }
+}
+
+const signedByte = (value: number): bigint => BigInt(value > 127 ? value - 256 : value);
+
+const encodeFinalShellPassword = (password: string, head: Uint8Array): string => {
+  assert.equal(head.length, 8);
+  const divisor = new TestJavaRandom(signedByte(head[5])).nextInt(127);
+  assert.notEqual(divisor, 0);
+  const random = new TestJavaRandom(BigInt.asIntN(64, 3680984568597093857n / BigInt(divisor)));
+  const iterations = Number(signedByte(head[0]));
+  for (let index = 0; index < iterations; index++) random.nextLong();
+  const secondRandom = new TestJavaRandom(random.nextLong());
+  const longs = [
+    signedByte(head[4]),
+    secondRandom.nextLong(),
+    signedByte(head[7]),
+    signedByte(head[3]),
+    secondRandom.nextLong(),
+    signedByte(head[1]),
+    random.nextLong(),
+    signedByte(head[2]),
+  ];
+  const keySource = Buffer.alloc(64);
+  longs.forEach((value, index) => keySource.writeBigInt64BE(BigInt.asIntN(64, value), index * 8));
+  const key = createHash("md5").update(keySource).digest().subarray(0, 8);
+  const cipher = createCipheriv("des-ede3", Buffer.concat([key, key, key]), null);
+  const encrypted = Buffer.concat([cipher.update(password, "utf8"), cipher.final()]);
+  return Buffer.concat([head, encrypted]).toString("base64");
+};
+
+const finalShellConnection = (password: string) => JSON.stringify({
+  name: "Synthetic FinalShell",
+  host: "synthetic.example.test",
+  port: 2222,
+  user_name: "tester",
+  conection_type: 100,
+  password,
+});
 
 test("ssh_config import maps ForwardX11 yes to host X11 forwarding", () => {
   const result = importVaultHostsFromText("ssh_config", [
@@ -132,6 +206,95 @@ test("detectVaultImportFormat recognizes csv and ssh_config exports", () => {
     detectVaultImportFormat(["Host prod", "  HostName prod.example.com", "  User deploy"].join("\n")),
     "ssh_config",
   );
+});
+
+test("FinalShell import decrypts a synthetic ASCII password", () => {
+  const password = "synthetic-secret";
+  const encrypted = encodeFinalShellPassword(password, Uint8Array.from([3, 18, 52, 86, 120, 11, 34, 56]));
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(encrypted));
+
+  assert.equal(result.hosts[0]?.password, password);
+  assert.deepEqual(result.issues, []);
+});
+
+test("FinalShell import decrypts a synthetic letter-number-dot password", () => {
+  const password = "Alpha9.beta2026";
+  const encrypted = encodeFinalShellPassword(password, Uint8Array.from([5, 201, 17, 88, 144, 23, 77, 199]));
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(encrypted));
+
+  assert.equal(result.hosts[0]?.password, password);
+  assert.deepEqual(result.issues, []);
+});
+
+test("FinalShell import skips damaged ciphertext and warns", () => {
+  const encrypted = encodeFinalShellPassword("synthetic-secret", Uint8Array.from([2, 41, 63, 85, 107, 29, 51, 73]));
+  const damaged = `${encrypted.slice(0, -2)}AA`;
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(damaged));
+
+  assert.equal(result.hosts.length, 1);
+  assert.equal(result.hosts[0]?.password, undefined);
+  assert.match(result.issues[0]?.message ?? "", /password.*decrypt/i);
+});
+
+test("FinalShell import accepts an empty password without warning", () => {
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(""));
+
+  assert.equal(result.hosts.length, 1);
+  assert.equal(result.hosts[0]?.password, undefined);
+  assert.deepEqual(result.issues, []);
+});
+
+test("FinalShell import rejects decrypted passwords containing control characters", () => {
+  const encrypted = encodeFinalShellPassword("invalid\u0085password", Uint8Array.from([4, 26, 48, 70, 92, 31, 53, 75]));
+  const result = importVaultHostsFromText("finalshell", finalShellConnection(encrypted));
+
+  assert.equal(result.hosts[0]?.password, undefined);
+  assert.match(result.issues[0]?.message ?? "", /password.*decrypt/i);
+});
+
+test("FinalShell import skips non-SSH connection types", () => {
+  const result = importVaultHostsFromText("finalshell", JSON.stringify({
+    name: "RDP",
+    host: "windows.example.com",
+    port: 3389,
+    user_name: "Administrator",
+    conection_type: 1,
+  }));
+
+  assert.equal(result.hosts.length, 0);
+  assert.equal(result.stats.parsed, 1);
+  assert.equal(result.stats.skipped, 1);
+  assert.match(result.issues[0]?.message ?? "", /unsupported.*type/i);
+});
+
+test("FinalShell detection and parsing accept a UTF-8 BOM", () => {
+  const text = "\uFEFF" + JSON.stringify({ host: "bom.example.com", conection_type: 100 });
+  assert.equal(detectVaultImportFormat(text), "finalshell");
+  assert.equal(importVaultHostsFromText("finalshell", text).hosts[0]?.hostname, "bom.example.com");
+});
+
+test("FinalShell auto-detection accepts missing and null usernames", () => {
+  for (const user_name of [undefined, null]) {
+    const text = JSON.stringify({ host: "optional-user.example.com", conection_type: 100, user_name });
+    assert.equal(detectVaultImportFormat(text), "finalshell");
+    assert.equal(importVaultHostsFromText("finalshell", text).hosts.length, 1);
+  }
+});
+
+test("FinalShell detection requires characteristic fields and avoids generic JSON", () => {
+  assert.equal(detectVaultImportFormat(JSON.stringify({
+    name: "Production",
+    host: "prod.example.com",
+    port: 22,
+    user_name: "root",
+    conection_type: 100,
+  })), "finalshell");
+  assert.equal(detectVaultImportFormat(JSON.stringify({
+    name: "Generic host",
+    host: "generic.example.com",
+    port: 22,
+    username: "root",
+  })), null);
 });
 
 test("SecureCRT import reads the protocol-specific hexadecimal port", () => {
@@ -771,6 +934,132 @@ test("MobaXterm import handles incomplete standard session records safely", () =
   assert.equal(result.hosts[0].port, 22);
   assert.equal(result.hosts[0].label, "short");
   assert.equal(result.issues.length, 3);
+});
+
+test("MobaXterm import attaches master-password secrets from a full config export", () => {
+  const result = importVaultHostsFromText("mobaxterm", [
+    "[Misc]",
+    "SessionP=165821882556840",
+    "[Sesspass]",
+    "Administrator@WIN=dummy",
+    "[Passwords]",
+    "deploy@10.0.0.20=1du11XKQBOxud/FWh4ouWA==",
+    "[Credentials]",
+    "prod=root:0XROpGmLAYVx",
+    "[Bookmarks]",
+    "SubRep=",
+    "ImgNum=42",
+    `web-server=${mobaXtermSshSession("10.0.0.20", 2222, "deploy")}`,
+    `root-server=${mobaXtermSshSession("root.example.com", 22, "root")}`,
+  ].join("\n"), { masterPassword: "12345678" });
+
+  assert.equal(result.hosts.length, 2);
+  const web = result.hosts.find((host) => host.label === "web-server");
+  const root = result.hosts.find((host) => host.label === "root-server");
+  assert.equal(web?.password, "Lw3+cZ2s.w@U@f]U");
+  assert.equal(web?.savePassword, true);
+  assert.equal(root?.password, "HyperSine");
+});
+
+test("MobaXterm import does not save garbage passwords for a wrong master password", () => {
+  const source = [
+    "[Misc]",
+    "SessionP=165821882556840",
+    "[Sesspass]",
+    "Administrator@WIN=dummy",
+    "[Passwords]",
+    "deploy@10.0.0.20=1du11XKQBOxud/FWh4ouWA==",
+    "[Credentials]",
+    "prod=root:0XROpGmLAYVx",
+    "[Bookmarks]",
+    "SubRep=",
+    "ImgNum=42",
+    `web-server=${mobaXtermSshSession("10.0.0.20", 2222, "deploy")}`,
+    `root-server=${mobaXtermSshSession("root.example.com", 22, "root")}`,
+  ].join("\n");
+
+  for (const masterPassword of ["wrong0", "wrong25", "wrong-password"]) {
+    const result = importVaultHostsFromText("mobaxterm", source, { masterPassword });
+    assert.equal(result.hosts.length, 2, masterPassword);
+    assert.equal(result.hosts.every((host) => host.password === undefined), true, masterPassword);
+    assert.match(result.issues[0]?.message ?? "", /master password/i, masterPassword);
+  }
+});
+
+test("MobaXterm import does not save a truncated UTF-8 prefix from a lone credential", () => {
+  const result = importVaultHostsFromText("mobaxterm", [
+    "[Sesspass]",
+    "Administrator@WIN=dummy",
+    "[Credentials]",
+    "prod=root:0XROpGmLAYVx",
+    "[Bookmarks]",
+    "SubRep=",
+    "ImgNum=42",
+    `root-server=${mobaXtermSshSession("root.example.com", 22, "root")}`,
+  ].join("\n"), { masterPassword: "wrong25" });
+
+  assert.equal(result.hosts.length, 1);
+  assert.equal(result.hosts[0].password, undefined);
+  assert.match(result.issues[0]?.message ?? "", /master password/i);
+});
+
+test("MobaXterm import keeps leading whitespace in the master password", () => {
+  const masterPassword = " 12345678";
+  const key = createHash("sha512").update(masterPassword, "utf8").digest().subarray(0, 32);
+  const iv = createCipheriv("aes-256-ecb", key, null).update(Buffer.alloc(16));
+  const cipher = createCipheriv("aes-256-cfb8", key, iv);
+  cipher.setAutoPadding(false);
+  const ciphertext = Buffer.concat([
+    cipher.update("spaced-secret", "utf8"),
+    cipher.final(),
+  ]).toString("base64");
+
+  const result = importVaultHostsFromText("mobaxterm", [
+    "[Sesspass]",
+    "Administrator@WIN=dummy",
+    "[Passwords]",
+    `deploy@10.0.0.20=${ciphertext}`,
+    "[Bookmarks]",
+    "SubRep=",
+    "ImgNum=42",
+    `web-server=${mobaXtermSshSession("10.0.0.20", 2222, "deploy")}`,
+  ].join("\n"), { masterPassword });
+
+  assert.equal(result.hosts[0]?.password, "spaced-secret");
+  assert.equal(result.hosts[0]?.savePassword, true);
+});
+
+test("MobaXterm import leaves sessions intact when encrypted passwords need a master password", () => {
+  const result = importVaultHostsFromText("mobaxterm", [
+    "[Sesspass]",
+    "Administrator@WIN=dummy",
+    "[Passwords]",
+    "deploy@10.0.0.20=1du11XKQBOxud/FWh4ouWA==",
+    "[Bookmarks]",
+    "SubRep=",
+    "ImgNum=42",
+    `web-server=${mobaXtermSshSession("10.0.0.20", 2222, "deploy")}`,
+  ].join("\n"));
+
+  assert.equal(result.hosts.length, 1);
+  assert.equal(result.hosts[0].password, undefined);
+  assert.match(result.issues[0]?.message ?? "", /master password/i);
+});
+
+test("detectVaultImportFormat recognizes full MobaXterm configuration exports", () => {
+  assert.equal(
+    detectVaultImportFormat([
+      "[Misc]",
+      "SessionP=165821882556840",
+      "[Passwords]",
+      "deploy@10.0.0.20=1du11XKQBOxud/FWh4ouWA==",
+      "[Bookmarks]",
+      "SubRep=",
+      "ImgNum=42",
+      `server=${mobaXtermSshSession("10.0.0.1")}`,
+    ].join("\n")),
+    "mobaxterm",
+  );
 });
 
 test("applyVaultHostImport skips duplicates by default", () => {

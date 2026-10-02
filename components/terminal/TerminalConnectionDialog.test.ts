@@ -239,3 +239,77 @@ test("shows restored session copy for disconnected restored placeholders", () =>
   assert.match(markup, /This terminal is disconnected/);
   assert.match(markup, /Reconnect/);
 });
+
+test("disconnected observer surfaces do not advertise a reconnect they cannot perform", () => {
+  const markup = renderDialog({
+    status: "disconnected",
+    error: "Observed session ended.",
+    showEnterReconnectHint: false,
+    progressProps: {
+      timeLeft: 0,
+      isCancelling: false,
+      progressLogs: [],
+      onCancelConnect: () => {},
+      onCloseSession: () => {},
+      onRetry: undefined,
+    },
+  });
+
+  assert.equal(markup.includes("Press Enter to reconnect"), false);
+  assert.equal(markup.includes("Start over"), false);
+  assert.match(markup, /Close session/);
+});
+
+test("re-auth dialog offers saved password identities from the vault (#3475)", () => {
+  const baseAuthProps = {
+    authMethod: "password" as const,
+    setAuthMethod: () => {},
+    authUsername: "root",
+    setAuthUsername: () => {},
+    authPassword: "",
+    setAuthPassword: () => {},
+    selectedIdentityId: null,
+    onSelectIdentity: () => {},
+    authKeyId: null,
+    setAuthKeyId: () => {},
+    authPassphrase: "",
+    setAuthPassphrase: () => {},
+    showAuthPassphrase: false,
+    setShowAuthPassphrase: () => {},
+    showAuthPassword: false,
+    setShowAuthPassword: () => {},
+    authRetryMessage: "Authentication failed. Please try again.",
+    onSubmit: () => {},
+    onCancel: () => {},
+    isValid: true,
+  };
+
+  const withIdentities = renderDialog({
+    needsAuth: true,
+    authProps: {
+      ...baseAuthProps,
+      identities: [
+        {
+          id: "identity-1",
+          label: "Password B",
+          username: "deploy",
+          authMethod: "password",
+          password: "secret",
+          created: 0,
+        },
+      ],
+    },
+  });
+
+  assert.match(withIdentities, /Use saved identity/);
+  assert.match(withIdentities, /Authentication failed\. Please try again\./);
+  // Stored passwords are never rendered, only masked.
+  assert.equal(withIdentities.includes("secret"), false);
+
+  const withoutIdentities = renderDialog({
+    needsAuth: true,
+    authProps: { ...baseAuthProps },
+  });
+
+  assert.equal(withoutIdentities.includes("Use saved identity"), false);
+});

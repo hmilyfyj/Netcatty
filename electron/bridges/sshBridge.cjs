@@ -55,7 +55,7 @@ const {
   _resetAlgorithmSupportCacheForTests,
 } = require("./sshAlgorithms.cjs");
 const { enableSshNoDelay, enableTcpNoDelay } = require("./tcpNoDelay.cjs");
-const { createTcpConnectLatencyProbe } = require("./tcpConnectLatency.cjs");
+const { createSshPingLatencyProbe } = require("./sshBridge/sshPingLatency.cjs");
 const {
   configureTerminalSessionDataEmitter,
 } = require("./emitTerminalSessionData.cjs");
@@ -471,6 +471,7 @@ const {
   releaseConnectionRef,
   transferConnectionRef,
   consumePendingShellReconnectRisk,
+  markEndpointNoIdlePark,
   findReusableSession,
   findTransportByEndpoint,
   resolveTransportForReuse,
@@ -689,7 +690,7 @@ async function connectThroughChain(event, options, jumpHosts, targetHost, target
         connOpts.privateKey = effectivePrivateKey;
         if (effectivePassphrase) {
           connOpts.passphrase = effectivePassphrase;
-        } else if (jump.privateKey && isKeyEncrypted(jump.privateKey)) {
+        } else if (isKeyEncrypted(effectivePrivateKey)) {
           // Key is encrypted but no passphrase provided — prompt the user
           console.log(`[Chain] Hop ${i + 1}: key is encrypted, requesting passphrase`);
           sendProgress(i + 1, totalHops + 1, hopLabel, 'auth-attempt', 'waiting for user input...');
@@ -980,7 +981,7 @@ const startSessionApi = createStartSessionApi({
   get selectZmodemDownloadDirectory() { return selectZmodemDownloadDirectory; },
   preparePrivateKeyForAuth, loadFirstIdentityFileForAuth, prepareSystemSshAgentForAuth, hasUserConfiguredKey, isPasswordProvided, createKeyboardInteractiveHandler, createOrderedStringAuthHandler, createAuthPhase, markAuthPhasePartialSuccess, canRepeatKeyboardInteractive, shouldSkipKiPasswordAutoFill,
   createConnectionRef, acquireConnectionRef, releaseConnectionRef, transferConnectionRef,
-  consumePendingShellReconnectRisk,
+  consumePendingShellReconnectRisk, markEndpointNoIdlePark,
   findReusableSession, findTransportByEndpoint, resolveTransportForReuse, discardAllTransports,
   beginTransportDial, waitForTransportDial, completeTransportDial, failTransportDial,
   buildConnectionReuseEndpoint,
@@ -1394,7 +1395,7 @@ const { ensureMoshStatsConnection, ensureEtStatsConnection } = createMoshStatsCo
 });
 
 const { createSessionOpsApi } = require("./sshBridge/sessionOps.cjs");
-const measureTcpConnectLatency = createTcpConnectLatencyProbe({ net });
+const measureSshPingLatency = createSshPingLatencyProbe();
 const sessionOpsApi = createSessionOpsApi({
   get sessions() { return sessions; },
   get electronModule() { return electronModule; },
@@ -1402,7 +1403,7 @@ const sessionOpsApi = createSessionOpsApi({
   getSessionDecoder, resetSessionDecoders, sessionEncodings, normalizeTerminalEncoding,
   safeSend,
   quoteShellArg, log, ensureMoshStatsConnection, ensureEtStatsConnection,
-  measureTcpConnectLatency,
+  measureSshPingLatency,
   execOnEtSession: (...args) => require("./terminalBridge.cjs").execOnEtSession(...args),
   getServerStats: undefined,
 });

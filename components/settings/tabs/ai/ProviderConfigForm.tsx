@@ -1,7 +1,10 @@
+import { decryptProviderHeaders, encryptProviderHeaders, parseProviderHeaderRows, type HeaderRow } from '../../../../infrastructure/ai/providerHeaderCredentials';
+import { ProviderHeadersEditor } from './ProviderHeadersEditor';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, ChevronRight, Eye, EyeOff, Pencil, Upload, RotateCcw, X, RefreshCw } from "lucide-react";
-import type { ProviderConfig, ProviderAdvancedParams, ProviderStyle } from "../../../../infrastructure/ai/types";
-import { PROVIDER_PRESETS, resolveProviderStyle } from "../../../../infrastructure/ai/types";
+import type { ProviderConfig, ProviderAdvancedParams, OpenAIApiFormat, ProviderStyle } from "../../../../infrastructure/ai/types";
+import { PROVIDER_PRESETS, resolveOpenAIApi, resolveProviderStyle } from "../../../../infrastructure/ai/types";
+import { normalizeOllamaSdkBaseURL } from "../../../../infrastructure/ai/ollamaCompatBaseUrl";
 import { sanitizeContextWindow } from "../../../../infrastructure/ai/contextCompaction";
 import {
   probeProviderConnection,
@@ -53,6 +56,12 @@ async function compressIconFileToDataUrl(file: File): Promise<string> {
 }
 
 const STYLE_OPTIONS: ReadonlyArray<ProviderStyle> = ["anthropic", "openai", "google"];
+const OPENAI_API_OPTIONS: ReadonlyArray<OpenAIApiFormat> = ["chat", "responses"];
+/** Selectable thinking-depth levels; empty string means "provider default" (field not sent). */
+const REASONING_EFFORT_OPTIONS = ["low", "medium", "high"] as const;
+
+/** Same box as the h-8 fields above. Transparent border keeps primary aligned with outline. */
+const PROVIDER_ACTION_CLASS = "box-border h-8 px-3 gap-1.5 text-sm font-medium leading-none";
 
 export const ProviderConfigForm: React.FC<{
   provider: ProviderConfig;
@@ -72,9 +81,31 @@ export const ProviderConfigForm: React.FC<{
     skipTLSVerify: provider.skipTLSVerify ?? false,
     advancedParams: provider.advancedParams ?? {},
     style: provider.style ?? "",
+    openaiApi: resolveOpenAIApi(provider),
     iconId: provider.iconId ?? "",
     iconDataUrl: provider.iconDataUrl ?? "",
   });
+  const [headersSourceVersion, setHeadersSourceVersion] = useState(0);
+  const [headerRows, setHeaderRows] = useState<HeaderRow[]>([]);
+  const [headersLoading, setHeadersLoading] = useState(true);
+  const [headersLoadError, setHeadersLoadError] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const parsedHeaders = useMemo(() => {
+    try { return { headers: parseProviderHeaderRows(headerRows), valid: true }; }
+    catch { return { headers: {}, valid: false }; }
+  }, [headerRows]);
+  const customHeaders = parsedHeaders.headers;
+  useEffect(() => {
+    let cancelled = false;
+    setHeadersLoading(true);
+    setHeadersLoadError(false);
+    decryptProviderHeaders(provider.customHeaders).then((headers) => {
+      if (!cancelled) setHeaderRows(Object.entries(headers).map(([name, value]) => ({ name, value })));
+    }).catch(() => { if (!cancelled) setHeadersLoadError(true); })
+      .finally(() => { if (!cancelled) setHeadersLoading(false); });
+    return () => { cancelled = true; };
+  }, [provider.customHeaders]);
   const [showApiKey, setShowApiKey] = useState(false);
   const [isDecrypting, setIsDecrypting] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -91,17 +122,22 @@ export const ProviderConfigForm: React.FC<{
 
   const preset = PROVIDER_PRESETS[provider.providerId];
   const resolvedStyle: ProviderStyle = form.style || resolveProviderStyle({ providerId: provider.providerId });
+  const resolvedBaseURL = provider.providerId === "ollama"
+    ? normalizeOllamaSdkBaseURL(form.baseURL || preset?.defaultBaseURL || "")
+    : (form.baseURL || preset?.defaultBaseURL || "");
   const modelMetadataSourceKey = useMemo(() => JSON.stringify({
     providerId: provider.providerId,
     baseURL: form.baseURL || preset?.defaultBaseURL || "",
     modelsEndpoint: preset?.modelsEndpoint ?? "",
     apiKeySourceVersion,
+    headersSourceVersion,
     style: resolvedStyle,
     skipTLSVerify: form.skipTLSVerify,
   }), [
     provider.providerId,
     form.baseURL,
     apiKeySourceVersion,
+    headersSourceVersion,
     form.skipTLSVerify,
     preset?.defaultBaseURL,
     preset?.modelsEndpoint,
@@ -110,11 +146,13 @@ export const ProviderConfigForm: React.FC<{
   const probeFingerprint = useMemo(() => JSON.stringify({
     baseURL: form.baseURL || preset?.defaultBaseURL || "",
     apiKey: form.apiKey,
+    customHeaders,
     style: resolvedStyle,
     skipTLSVerify: form.skipTLSVerify,
     modelsEndpoint: preset?.modelsEndpoint ?? "",
   }), [
     form.apiKey,
+    customHeaders,
     form.baseURL,
     form.skipTLSVerify,
     preset?.defaultBaseURL,
@@ -173,7 +211,8 @@ export const ProviderConfigForm: React.FC<{
   }, [probeFingerprint]);
 
   const [advancedParamRaw, setAdvancedParamRaw] = useState<Record<string, string>>({});
-  const handleAdvancedParam = useCallback((key: keyof ProviderAdvancedParams, raw: string) => {
+  /** Numeric advanced params; the string-valued reasoningEffort uses {@link handleAdvancedParamSelect}. */
+  const handleAdvancedParam = useCallback((key: Exclude<keyof ProviderAdvancedParams, "reasoningEffort">, raw: string) => {
     setAdvancedParamRaw((prev) => ({ ...prev, [key]: raw }));
     setForm((prev) => {
       const next = { ...prev.advancedParams };
@@ -184,6 +223,17 @@ export const ProviderConfigForm: React.FC<{
         if (!Number.isNaN(num)) {
           next[key] = num;
         }
+      }
+      return { ...prev, advancedParams: next };
+    });
+  }, []);
+  const handleAdvancedParamSelect = useCallback((raw: string) => {
+    setForm((prev) => {
+      const next = { ...prev.advancedParams };
+      if (raw) {
+        next.reasoningEffort = raw;
+      } else {
+        delete next.reasoningEffort;
       }
       return { ...prev, advancedParams: next };
     });
@@ -220,7 +270,7 @@ export const ProviderConfigForm: React.FC<{
   }, []);
 
   const handleTestConnection = useCallback(async () => {
-    const baseURL = form.baseURL || preset?.defaultBaseURL || "";
+    const baseURL = resolvedBaseURL;
     const inputCheck = validateProviderProbeInputs({
       baseURL,
       apiKey: form.apiKey,
@@ -248,6 +298,7 @@ export const ProviderConfigForm: React.FC<{
         bridge: getFetchBridge(),
         baseURL,
         apiKey: form.apiKey,
+        customHeaders,
         providerId: provider.providerId,
         style: resolvedStyle,
         presetModelsEndpoint: preset?.modelsEndpoint,
@@ -301,9 +352,10 @@ export const ProviderConfigForm: React.FC<{
     } finally {
       if (probeRequestIdRef.current === requestId) setIsTesting(false);
     }
-  }, [form.apiKey, form.baseURL, form.skipTLSVerify, preset?.defaultBaseURL, preset?.modelsEndpoint, provider.providerId, resolvedStyle, t]);
+  }, [form.apiKey, customHeaders, form.skipTLSVerify, preset?.modelsEndpoint, provider.providerId, resolvedBaseURL, resolvedStyle, t]);
 
   const handleSave = useCallback(async () => {
+    if (isSaving || headersLoading || headersLoadError || !parsedHeaders.valid) return;
     const cleanedParams: ProviderAdvancedParams = {};
     const ap = form.advancedParams;
     if (ap.maxTokens != null && Number.isFinite(ap.maxTokens) && ap.maxTokens > 0) cleanedParams.maxTokens = Math.max(1, Math.round(ap.maxTokens));
@@ -311,6 +363,9 @@ export const ProviderConfigForm: React.FC<{
     if (ap.topP != null) cleanedParams.topP = Math.min(1, Math.max(0, ap.topP));
     if (ap.frequencyPenalty != null) cleanedParams.frequencyPenalty = Math.min(2, Math.max(-2, ap.frequencyPenalty));
     if (ap.presencePenalty != null) cleanedParams.presencePenalty = Math.min(2, Math.max(-2, ap.presencePenalty));
+    if (ap.reasoningEffort && (REASONING_EFFORT_OPTIONS as readonly string[]).includes(ap.reasoningEffort)) {
+      cleanedParams.reasoningEffort = ap.reasoningEffort;
+    }
 
     const trimmedName = form.name.trim();
     const defaultName = PROVIDER_PRESETS[provider.providerId]?.name ?? "";
@@ -329,26 +384,38 @@ export const ProviderConfigForm: React.FC<{
 
     const updates: Partial<ProviderConfig> = {
       name: trimmedName || defaultName,
-      baseURL: form.baseURL || undefined,
+      baseURL: provider.providerId === "ollama"
+        ? resolvedBaseURL
+        : (form.baseURL || undefined),
       defaultModel: form.defaultModel || undefined,
       contextWindow: manualContextWindow,
       modelContextWindows: Object.keys(form.modelContextWindows).length > 0 ? form.modelContextWindows : undefined,
       skipTLSVerify: form.skipTLSVerify || undefined,
       advancedParams: Object.keys(cleanedParams).length > 0 ? cleanedParams : undefined,
       style: form.style || undefined,
+      openaiApi: resolvedStyle === "openai" && form.openaiApi === "responses" ? "responses" : undefined,
       iconId: form.iconId || undefined,
       iconDataUrl: form.iconDataUrl || undefined,
     };
 
-    // Encrypt API key before saving
-    if (form.apiKey) {
-      updates.apiKey = await encryptField(form.apiKey);
-    } else {
-      updates.apiKey = undefined;
-    }
+    setIsSaving(true);
+    setSaveError(false);
+    try {
+      updates.customHeaders = await encryptProviderHeaders(customHeaders);
+      // Encrypt API key before saving
+      if (form.apiKey) {
+        updates.apiKey = await encryptField(form.apiKey);
+      } else {
+        updates.apiKey = undefined;
+      }
 
-    onSave(updates);
-  }, [form, onSave, provider.providerId, t]);
+      onSave(updates);
+    } catch {
+      setSaveError(true);
+    } finally {
+      setIsSaving(false);
+    }
+  }, [form, customHeaders, isSaving, headersLoading, headersLoadError, parsedHeaders.valid, onSave, provider.providerId, resolvedBaseURL, resolvedStyle, t]);
 
   return (
     <div className="mt-3 space-y-3 border-t border-border/40 pt-3">
@@ -475,6 +542,34 @@ export const ProviderConfigForm: React.FC<{
         <p className="text-[11px] text-muted-foreground/70">{t('ai.providers.style.help')}</p>
       </div>
 
+      {resolvedStyle === "openai" && (
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium text-muted-foreground">{t('ai.providers.openaiApi')}</label>
+          <div className="flex items-center gap-1.5">
+            {OPENAI_API_OPTIONS.map((format) => {
+              const isSelected = form.openaiApi === format;
+              return (
+                <button
+                  key={format}
+                  type="button"
+                  onClick={() => setForm((prev) => ({ ...prev, openaiApi: format }))}
+                  className={cn(
+                    "h-7 px-2.5 rounded-md text-xs border transition-colors",
+                    isSelected
+                      ? "border-primary/70 bg-primary/15 text-foreground"
+                      : "border-border/50 bg-background text-muted-foreground hover:text-foreground hover:bg-muted/40",
+                  )}
+                  aria-pressed={isSelected}
+                >
+                  {t(`ai.providers.openaiApi.${format}`)}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-muted-foreground/70">{t('ai.providers.openaiApi.help')}</p>
+        </div>
+      )}
+
       {/* API Key */}
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-muted-foreground">{t('ai.providers.apiKey')}</label>
@@ -499,6 +594,17 @@ export const ProviderConfigForm: React.FC<{
         </div>
       </div>
 
+      <ProviderHeadersEditor
+        rows={headerRows}
+        onChange={(rows) => { setHeaderRows(rows); setHeadersSourceVersion((version) => version + 1); }}
+        disabled={headersLoading || headersLoadError || isSaving}
+      />
+      {(!parsedHeaders.valid || headersLoadError || saveError) && (
+        <p role="alert" className="text-xs text-destructive">{t(!parsedHeaders.valid
+          ? 'ai.providers.headers.invalid' : headersLoadError
+            ? 'ai.providers.headers.loadError' : 'ai.providers.headers.saveError')}</p>
+      )}
+
       {/* Base URL */}
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-muted-foreground">{t('ai.providers.baseUrl')}</label>
@@ -511,6 +617,9 @@ export const ProviderConfigForm: React.FC<{
         />
         {resolvedStyle === "anthropic" ? (
           <p className="text-[11px] text-muted-foreground/70">{t('ai.providers.baseUrl.anthropicHelp')}</p>
+        ) : null}
+        {provider.providerId === "ollama" ? (
+          <p className="text-[11px] text-muted-foreground/70">{t('ai.providers.baseUrl.ollamaHelp')}</p>
         ) : null}
       </div>
 
@@ -526,10 +635,11 @@ export const ProviderConfigForm: React.FC<{
               modelContextWindows: mergeModelContextWindow(prev.modelContextWindows, model.id, model.contextWindow) ?? prev.modelContextWindows,
             }));
           }}
-          baseURL={form.baseURL || preset?.defaultBaseURL || ""}
+          baseURL={resolvedBaseURL}
           modelsEndpoint={preset?.modelsEndpoint}
           presetModels={preset?.defaultModels}
-          apiKey={form.apiKey}
+          apiKey={headersLoading || headersLoadError || !parsedHeaders.valid ? undefined : form.apiKey}
+          customHeaders={headersLoading || headersLoadError || !parsedHeaders.valid ? undefined : customHeaders}
           providerId={provider.providerId}
           style={resolvedStyle}
           skipTLSVerify={form.skipTLSVerify}
@@ -655,6 +765,20 @@ export const ProviderConfigForm: React.FC<{
                 className="w-full h-8 rounded-md border border-input bg-background px-3 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               />
             </div>
+            {/* reasoning_effort */}
+            <div className="space-y-1 pl-3">
+              <label className="text-xs text-muted-foreground">reasoning_effort</label>
+              <select
+                value={form.advancedParams.reasoningEffort ?? ""}
+                onChange={(e) => handleAdvancedParamSelect(e.target.value)}
+                className="w-full h-8 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                <option value="">{t('ai.providers.advancedParams.default')}</option>
+                {REASONING_EFFORT_OPTIONS.map((level) => (
+                  <option key={level} value={level}>{level}</option>
+                ))}
+              </select>
+            </div>
           </div>
         )}
       </div>
@@ -662,20 +786,27 @@ export const ProviderConfigForm: React.FC<{
       {/* Actions */}
       <div className="flex flex-col gap-2 pt-1">
         <div className="flex items-center gap-2">
-          <Button variant="default" size="sm" onClick={() => void handleSave()}>
-            <Check size={14} className="mr-1.5" />
+          <Button
+            variant="default"
+            size="sm"
+            className={cn(PROVIDER_ACTION_CLASS, "border border-transparent")}
+            disabled={isSaving || isDecrypting || headersLoading || headersLoadError || !parsedHeaders.valid}
+            onClick={() => void handleSave()}
+          >
+            <Check size={14} className="size-3.5 shrink-0" />
             {t('common.save')}
           </Button>
           <Button
             variant="outline"
             size="sm"
+            className={PROVIDER_ACTION_CLASS}
             onClick={() => void handleTestConnection()}
-            disabled={isTesting || isDecrypting}
+            disabled={isTesting || isDecrypting || headersLoading || headersLoadError || !parsedHeaders.valid}
           >
-            <RefreshCw size={14} className={cn("mr-1.5", isTesting && "animate-spin")} />
+            <RefreshCw size={14} className={cn("size-3.5 shrink-0", isTesting && "animate-spin")} />
             {isTesting ? t('ai.providers.test.testing') : t('ai.providers.test')}
           </Button>
-          <Button variant="ghost" size="sm" onClick={onCancel}>
+          <Button variant="ghost" size="sm" className={PROVIDER_ACTION_CLASS} onClick={onCancel}>
             {t('common.cancel')}
           </Button>
         </div>

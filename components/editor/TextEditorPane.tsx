@@ -26,9 +26,11 @@ loader.config({
     }),
   },
 });
+const isMacPlatform = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 
 import { useI18n } from '../../application/i18n/I18nProvider';
 import { useClipboardBackend } from '../../application/state/useClipboardBackend';
+import { isPrimaryModifierWBinding } from '../../application/state/windowCommandClose';
 import { HotkeyScheme, KeyBinding, matchesKeyBinding } from '../../domain/models';
 import { pasteForMonacoEditorCommand } from '../../infrastructure/monaco/monacoClipboardPaste';
 import { useNetcattyMonacoTheme } from '../../infrastructure/monaco/useNetcattyMonacoTheme';
@@ -121,6 +123,23 @@ export function getTextEditorContentStats(content: string): { lineCount: number;
   return { lineCount, charCount: content.length };
 }
 
+export function isTextEditorCommandWEnabled({
+  hotkeyScheme,
+  closeTabBinding,
+  isMac,
+}: {
+  hotkeyScheme: HotkeyScheme;
+  closeTabBinding?: KeyBinding;
+  isMac: boolean;
+}): boolean {
+  if (hotkeyScheme === 'disabled' || !closeTabBinding) return false;
+  return isPrimaryModifierWBinding(
+    hotkeyScheme === 'mac' ? closeTabBinding.mac : closeTabBinding.pc,
+    matchesKeyBinding,
+    isMac,
+  );
+}
+
 export const TextEditorPromoteButton: React.FC<{
   saving: boolean;
   onPromoteToTab: () => void;
@@ -171,6 +190,7 @@ const TextEditorPaneInner: React.FC<TextEditorPaneProps> = ({
   // Ref to store the latest save function to avoid stale closure in keyboard shortcut
   const handleSaveRef = useRef<() => void>(() => {});
   const handleCloseRef = useRef<(() => void) | null>(null);
+  const closeTabCommandWEnabledRef = useRef(false);
   const handlePasteRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const readClipboardTextRef = useRef<() => Promise<string | null>>(() => Promise.resolve(null));
 
@@ -178,6 +198,11 @@ const TextEditorPaneInner: React.FC<TextEditorPaneProps> = ({
     () => keyBindings.find((binding) => binding.action === 'closeTab'),
     [keyBindings],
   );
+  closeTabCommandWEnabledRef.current = isTextEditorCommandWEnabled({
+    hotkeyScheme,
+    closeTabBinding,
+    isMac: isMacPlatform,
+  });
 
   const handleSave = useCallback(() => {
     if (saving) return;
@@ -273,6 +298,7 @@ const TextEditorPaneInner: React.FC<TextEditorPaneProps> = ({
     // key-event dispatcher fires first for focused editor keystrokes, so
     // registering the command here is the reliable path.
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW, () => {
+      if (!closeTabCommandWEnabledRef.current) return;
       handleCloseRef.current?.();
     });
 

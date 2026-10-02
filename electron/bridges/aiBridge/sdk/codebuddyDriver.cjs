@@ -76,7 +76,7 @@ function buildCodebuddyThinkingEnv(thinking) {
 // ---------------------------------------------------------------------------
 
 /** Convert neutral injectMcp configs into the SDK's keyed mcpServers map.
- *  Supports stdio (default), sse, http, and sdk (in-process) transport types (SDK 0.3.230). */
+ *  Supports stdio (default), sse, http, and sdk (in-process) transport types (SDK 0.3.258). */
 function toSdkMcpServers(injectedMcpServers) {
   const map = {};
   for (const cfg of injectedMcpServers || []) {
@@ -193,10 +193,61 @@ function codebuddyBuiltinTools(toolIntegrationMode) {
     : [...MCP_MODE_TOOLS];
 }
 
+const CODEBUDDY_REASONING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const CODEBUDDY_REASONING_LEVEL_SET = new Set(CODEBUDDY_REASONING_LEVELS);
+
+function splitCodebuddyModelSelection(model) {
+  if (typeof model !== "string" || !model) {
+    return { model: undefined, effort: undefined };
+  }
+  const slash = model.lastIndexOf("/");
+  if (slash <= 0) return { model, effort: undefined };
+  const effort = model.slice(slash + 1).toLowerCase();
+  if (!CODEBUDDY_REASONING_LEVEL_SET.has(effort)) return { model, effort: undefined };
+  return { model: model.slice(0, slash), effort };
+}
+
+/**
+ * Narrow a model-declared effort list to the SDK's canonical Effort union.
+ * Accepts whatever the CLI/runtime reports (SDK 0.3.258 `RawLanguageModel
+ * .reasoning.supportedEfforts`), keeps only known values, preserves canonical
+ * order, and returns null when nothing usable was declared so callers can fall
+ * back to the full union.
+ */
+function normalizeCodebuddyThinkingLevels(supported) {
+  if (!Array.isArray(supported) || supported.length === 0) return null;
+  const ordered = CODEBUDDY_REASONING_LEVELS.filter((level) => supported.includes(level));
+  return ordered.length > 0 ? ordered : null;
+}
+
+function attachCodebuddyThinkingLevels(preset, capability) {
+  if (!preset) return preset;
+  // Prefer the levels the model actually declares (SDK 0.3.258). Without a
+  // usable declaration the full Effort union is offered, matching prior
+  // behaviour exactly.
+  const levels = normalizeCodebuddyThinkingLevels(capability?.supportedEfforts)
+    || [...CODEBUDDY_REASONING_LEVELS];
+  const declaredDefault = capability?.defaultEffort;
+  let defaultThinkingLevel;
+  if (declaredDefault && levels.includes(declaredDefault)) {
+    defaultThinkingLevel = declaredDefault;
+  } else if (levels.includes("medium")) {
+    defaultThinkingLevel = "medium";
+  } else {
+    defaultThinkingLevel = levels[0];
+  }
+  return {
+    ...preset,
+    thinkingLevels: levels,
+    defaultThinkingLevel,
+    encodeDefaultThinking: false,
+  };
+}
+
 function buildCodebuddyQueryOptions({
   cwd, model, env, injectedMcpServers, abortController,
   resume, pathToCodebuddyCode, toolIntegrationMode, thinking,
-  // Phase 1: SDK 0.3.230 options
+  // Phase 1: SDK 0.3.258 options
   systemPrompt, effort, maxTurns, maxBudgetUsd, fallbackModel,
   sandbox, agents, outputFormat, enableFileCheckpointing,
   traceId, parentSpanId, persistSession, sessionId, hooks,
@@ -222,7 +273,8 @@ function buildCodebuddyQueryOptions({
     settingSources: [],
     env,
   };
-  if (model) options.model = model;
+  const selection = splitCodebuddyModelSelection(model);
+  if (selection.model) options.model = selection.model;
   if (abortController) options.abortController = abortController;
   // Resume prior session for multi-turn context continuity.
   if (resume) options.resume = resume;
@@ -233,16 +285,18 @@ function buildCodebuddyQueryOptions({
   if (thinkingConfig) {
     options.thinking = thinkingConfig;
   }
-  // --- SDK 0.3.230 options ---
+  // --- SDK 0.3.258 options ---
   // System prompt: string is treated as append to default.
   if (systemPrompt) {
     options.systemPrompt = typeof systemPrompt === "string"
       ? { append: systemPrompt }
       : systemPrompt;
   }
-  // Effort level for model reasoning.
-  if (["low", "medium", "high", "xhigh"].includes(effort)) {
-    options.effort = effort;
+  // Effort level for model reasoning. Sidebar `model/effort` wins over
+  // the Settings-level codebuddyOptions.effort fallback.
+  const resolvedEffort = selection.effort || effort;
+  if (CODEBUDDY_REASONING_LEVEL_SET.has(resolvedEffort)) {
+    options.effort = resolvedEffort;
   }
   // Safety guardrails.
   if (Number.isInteger(maxTurns) && maxTurns > 0) options.maxTurns = maxTurns;
@@ -277,7 +331,7 @@ function buildCodebuddyQueryOptions({
   if (sessionId) options.sessionId = sessionId;
   // Lifecycle hooks.
   if (hooks && typeof hooks === "object") options.hooks = hooks;
-  // Supported by @tencent-ai/agent-sdk 0.3.230 Options.elicitation.
+  // Supported by @tencent-ai/agent-sdk 0.3.258 Options.elicitation.
   // QueryController advertises capabilities.elicitation.form during
   // initialization and routes elicitation_create control requests here.
   if (elicitation && typeof elicitation === "object") options.elicitation = elicitation;
@@ -633,37 +687,119 @@ function mapCodebuddyModels(models) {
       if (!m) return null;
       const id = m.id || m.modelId || m.value;
       if (!id) return null;
-      return {
-        id,
-        name: m.name || m.displayName || id,
-        description: m.description,
-      };
+      // SDK 0.3.258: raw model records carry reasoning capability metadata
+      // (RawLanguageModel.reasoning.supportedEfforts / defaultEffort). Simple
+      // ModelInfo responses omit it — then the full Effort union is offered,
+      // exactly as before.
+      const reasoning = m.reasoning && typeof m.reasoning === "object" ? m.reasoning : null;
+      return attachCodebuddyThinkingLevels(
+        {
+          id,
+          name: m.name || m.displayName || id,
+          description: m.description,
+        },
+        reasoning,
+      );
     })
     .filter(Boolean);
 }
 
 /**
- * Fetch available CodeBuddy models via the SDK control channel. Opens a
- * streaming (idle) session so no turn is billed, asks supportedModels(), then
- * tears down. Returns [] on failure (caller falls back to curated presets).
+ * Fetch available CodeBuddy models via the SDK control channel. Prefer the V2
+ * session API because it exposes RawLanguageModel reasoning metadata. Fall
+ * back to the legacy idle query API for older SDK/CLI combinations.
  * @param {object} args
  * @param {string} [args.pathToCodebuddyCode]
  * @param {object} [args.env]
  * @param {Function} [args.queryFn] inject query() for tests
+ * @param {Function} [args.createSessionFn] inject V2 createSession() for tests
  */
+async function raceCodebuddyModelRequest(request, signal) {
+  if (!signal) return { type: "models", models: await request() };
+  let onAbort;
+  const abortPromise = new Promise((resolve) => {
+    onAbort = () => resolve({ type: "aborted" });
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([
+      Promise.resolve().then(request).then((models) => ({ type: "models", models })),
+      abortPromise,
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function listCodebuddyModelsViaSession({ createSessionFn, pathToCodebuddyCode, env, signal }) {
+  if (typeof createSessionFn !== "function") return null;
+  let session;
+  try {
+    session = createSessionFn({ pathToCodebuddyCode, env });
+    if (typeof session?.getAvailableModelsRaw !== "function") return null;
+
+    const rawResult = await raceCodebuddyModelRequest(
+      () => session.getAvailableModelsRaw(),
+      signal,
+    );
+    if (rawResult.type === "aborted") return [];
+    if (Array.isArray(rawResult.models) && rawResult.models.length > 0) {
+      return mapCodebuddyModels(rawResult.models);
+    }
+
+    // Some CLI versions implement the V2 control request but only return the
+    // simplified catalog. Preserve model discovery in that case, without
+    // pretending that reasoning capabilities were declared.
+    if (typeof session.getAvailableModels === "function") {
+      const simpleResult = await raceCodebuddyModelRequest(
+        () => session.getAvailableModels(),
+        signal,
+      );
+      if (simpleResult.type === "aborted") return [];
+      if (Array.isArray(simpleResult.models) && simpleResult.models.length > 0) {
+        return mapCodebuddyModels(simpleResult.models);
+      }
+    }
+    return [];
+  } catch {
+    return signal?.aborted ? [] : null;
+  } finally {
+    try { session?.close?.(); } catch { /* best effort */ }
+  }
+}
+
 async function listCodebuddyModels({
   pathToCodebuddyCode,
   env,
   queryFn,
+  createSessionFn,
   abortController,
   signal,
 }) {
   const externalSignal = signal || abortController?.signal;
   if (externalSignal?.aborted) return [];
+  let sdk;
+  let createSession = createSessionFn;
+  if (!createSession && !queryFn) {
+    try {
+      sdk = await import("@tencent-ai/agent-sdk");
+      createSession = sdk.unstable_v2_createSession;
+    } catch { /* use the legacy path below */ }
+  }
+  const v2Models = await listCodebuddyModelsViaSession({
+    createSessionFn: createSession,
+    pathToCodebuddyCode,
+    env,
+    signal: externalSignal,
+  });
+  if (v2Models !== null) return v2Models;
+
   let query = queryFn;
   if (!query) {
-    let sdk;
-    try { sdk = await import("@tencent-ai/agent-sdk"); } catch { return []; }
+    try {
+      sdk ||= await import("@tencent-ai/agent-sdk");
+    } catch { return []; }
     query = sdk.query;
   }
   const queryAbortController = new AbortController();
@@ -713,13 +849,13 @@ async function listCodebuddyModels({
 }
 
 // ---------------------------------------------------------------------------
-// Hooks (SDK 0.3.230 lifecycle callbacks)
+// Hooks (SDK 0.3.258 lifecycle callbacks)
 // ---------------------------------------------------------------------------
 
 /**
  * Build SDK hooks option from an emitter. Registers PreToolUse / PostToolUse /
- * PostToolUseFailure / SessionEnd / Notification hooks that forward events to
- * the renderer via the existing emitter event channel.
+ * PostToolUseFailure / SessionEnd / Notification / PostCompact hooks that
+ * forward events to the renderer via the existing emitter event channel.
  * @param {object} emitter  createStreamEmitter(...)
  * @returns {object} hooks map suitable for Options.hooks
  */
@@ -772,7 +908,8 @@ function buildCodebuddyHooks(
             decision: "block",
             reason:
               "Only Netcatty CLI commands are allowed in Skills mode. " +
-              "Use the netcatty-tool-cli command prefix provided by the host.",
+              "Use the netcatty-tool-cli command prefix provided by the host. " +
+              "Do not pass --chat-session or override NETCATTY_CLI_CHAT_SESSION_ID; the host already bound this process.",
           };
         }
         return { continue: true };
@@ -797,6 +934,12 @@ function buildCodebuddyHooks(
       title: input.title,
       notificationType: input.notification_type,
     })),
+    // SDK 0.3.258 — fires after context compaction, carrying the summary that
+    // was written. Distinct from PreCompact (which the SDK also exposes).
+    PostCompact: makeHook("PostCompact", (input) => ({
+      trigger: input.trigger,
+      compactSummary: input.compact_summary,
+    })),
   };
   for (const [eventName, matchers] of Object.entries(additionalHooks || {})) {
     if (!Array.isArray(matchers) || matchers.length === 0) continue;
@@ -806,7 +949,7 @@ function buildCodebuddyHooks(
 }
 
 // ---------------------------------------------------------------------------
-// Elicitation handler (SDK 0.3.230 — interactive confirmations)
+// Elicitation handler (SDK 0.3.258 — interactive confirmations)
 // ---------------------------------------------------------------------------
 
 /**
@@ -902,7 +1045,7 @@ function buildCodebuddyElicitation(emitter, pendingMap, { chatSessionId } = {}) 
 }
 
 // ---------------------------------------------------------------------------
-// MCP server status & account info (SDK 0.3.230)
+// MCP server status & account info (SDK 0.3.258)
 // ---------------------------------------------------------------------------
 
 /**
@@ -970,7 +1113,7 @@ async function getCodebuddyAccountInfo({ pathToCodebuddyCode, env, queryFn }) {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin management (SDK 0.3.230)
+// Plugin management (SDK 0.3.258)
 // ---------------------------------------------------------------------------
 
 async function codebuddyInstallPlugin(options) {
@@ -1013,6 +1156,7 @@ module.exports = {
   runCodebuddyTurn,
   listCodebuddyModels,
   mapCodebuddyModels,
+  splitCodebuddyModelSelection,
   codebuddyBuiltinTools,
   buildCodebuddyHooks,
   isAllowedCodebuddySkillsBash,

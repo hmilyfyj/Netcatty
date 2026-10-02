@@ -53,6 +53,8 @@ export const terminalLayerAreEqual = (
   prev.sftpAutoOpenSidebar === next.sftpAutoOpenSidebar &&
   prev.terminalSidePanelAutoOpen === next.terminalSidePanelAutoOpen &&
   prev.terminalSidePanelAutoOpenTab === next.terminalSidePanelAutoOpenTab &&
+  prev.localShellSidePanelAutoOpen === next.localShellSidePanelAutoOpen &&
+  prev.localShellSidePanelAutoOpenTab === next.localShellSidePanelAutoOpenTab &&
   prev.sftpFollowTerminalCwd === next.sftpFollowTerminalCwd &&
   prev.setSftpFollowTerminalCwd === next.setSftpFollowTerminalCwd &&
   prev.editorWordWrap === next.editorWordWrap &&
@@ -73,10 +75,14 @@ export const terminalLayerAreEqual = (
   prev.onCreateLocalTerminal === next.onCreateLocalTerminal &&
   prev.isBroadcastEnabled === next.isBroadcastEnabled &&
   prev.onToggleBroadcast === next.onToggleBroadcast &&
+  prev.isGlobalBroadcastEnabled === next.isGlobalBroadcastEnabled &&
+  prev.canUseGlobalBroadcast === next.canUseGlobalBroadcast &&
+  prev.onToggleGlobalBroadcast === next.onToggleGlobalBroadcast &&
   prev.updateSnippets === next.updateSnippets &&
   prev.updateSnippetPackages === next.updateSnippetPackages &&
   prev.toggleScriptsSidePanelRef === next.toggleScriptsSidePanelRef &&
   prev.toggleSidePanelRef === next.toggleSidePanelRef &&
+  prev.paneMagnificationRef === next.paneMagnificationRef &&
   prev.identities === next.identities
   // shellHistory intentionally omitted — History panel reads shellHistoryStore.
 );
