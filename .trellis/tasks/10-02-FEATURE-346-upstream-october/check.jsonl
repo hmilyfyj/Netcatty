@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/desktop/app/quality-guidelines.md", "reason": "最终质量检查"}
+{"file": ".trellis/spec/desktop/app/index.md", "reason": "跨层核对"}
+{"file": ".trellis/spec/desktop/app/application-state.md", "reason": "核对主机组和会话生命周期"}
+{"file": ".trellis/spec/desktop/app/component-guidelines.md", "reason": "核对控制台与侧栏可见性"}
+{"file": ".trellis/spec/desktop/app/electron-guidelines.md", "reason": "核对 CLI MCP 和 Monaco 打包边界"}

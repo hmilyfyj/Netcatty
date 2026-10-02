@@ -178,7 +178,7 @@ test("terminal pane render snapshot combines visibility and focus in one token",
   assert.equal(parsed.isFocusedPane, true);
 });
 
-test("hidden focus workspaces keep the focused pane full-size and other panes split", () => {
+test("focus workspaces never use split geometry so hidden panes keep full size (#3046)", () => {
   const workspace = createWorkspace("ws-focus", ["f-1", "f-2"], {
     viewMode: "focus",
     focusedSessionId: "f-2",
@@ -190,12 +190,15 @@ test("hidden focus workspaces keep the focused pane full-size and other panes sp
     isVisible: false,
     hibernateHiddenTabs: false,
   }), false);
+  // A hidden, non-focused pane must not fall back to its split rect: the
+  // continuously rendered xterm and the remote PTY would shrink to a 1/N-width
+  // fragment and \r progress refreshes would wrap into scrollback spam.
   assert.equal(shouldUseTerminalPaneSplitLayout({
     workspace,
     sessionId: "f-1",
     isVisible: false,
     hibernateHiddenTabs: false,
-  }), true);
+  }), false);
   assert.equal(shouldUseTerminalPaneSplitLayout({
     workspace,
     sessionId: "f-1",
@@ -260,14 +263,15 @@ test("hidden terminal layers measure once when their layout must stay active", (
   }), true);
 });
 
-test("inactive terminal pane keeps rendering when hibernate is disabled", () => {
+test("inactive terminal pane parks its screen without changing live dimensions", () => {
   const inactiveStyle = resolveInactiveTerminalPaneStyle(
     { left: "40px", top: 0, width: "640px", height: "480px" },
     { width: 1180, height: 720 },
     false,
   );
 
-  assert.equal(inactiveStyle.left, "40px");
+  assert.equal(inactiveStyle.left, 0);
+  assert.equal(inactiveStyle.transform, "translateX(calc(-100vw - 100%))");
   assert.equal(inactiveStyle.top, 0);
   assert.equal(inactiveStyle.visibility, "visible");
   assert.equal(inactiveStyle.pointerEvents, "none");

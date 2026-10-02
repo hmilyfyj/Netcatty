@@ -345,7 +345,9 @@ function createPreloadApi(ctx) {
       sessionId,
       data,
       automated: Boolean(options?.automated),
+      pasteRequestId: typeof options?.pasteRequestId === "string" ? options.pasteRequestId : undefined,
       sensitive: options?.sensitive === true,
+      serialEraseChar: typeof options?.serialEraseChar === "string" ? options.serialEraseChar : undefined,
       lineDelayMs: Number.isFinite(lineDelayMs) && lineDelayMs > 0 ? lineDelayMs : undefined,
       logRewrite: options?.logRewrite && typeof options.logRewrite === "object"
         ? {
@@ -355,8 +357,20 @@ function createPreloadApi(ctx) {
         : undefined,
     });
   },
-  interruptSession: (sessionId, trace) => {
+  notifySessionUserInput: (sessionId) => {
+    ipcRenderer.send("netcatty:terminal:user-input", { sessionId });
+  },
+  onTerminalPasteWrite: (cb) => {
+    const listener = (_event, payload) => cb(payload);
+    ipcRenderer.on("netcatty:paste-write", listener);
+    return () => ipcRenderer.removeListener("netcatty:paste-write", listener);
+  },
+  interruptSession: (sessionId, trace, options) => {
     const sanitizedTrace = sanitizeInterruptTrace(trace);
+    if (options?.cancelPendingWritesOnly === true) {
+      ipcRenderer.send("netcatty:interrupt", { sessionId, trace: sanitizedTrace, cancelPendingWritesOnly: true });
+      return;
+    }
     if (ctx.terminalUrgentInputPorts?.postInterrupt?.(sessionId, sanitizedTrace)) {
       return;
     }
@@ -456,7 +470,8 @@ function createPreloadApi(ctx) {
     const replay = terminalPopupConfigState.pending ?? terminalPopupConfigState.lastPayload;
     if (replay) {
       // Drain the one-shot pending slot once a live subscriber exists, but keep
-      // lastPayload so StrictMode remount can resubscribe and still setConfig.
+      // lastPayload so remounts (AppLockGate delay, StrictMode) can resubscribe
+      // and still receive the one-shot main post-loadURL payload.
       terminalPopupConfigState.pending = null;
       queueMicrotask(() => {
         try {
@@ -818,6 +833,19 @@ function createPreloadApi(ctx) {
       sessionId,
       expectedEndpoint: options,
     });
+    if (
+      options?.requireExactSourceSession === true
+      && result.sourceSessionId !== sessionId
+    ) {
+      if (result.sftpId) {
+        try {
+          await ipcRenderer.invoke("netcatty:sftp:close", { sftpId: result.sftpId });
+        } catch {
+          // Best-effort cleanup before rejecting an invalid strict binding.
+        }
+      }
+      throw new Error("The requested terminal connection is no longer available");
+    }
     return result.sftpId;
   },
   listSftp: async (sftpId, path, encoding) => {
@@ -865,6 +893,9 @@ function createPreloadApi(ctx) {
   chmodSftp: async (sftpId, path, mode, encoding) => {
     return ipcRenderer.invoke("netcatty:sftp:chmod", { sftpId, path, mode, encoding });
   },
+  extractSftpArchive: async (sftpId, path, encoding) => {
+    return ipcRenderer.invoke("netcatty:sftp:extract", { sftpId, path, encoding });
+  },
   getSftpHomeDir: async (sftpId, encoding) => {
     return ipcRenderer.invoke("netcatty:sftp:homeDir", { sftpId, encoding });
   },
@@ -887,6 +918,9 @@ function createPreloadApi(ctx) {
   renameLocalFile: async (oldPath, newPath) => {
     return ipcRenderer.invoke("netcatty:local:rename", { oldPath, newPath });
   },
+  extractLocalArchive: async (path) => {
+    return ipcRenderer.invoke("netcatty:local:extract", { path });
+  },
   mkdirLocal: async (path) => {
     return ipcRenderer.invoke("netcatty:local:mkdir", { path });
   },
@@ -895,6 +929,9 @@ function createPreloadApi(ctx) {
   },
   lstatLocal: async (path) => {
     return ipcRenderer.invoke("netcatty:local:lstat", { path });
+  },
+  realpathLocal: async (path) => {
+    return ipcRenderer.invoke("netcatty:local:realpath", { path });
   },
   listLocalTree: async (path, options = {}) => {
     const onProgress = typeof options?.onProgress === "function" ? options.onProgress : null;
@@ -1117,12 +1154,50 @@ function createPreloadApi(ctx) {
     ipcRenderer.on("netcatty:settings:changed", handler);
     return () => ipcRenderer.removeListener("netcatty:settings:changed", handler);
   },
+  getAppLockRuntimeState: () => ipcRenderer.invoke("netcatty:appLock:getRuntimeState"),
+  getAppLockSettings: () => ipcRenderer.invoke("netcatty:appLock:getSettings"),
+  setAppLockTimeoutMinutes: (timeoutMinutes) =>
+    ipcRenderer.invoke("netcatty:appLock:setTimeoutMinutes", timeoutMinutes),
+  requestAppLockEnable: () => ipcRenderer.invoke("netcatty:appLock:requestEnable"),
+  requestAppLockDisable: (currentPassword) =>
+    ipcRenderer.invoke("netcatty:appLock:requestDisable", currentPassword),
+  requestAppLockReset: (currentPassword) =>
+    ipcRenderer.invoke("netcatty:appLock:requestReset", currentPassword),
+  requestAppLockPasswordChange: (input) =>
+    ipcRenderer.invoke("netcatty:appLock:requestPasswordChange", input),
+  setAppLockRuntimeLocked: (reason) =>
+    ipcRenderer.invoke("netcatty:appLock:setLocked", reason),
+  requestAppLockUnlock: (password) =>
+    ipcRenderer.invoke("netcatty:appLock:requestUnlock", password),
+  getAppLockSystemUnlockStatus: () =>
+    ipcRenderer.invoke("netcatty:appLock:getSystemUnlockStatus"),
+  setAppLockSystemUnlockEnabled: (input) =>
+    ipcRenderer.invoke("netcatty:appLock:setSystemUnlockEnabled", input),
+  requestAppLockSystemUnlock: () =>
+    ipcRenderer.invoke("netcatty:appLock:requestSystemUnlock"),
+  reportAppLockActivity: () =>
+    ipcRenderer.invoke("netcatty:appLock:reportActivity"),
+  onAppLockSettingsChanged: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on("netcatty:appLock:settingsChanged", handler);
+    return () => ipcRenderer.removeListener("netcatty:appLock:settingsChanged", handler);
+  },
+  onAppLockRuntimeStateChanged: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on("netcatty:appLock:runtimeStateChanged", handler);
+    return () => ipcRenderer.removeListener("netcatty:appLock:runtimeStateChanged", handler);
+  },
   getSshDebugLogInfo: () => ipcRenderer.invoke("netcatty:sshDebugLog:info"),
   openSshDebugLogDir: () => ipcRenderer.invoke("netcatty:sshDebugLog:openDir"),
 
   // Cloud sync session (in-memory only, shared across windows)
   cloudSyncSetSessionPassword: (password) =>
     ipcRenderer.invoke("netcatty:cloudSync:session:setPassword", password),
+  onCloudSyncSessionPasswordAvailable: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on("netcatty:cloudSync:session:passwordAvailable", handler);
+    return () => ipcRenderer.removeListener("netcatty:cloudSync:session:passwordAvailable", handler);
+  },
   cloudSyncGetSessionPassword: () =>
     ipcRenderer.invoke("netcatty:cloudSync:session:getPassword"),
   cloudSyncClearSessionPassword: () =>
@@ -1482,6 +1557,16 @@ function createPreloadApi(ctx) {
     ipcRenderer.invoke("netcatty:tray:setCloseToTray", { enabled }),
   isCloseToTray: () =>
     ipcRenderer.invoke("netcatty:tray:isCloseToTray"),
+  setShowTrayIcon: (enabled) =>
+    ipcRenderer.invoke("netcatty:tray:setShowTrayIcon", { enabled }),
+  isShowTrayIcon: () =>
+    ipcRenderer.invoke("netcatty:tray:isShowTrayIcon"),
+
+  // Auto Launch at system login (hidden to tray)
+  getAutoLaunch: () =>
+    ipcRenderer.invoke("netcatty:autoLaunch:get"),
+  setAutoLaunch: (enabled) =>
+    ipcRenderer.invoke("netcatty:autoLaunch:set", { enabled }),
 
   // App-level HTTP(S) network proxy (cloud sync / AI providers)
   setHttpNetworkProxy: (settings) =>
@@ -1490,6 +1575,11 @@ function createPreloadApi(ctx) {
     ipcRenderer.invoke("netcatty:networkProxy:get"),
   updateTrayMenuData: (data) =>
     ipcRenderer.invoke("netcatty:tray:updateMenuData", data),
+  onAppLockReopen: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on("netcatty:app-lock:reopen", handler);
+    return () => ipcRenderer.removeListener("netcatty:app-lock:reopen", handler);
+  },
   // Listen for tray menu actions
   onTrayFocusSession: (callback) => {
     const handler = (_event, sessionId) => callback(sessionId);
@@ -1498,8 +1588,13 @@ function createPreloadApi(ctx) {
   },
   onTrayTogglePortForward: (callback) => {
     const handler = (_event, ruleId, start) => callback(ruleId, start);
+    const startHandler = (_event, ruleId) => callback(ruleId, true);
     ipcRenderer.on("netcatty:tray:togglePortForward", handler);
-    return () => ipcRenderer.removeListener("netcatty:tray:togglePortForward", handler);
+    ipcRenderer.on("netcatty:trayPanel:startPortForward", startHandler);
+    return () => {
+      ipcRenderer.removeListener("netcatty:tray:togglePortForward", handler);
+      ipcRenderer.removeListener("netcatty:trayPanel:startPortForward", startHandler);
+    };
   },
 
   // Tray panel actions forwarded to main window
@@ -1527,6 +1622,8 @@ function createPreloadApi(ctx) {
     ipcRenderer.invoke("netcatty:trayPanel:jumpToSession", sessionId),
   connectToHostFromTrayPanel: (hostId) =>
     ipcRenderer.invoke("netcatty:trayPanel:connectToHost", hostId),
+  startPortForwardFromTrayPanel: (ruleId) =>
+    ipcRenderer.invoke("netcatty:trayPanel:startPortForward", ruleId),
   closeSessionFromTrayPanel: (sessionId) =>
     ipcRenderer.invoke("netcatty:trayPanel:closeSession", sessionId),
   onTrayPanelCloseRequest: (callback) => {
@@ -1556,6 +1653,8 @@ function createPreloadApi(ctx) {
   },
 
   // Get file path from File object (for drag-and-drop)
+  startLocalFileDrag: (payload) => ipcRenderer.invoke("netcatty:local:drag-start", payload),
+  cancelLocalFileDrag: (requestId) => ipcRenderer.send("netcatty:local:drag-cancel", { requestId }),
   getPathForFile: (file) => {
     try {
       return webUtils.getPathForFile(file);
@@ -1590,6 +1689,10 @@ function createPreloadApi(ctx) {
     if (!controller) return { success: false };
     controller.abort(new Error("Upload staging cancelled"));
     return { success: true };
+  },
+
+  showSystemNotification: async (payload) => {
+    return ipcRenderer.invoke("netcatty:notification:show", payload ?? {});
   },
 
   // Clipboard fallback helpers
@@ -1653,8 +1756,15 @@ function createPreloadApi(ctx) {
   aiSyncWebSearch: async (apiHost, apiKey) => {
     return ipcRenderer.invoke("netcatty:ai:sync-web-search", { apiHost, apiKey });
   },
-  aiChatStream: async (requestId, url, headers, body, providerId) => {
-    return ipcRenderer.invoke("netcatty:ai:chat:stream", { requestId, url, headers, body, providerId });
+  aiChatStream: async (requestId, url, headers, body, providerId, idleTimeoutMs) => {
+    return ipcRenderer.invoke("netcatty:ai:chat:stream", {
+      requestId,
+      url,
+      headers,
+      body,
+      providerId,
+      idleTimeoutMs,
+    });
   },
   aiChatCancel: async (requestId) => {
     return ipcRenderer.invoke("netcatty:ai:chat:cancel", { requestId });
@@ -1710,6 +1820,9 @@ function createPreloadApi(ctx) {
   },
   externalMcpSetConfig: async (config) => {
     return ipcRenderer.invoke("netcatty:external-mcp:set-config", config || {});
+  },
+  externalMcpGetUniversalSetupPrompt: async () => {
+    return ipcRenderer.invoke("netcatty:external-mcp:get-universal-setup-prompt");
   },
   externalMcpCodexGetStatus: async () => {
     return ipcRenderer.invoke("netcatty:external-mcp:codex:get-status");
@@ -1769,14 +1882,17 @@ function createPreloadApi(ctx) {
   aiUserSkillsBuildContext: async (prompt, selectedSkillSlugs) => {
     return ipcRenderer.invoke("netcatty:ai:user-skills:build-context", { prompt, selectedSkillSlugs });
   },
+  aiSkillsCliGetInvocation: async () => {
+    return ipcRenderer.invoke("netcatty:ai:skills-cli:invocation");
+  },
   // MCP approval gate: renderer receives approval requests from main process
   onMcpApprovalRequest: (cb) => {
     const handler = (_event, payload) => cb(payload);
     ipcRenderer.on("netcatty:ai:mcp:approval-request", handler);
     return () => ipcRenderer.removeListener("netcatty:ai:mcp:approval-request", handler);
   },
-  respondMcpApproval: async (approvalId, approved) => {
-    return ipcRenderer.invoke("netcatty:ai:mcp:approval-response", { approvalId, approved });
+  respondMcpApproval: async (approvalId, approved, scope) => {
+    return ipcRenderer.invoke("netcatty:ai:mcp:approval-response", { approvalId, approved, scope });
   },
   cancelMcpApprovalTimeout: async (approvalId) => {
     return ipcRenderer.invoke("netcatty:ai:mcp:approval-cancel-timeout", { approvalId });
@@ -1805,6 +1921,7 @@ function createPreloadApi(ctx) {
           fallbackModel: codebuddyOptions.fallbackModel,
           sandbox: codebuddyOptions.sandbox,
           enableFileCheckpointing: codebuddyOptions.enableFileCheckpointing,
+          persistSession: codebuddyOptions.persistSession,
         }
       : {};
     return ipcRenderer.invoke("netcatty:ai:sdk-agent:stream", {

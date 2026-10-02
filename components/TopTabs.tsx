@@ -1,4 +1,4 @@
-import { Folder, FolderLock, Menu, MoreHorizontal, Plus, Settings, Sparkles } from 'lucide-react';
+import { Folder, FolderLock, Lock, Menu, MoreHorizontal, Plus, Settings, Sparkles } from 'lucide-react';
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { fromEditorTabId, isEditorTabId, toEditorTabId, useActiveTabId } from '../application/state/activeTabStore';
 import { topTabsSessionsEqual } from '../domain/topTabsSessionsEqual';
@@ -11,7 +11,7 @@ import {
   appendHostFromWorkspaceDrop,
   resolveFocusSidebarDragKind,
 } from '../domain/focusSidebarHostDrop';
-import type { DynamicTabTitleMode, KeyBinding } from '../domain/models';
+import type { DynamicTabTitleMode, KeyBinding, TerminalTabDoubleClickBehavior } from '../domain/models';
 
 import { getTopTabInsertionTarget, getWorkspaceSessionDragId, hasWorkspaceSessionDrag } from '../application/state/terminalDragData';
 import {
@@ -141,6 +141,7 @@ interface TopTabsProps {
   onCloseSession: (sessionId: string, e?: React.MouseEvent) => void;
   onRenameSession: (sessionId: string) => void;
   onCopySession: (sessionId: string) => void;
+  onDuplicateSession?: (sessionId: string) => void;
   onCopySessionToNewWindow: (sessionId: string) => void;
   onEditHost?: (host: Host) => void;
   onRenameWorkspace: (workspaceId: string) => void;
@@ -151,6 +152,8 @@ interface TopTabsProps {
   onOpenQuickSwitcher: () => void;
   onThemeChange: (theme: 'dark' | 'light' | 'system') => void;
   onOpenSettings: () => void;
+  onLockApp?: () => void;
+  appLockEnabled?: boolean;
   externalMcpEnabled: boolean;
   onToggleExternalMcp: (enabled: boolean) => void;
   showExternalMcpToggle?: boolean;
@@ -169,6 +172,7 @@ interface TopTabsProps {
   showHostTreeSidebar: boolean;
   switchTabKeyBinding: Pick<KeyBinding, 'mac' | 'pc'> | null;
   dynamicTabTitleMode?: DynamicTabTitleMode;
+  tabDoubleClickBehavior: TerminalTabDoubleClickBehavior;
   editorTabs: readonly EditorTabChrome[];
   pluginViewTabs: readonly PluginViewTab[];
   onClosePluginViewTab: (tabId: string) => void;
@@ -193,6 +197,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   onCloseSession,
   onRenameSession,
   onCopySession,
+  onDuplicateSession,
   onCopySessionToNewWindow,
   onEditHost,
   onRenameWorkspace,
@@ -203,6 +208,8 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   onOpenQuickSwitcher,
   onThemeChange,
   onOpenSettings,
+  onLockApp,
+  appLockEnabled,
   externalMcpEnabled,
   onToggleExternalMcp,
   showExternalMcpToggle = true,
@@ -218,6 +225,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   showHostTreeSidebar,
   switchTabKeyBinding,
   dynamicTabTitleMode,
+  tabDoubleClickBehavior,
   editorTabs,
   pluginViewTabs,
   onClosePluginViewTab,
@@ -772,6 +780,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
     const anchorIdx = orderedTabs.indexOf(anchorId);
     const othersIds = orderedTabs.filter((id) => id !== anchorId);
     const rightIds = anchorIdx >= 0 ? orderedTabs.slice(anchorIdx + 1) : [];
+    const leftIds = anchorIdx > 0 ? orderedTabs.slice(0, anchorIdx) : [];
     return (
       <>
         <ContextMenuSeparator />
@@ -780,6 +789,12 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
           onClick={() => onCloseTabsBatch(othersIds)}
         >
           {t('tabs.closeOthers')}
+        </ContextMenuItem>
+        <ContextMenuItem
+          disabled={leftIds.length === 0}
+          onClick={() => onCloseTabsBatch(leftIds)}
+        >
+          {t('tabs.closeToLeft')}
         </ContextMenuItem>
         <ContextMenuItem
           disabled={rightIds.length === 0}
@@ -923,10 +938,12 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
             onCloseSession={onCloseSession}
             onRenameSession={onRenameSession}
             onCopySession={onCopySession}
+            onDuplicateSession={onDuplicateSession}
             onCopySessionToNewWindow={onCopySessionToNewWindow}
             onEditHost={onEditHost}
             renderBulkCloseItems={renderBulkCloseItems}
             dynamicTabTitleMode={dynamicTabTitleMode}
+            tabDoubleClickBehavior={tabDoubleClickBehavior}
             t={t}
             tabAnimationClass={getTabAnimationClass(session.id)}
             shortcutNumber={tabShortcutNumbers?.get(session.id)}
@@ -1213,9 +1230,9 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
           </div>
         )}
 
-        {/* Fixed right controls — utility icons + window controls share one h-7 row */}
+        {/* Right controls share the tab row. */}
         <div
-          className="flex-shrink-0 flex items-center gap-0.5 app-drag self-end h-7 overflow-visible"
+          className="flex-shrink-0 flex items-center gap-0.5 app-drag h-7 overflow-visible self-end"
           style={dragRegionStyle}
           data-section="top-tabs-toolbar-actions"
         >
@@ -1240,6 +1257,22 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
             className="h-7 w-7 shrink-0 top-tab-utility-btn"
             style={{ color: 'var(--top-tabs-muted, hsl(var(--muted-foreground)))' }}
           />
+          {appLockEnabled && onLockApp && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 shrink-0 app-no-drag top-tab-utility-btn"
+                  style={{ color: 'var(--top-tabs-muted, hsl(var(--muted-foreground)))' }}
+                  onClick={onLockApp}
+                >
+                  <Lock size={16} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t('topTabs.lockApp')}</TooltipContent>
+            </Tooltip>
+          )}
           <TopTabsQuickControls
             theme={theme}
             themePreference={themePreference}
@@ -1251,6 +1284,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
             setWindowOpacity={setWindowOpacity}
             style={{ color: 'var(--top-tabs-muted, hsl(var(--muted-foreground)))' }}
           />
+
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -1299,11 +1333,14 @@ export const topTabsAreEqual = (prev: TopTabsProps, next: TopTabsProps): boolean
     prev.draggingSessionId === next.draggingSessionId &&
     prev.isMacClient === next.isMacClient &&
     prev.onCopySession === next.onCopySession &&
+    prev.onDuplicateSession === next.onDuplicateSession &&
     prev.onCopySessionToNewWindow === next.onCopySessionToNewWindow &&
     prev.onEditHost === next.onEditHost &&
     prev.onAppendHostToWorkspace === next.onAppendHostToWorkspace &&
     prev.onCopyWorkspace === next.onCopyWorkspace &&
     prev.onOpenSettings === next.onOpenSettings &&
+    prev.onLockApp === next.onLockApp &&
+    prev.appLockEnabled === next.appLockEnabled &&
     prev.externalMcpEnabled === next.externalMcpEnabled &&
     prev.onToggleExternalMcp === next.onToggleExternalMcp &&
     prev.showExternalMcpToggle === next.showExternalMcpToggle &&
@@ -1316,6 +1353,7 @@ export const topTabsAreEqual = (prev: TopTabsProps, next: TopTabsProps): boolean
     prev.showHostTreeSidebar === next.showHostTreeSidebar &&
     prev.switchTabKeyBinding === next.switchTabKeyBinding &&
     prev.dynamicTabTitleMode === next.dynamicTabTitleMode &&
+    prev.tabDoubleClickBehavior === next.tabDoubleClickBehavior &&
     prev.hostById === next.hostById
   );
 };

@@ -18,6 +18,21 @@ function normalizeLocalTreeLimit(value, fallback) {
   return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
 }
 
+let cachedLocalUserInfo;
+function localOwnerFromStat(stat) {
+  if (process.platform === "win32") return undefined;
+  if (!stat || typeof stat.uid !== "number") return undefined;
+  try {
+    cachedLocalUserInfo ??= os.userInfo();
+    if (cachedLocalUserInfo.uid === stat.uid && cachedLocalUserInfo.username) {
+      return cachedLocalUserInfo.username;
+    }
+  } catch {
+    // userInfo() can throw when the process has no passwd entry.
+  }
+  return String(stat.uid);
+}
+
 function createLocalTreeTraversalBudget(limits = {}) {
   return {
     directories: 0,
@@ -168,6 +183,9 @@ async function listLocalDir(event, payload) {
         // Windows hidden attribute: resolved from the batched lookup.
         const hidden = isWindows ? hiddenSet.has(entry.name) : false;
 
+        // Follow the target for size/mtime/type; owner is the directory entry itself.
+        const ownerStat = type === "symlink" ? await fs.promises.lstat(fullPath) : stat;
+        const owner = localOwnerFromStat(ownerStat);
         result[i] = {
           name: entry.name,
           type,
@@ -175,6 +193,7 @@ async function listLocalDir(event, payload) {
           size: `${stat.size} bytes`,
           lastModified: stat.mtime.toISOString(),
           hidden,
+          ...(owner ? { owner } : {}),
         };
       } catch (err) {
         // Handle broken symlinks - lstat doesn't follow symlinks
@@ -186,6 +205,7 @@ async function listLocalDir(event, payload) {
             if (lstat.isSymbolicLink()) {
               // Broken symlink
               const hidden = isWindows ? hiddenSet.has(brokenEntry.name) : false;
+              const owner = localOwnerFromStat(lstat);
               result[i] = {
                 name: brokenEntry.name,
                 type: "symlink",
@@ -193,6 +213,7 @@ async function listLocalDir(event, payload) {
                 size: `${lstat.size} bytes`,
                 lastModified: lstat.mtime.toISOString(),
                 hidden,
+                ...(owner ? { owner } : {}),
               };
               return;
             }
@@ -313,6 +334,10 @@ async function statLocal(event, payload) {
     type: stat.isDirectory() ? "directory" : "file",
     size: stat.size,
     lastModified: stat.mtime.getTime(),
+    // Filesystem identity for same-pane paste guards: realpath cannot see
+    // through bind mounts, but dev/ino name the same directory regardless of
+    // the mount path used. Windows dev/ino are unreliable, so omit them there.
+    ...(process.platform === "win32" ? {} : { dev: stat.dev, ino: stat.ino }),
   };
 }
 
@@ -328,7 +353,19 @@ async function lstatLocal(event, payload) {
     type: stat.isDirectory() ? "directory" : stat.isSymbolicLink() ? "symlink" : "file",
     size: stat.size,
     lastModified: stat.mtime.getTime(),
+    // Mirror statLocal so guards comparing identities work with either stat.
+    ...(process.platform === "win32" ? {} : { dev: stat.dev, ino: stat.ino }),
   };
+}
+
+/**
+ * Resolve a local path to its absolute canonical form, following every
+ * symlink component. Same-pane paste guards use this so destinations that
+ * reach the clipboard source through a symlink alias compare equal to the
+ * real source path.
+ */
+async function realpathLocal(event, payload) {
+  return fs.promises.realpath(payload.path);
 }
 
 function throwIfLocalTreeCancelled(isCancelled) {
@@ -377,6 +414,7 @@ async function collectLocalTreeEntries(rootPath, limits = {}, onProgress, isCanc
   const queue = [{
     localPath: rootPath,
     relativePath: rootName,
+    realPath: rootRealPath,
     ancestorRealPaths: new Set([rootRealPath]),
   }];
   let queueIndex = 0;
@@ -410,14 +448,23 @@ async function collectLocalTreeEntries(rootPath, limits = {}, onProgress, isCanc
             // Use lstat to distinguish links, then stat the target. Directory
             // links retain the established folder-upload behavior, while the
             // real-path ancestor chain prevents junction/symlink cycles.
+            // Ordinary files/dirs skip realpath: node_modules-sized trees pay
+            // an extra syscall per directory otherwise, which shows up as
+            // "scanning" stall before the first byte is uploaded.
             const linkStat = await fs.promises.lstat(childPath);
-            const stat = linkStat.isSymbolicLink()
+            const followLink = linkStat.isSymbolicLink();
+            const stat = followLink
               ? await fs.promises.stat(childPath).catch(() => linkStat)
               : linkStat;
             const isDirectory = stat.isDirectory();
-            const realPath = isDirectory
-              ? await fs.promises.realpath(childPath)
-              : null;
+            // Ordinary directories keep their ancestor identity by composing
+            // from the already-resolved parent. Only directory links pay for
+            // realpath, which is what cycle detection actually needs.
+            const realPath = !isDirectory
+              ? null
+              : followLink
+                ? await fs.promises.realpath(childPath)
+                : path.join(current.realPath, child.name);
             const isCycle = !!realPath && current.ancestorRealPaths.has(realPath);
             const ancestorRealPaths = realPath
               ? new Set([...current.ancestorRealPaths, realPath])
@@ -428,6 +475,7 @@ async function collectLocalTreeEntries(rootPath, limits = {}, onProgress, isCanc
               stat,
               isDirectory,
               isCycle,
+              realPath,
               ancestorRealPaths,
             };
           } catch (error) {
@@ -464,6 +512,7 @@ async function collectLocalTreeEntries(rootPath, limits = {}, onProgress, isCanc
           queue.push({
             localPath: child.childPath,
             relativePath: child.childRelativePath,
+            realPath: child.realPath,
             ancestorRealPaths: child.ancestorRealPaths,
           });
         } else {
@@ -617,6 +666,11 @@ async function listDrives() {
   return letters.filter((_, idx) => results[idx].status === "fulfilled").map((letter) => letter + ":");
 }
 
+async function extractLocalArchive(_event, payload) {
+  const { extractLocalArchiveFile } = require("./sftpBridge/archiveExtract.cjs");
+  return extractLocalArchiveFile(payload?.path);
+}
+
 /**
  * Register IPC handlers for local filesystem operations
  */
@@ -626,9 +680,11 @@ function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:local:write", writeLocalFile);
   ipcMain.handle("netcatty:local:delete", deleteLocalFile);
   ipcMain.handle("netcatty:local:rename", renameLocalFile);
+  ipcMain.handle("netcatty:local:extract", extractLocalArchive);
   ipcMain.handle("netcatty:local:mkdir", mkdirLocal);
   ipcMain.handle("netcatty:local:stat", statLocal);
   ipcMain.handle("netcatty:local:lstat", lstatLocal);
+  ipcMain.handle("netcatty:local:realpath", realpathLocal);
   ipcMain.handle("netcatty:local:tree", listLocalTree);
   ipcMain.handle("netcatty:local:homedir", getHomeDir);
   ipcMain.handle("netcatty:local:drives", listDrives);
@@ -644,9 +700,11 @@ module.exports = {
   writeLocalFile,
   deleteLocalFile,
   renameLocalFile,
+  extractLocalArchive,
   mkdirLocal,
   statLocal,
   lstatLocal,
+  realpathLocal,
   collectLocalTreeEntries,
   createLocalTreeTraversalBudget,
   MAX_LOCAL_TREE_DIRECTORIES,

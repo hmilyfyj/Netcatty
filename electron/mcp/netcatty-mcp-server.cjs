@@ -12,7 +12,9 @@ const net = require("node:net");
 const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { getCatalogToolDescription } = require("./catalogToolMetadata.cjs");
-const { registerMcpTools } = require("../capabilities/codegen/mcpToolRegistry.cjs");
+const { NETCATTY_MCP_SERVER_INSTRUCTIONS } = require("./netcattyMcpInstructions.cjs");
+const { registerProgressiveMcpTools } = require("./progressiveMcpTools.cjs");
+const { normalizeMcpJsonRpcMessage } = require("./normalizeMcpCallArguments.cjs");
 
 function catalogDescription(toolName, fallback) {
   return getCatalogToolDescription(toolName) || fallback;
@@ -199,6 +201,8 @@ function rpcCall(method, params) {
 const server = new McpServer({
   name: "netcatty-remote-hosts",
   version: "1.0.0",
+}, {
+  instructions: NETCATTY_MCP_SERVER_INSTRUCTIONS,
 });
 
 // Scope params shared by all tool calls.
@@ -226,8 +230,8 @@ server.resource(
   },
 );
 
-// Register catalog-driven MCP tools (terminal, SFTP, attachments, vault, portforward).
-registerMcpTools(server, {
+// Start with core tools; load specialized catalog groups through load_netcatty_tools.
+registerProgressiveMcpTools(server, {
   rpcCall,
   scopeParams,
   guardWriteOperation,
@@ -255,6 +259,10 @@ async function main() {
   process.stderr.write("[netcatty-mcp] Authenticated with TCP bridge\n");
 
   const transport = new StdioServerTransport();
+  // Protocol.connect keeps this callback and runs it before request dispatch.
+  transport.onmessage = (message) => {
+    normalizeMcpJsonRpcMessage(message);
+  };
   await server.connect(transport);
 }
 

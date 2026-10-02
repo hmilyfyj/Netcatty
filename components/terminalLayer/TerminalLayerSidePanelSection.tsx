@@ -1,11 +1,13 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { Activity, FolderTree, History, MessageSquare, NotebookText, Palette, PanelLeft, PanelRight, Play, SplitSquareHorizontal, SplitSquareVertical, X } from 'lucide-react';
+import { Activity, FolderTree, History, Maximize2, MessageSquare, Minimize2, NotebookText, Palette, PanelsTopLeft, Play, Save, SplitSquareHorizontal, SplitSquareVertical, X } from 'lucide-react';
 import {
   buildSidePanelChromeThemeFromTerminalTheme,
   buildTerminalSidePanelCssVars,
 } from '../../infrastructure/theme/terminalAppearanceTokens';
 import { injectTerminalLayerChromeSurfaceVars } from '../../infrastructure/theme/terminalAppearanceVars';
-import React, { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { createPortal } from 'react-dom';
+import * as SelectPrimitive from '@radix-ui/react-select';
 
 import { useActiveTabId } from '../../application/state/activeTabStore';
 import {
@@ -21,10 +23,15 @@ import {
   useTerminalSidePanelTabOrder,
 } from '../../application/state/terminalSidePanelTabs';
 import {
+  clampTerminalSidePanelHeight,
   clampTerminalSidePanelWidth,
+  getTerminalSidePanelAvailableHeight,
   getTerminalSidePanelAvailableWidth,
   getTerminalSidePanelMaxShownTools,
+  getTerminalSidePanelMaxHeight,
   getTerminalSidePanelMaxWidth,
+  TERMINAL_SIDE_PANEL_MIN_HEIGHT,
+  TERMINAL_SIDE_PANEL_TOOLBAR_HEIGHT,
 } from '../../application/state/terminalSidePanelWidth';
 import { terminalLayoutSuppressStore } from '../../application/state/terminalLayoutSuppressStore';
 import { AI_PANEL_FORCE_HIDE_SHELL } from '../ai/aiPanelDiagnostics';
@@ -35,6 +42,7 @@ import {
 } from '../ui/toolbar-item-layout';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { Popover, PopoverClose, PopoverContent, PopoverTrigger } from '../ui/popover';
+import { Select, SelectContent, SelectItem } from '../ui/select';
 import type { SidePanelTab } from './TerminalLayerSupport';
 import {
   MAX_SIDE_PANEL_PANES,
@@ -44,6 +52,8 @@ import {
   getSidePanelNodeMinimumPixels,
   getSidePanelSplitResizeBounds,
   SIDE_PANEL_SPLIT_DIVIDER_PIXELS,
+  SIDE_PANEL_DOCK_POSITIONS,
+  type SidePanelDockPosition,
   type SidePanelLayout,
   type SidePanelLayoutNode,
   type SidePanelSplitDirection,
@@ -51,6 +61,7 @@ import {
 } from '../../domain/sidePanelLayout';
 import { terminalLayerSidePanelStableCtxEqual } from './terminalLayerViewMemo';
 import { SidePanelMountedContent } from './terminalLayerSidePanelSlots';
+import { getPaneMagnificationShortcutLabel } from '../../domain/paneMagnification';
 
 const MemoizedSidePanelMountedContent = memo(
   SidePanelMountedContent,
@@ -82,6 +93,15 @@ export function listenForSidePanelPaneFocus(
     target.removeEventListener('pointerdown', onFocus);
     target.removeEventListener('focusin', onFocus);
   };
+}
+
+export function resolveMagnifiedSidePanelHosts<K, T>(
+  paneHosts: ReadonlyMap<K, T>,
+  magnifiedPane: { tool: K } | null,
+  overlayHost: T | null,
+): ReadonlyMap<K, T> {
+  if (!magnifiedPane || !overlayHost) return paneHosts;
+  return new Map(paneHosts).set(magnifiedPane.tool, overlayHost);
 }
 
 function SidePanelPaneHost({
@@ -473,6 +493,46 @@ function SidePanelSplitMenu({
   );
 }
 
+function SidePanelDockSelect({
+  position,
+  onSelect,
+  t,
+  buttonColor,
+}: {
+  position: SidePanelDockPosition;
+  onSelect: (position: SidePanelDockPosition) => void;
+  t: (key: string) => string;
+  buttonColor: string;
+}) {
+  const labels = {
+    left: 'terminal.layer.dockLeft',
+    right: 'terminal.layer.dockRight',
+    bottom: 'terminal.layer.dockBottom',
+  };
+
+  return (
+    <Select value={position} onValueChange={(value) => onSelect(value as SidePanelDockPosition)}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <SelectPrimitive.Trigger
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-transparent p-0 hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            style={{ color: buttonColor }}
+            aria-label={t('terminal.layer.choosePanelPosition')}
+          >
+            <PanelsTopLeft size={15} />
+          </SelectPrimitive.Trigger>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">{t('terminal.layer.choosePanelPosition')}</TooltipContent>
+      </Tooltip>
+      <SelectContent align="end" side="bottom" className="min-w-[7rem]" hideScrollButtons>
+        {SIDE_PANEL_DOCK_POSITIONS.map((dock) => (
+          <SelectItem key={dock} value={dock}>{t(labels[dock])}</SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
 export function getTerminalSidePanelShellWidth({
   activeSidePanelTab,
   forceHideAiShell,
@@ -572,6 +632,8 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
     handleOpenSystem,
     handleOpenTheme,
     handleFocusSidePanelPane,
+    handleMagnifySidePanelPane,
+    handleRestoreMagnifiedPane,
     handleSplitSidePanelPane,
     handleCloseSidePanelPane,
     handleResizeSidePanelSplit,
@@ -580,10 +642,16 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
     setSidePanelPosition,
     setSidePanelWidth,
     persistSidePanelWidth,
+    setSidePanelHeight,
+    persistSidePanelHeight,
     sidePanelPosition,
     sidePanelWidth,
+    sidePanelHeight,
     t,
     terminalTheme,
+    hotkeyScheme,
+    keyBindings,
+    magnifiedPane,
   } = ctx;
 
   // Live theme for chrome when panel is open and not follow-app — stable memo
@@ -601,12 +669,22 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
       : ctxResolvedPreviewTheme);
 
   const [resizePreviewWidth, setResizePreviewWidth] = useState<number | null>(null);
+  const [resizePreviewHeight, setResizePreviewHeight] = useState<number | null>(null);
+  const isBottomDock = sidePanelPosition === 'bottom';
   const shellRef = useRef<HTMLDivElement>(null);
   const shellResizeCleanupRef = useRef<(() => void) | null>(null);
+  const updateAvailableSurfaceRef = useRef<() => void>(() => {});
   const [availableSurfaceWidth, setAvailableSurfaceWidth] = useState(0);
   const availableSurfaceWidthRef = useRef(availableSurfaceWidth);
+  // Full terminal-layer width; unlike `availableSurfaceWidth` this does not
+  // subtract the workspace focus sidebar (relevant for the bottom dock).
+  const [terminalLayerWidth, setTerminalLayerWidth] = useState(0);
+  const [availableSurfaceHeight, setAvailableSurfaceHeight] = useState(0);
+  const availableSurfaceHeightRef = useRef(availableSurfaceHeight);
   const [paneHosts, setPaneHosts] = useState<Map<SidePanelTab, HTMLElement>>(new Map());
   const [parkingHost, setParkingHost] = useState<HTMLElement | null>(null);
+  const [overlayRoot, setOverlayRoot] = useState<HTMLElement | null>(null);
+  const [overlayHost, setOverlayHost] = useState<HTMLElement | null>(null);
   const parkingHostRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     setParkingHost(parkingHostRef.current);
@@ -619,11 +697,17 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
     const shell = shellRef.current;
     const terminalLayer = shell?.parentElement;
     if (!terminalLayer) return undefined;
+    setOverlayRoot(terminalLayer);
 
     let observedFocusSidebar: Element | null = null;
+    let observedComposeBar: Element | null = null;
+    let observedWorkspaceColumn: Element | null = null;
     const resizeObserver = typeof ResizeObserver === 'undefined'
       ? null
       : new ResizeObserver(() => updateAvailableWidth());
+    const mutationObserver = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(() => updateAvailableWidth());
     const updateAvailableWidth = () => {
       const focusSidebar = terminalLayer.querySelector('[data-section="terminal-workspace-sidebar"]');
       if (resizeObserver && focusSidebar !== observedFocusSidebar) {
@@ -631,26 +715,77 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
         observedFocusSidebar = focusSidebar;
         if (focusSidebar) resizeObserver.observe(focusSidebar);
       }
+      // The workspace compose bar is a flex-shrink-0 sibling of the terminal
+      // area inside the workspace column; re-discover it on mount/unmount and
+      // measure it on its own resize so the dock never starves the terminal.
+      const composeBar = terminalLayer.querySelector('[data-section="terminal-compose-bar"]');
+      if (resizeObserver && composeBar !== observedComposeBar) {
+        if (observedComposeBar) resizeObserver.unobserve(observedComposeBar);
+        observedComposeBar = composeBar;
+        if (composeBar) resizeObserver.observe(composeBar);
+      }
+      const workspaceColumn = terminalLayer.querySelector(
+        '[data-section="terminal-workspace-column"]',
+      );
+      // MutationObserver has no unobserve; observe() on a node replaces its
+      // previous registration, so only newly seen columns need registering.
+      if (mutationObserver && workspaceColumn && workspaceColumn !== observedWorkspaceColumn) {
+        observedWorkspaceColumn = workspaceColumn;
+        mutationObserver.observe(workspaceColumn, { childList: true });
+      }
+      const layerWidth = terminalLayer.getBoundingClientRect().width;
       const nextWidth = getTerminalSidePanelAvailableWidth(
-        terminalLayer.getBoundingClientRect().width,
+        layerWidth,
         focusSidebar?.getBoundingClientRect().width ?? 0,
       );
+      setTerminalLayerWidth((current) => current === layerWidth ? current : layerWidth);
       availableSurfaceWidthRef.current = nextWidth;
       setAvailableSurfaceWidth((current) => current === nextWidth ? current : nextWidth);
+      // Bottom dock shares the full terminal layer height; only the host-tree
+      // sidebar overlaps horizontally. The compose bar is a flex-shrink-0
+      // sibling below the terminal area, though, so its height is reserved
+      // too — otherwise the MIN_TERMINAL_HEIGHT floor applies to the whole
+      // workspace row and a tall compose bar can collapse the terminal.
+      const nextHeight = getTerminalSidePanelAvailableHeight(
+        terminalLayer.getBoundingClientRect().height,
+        composeBar?.getBoundingClientRect().height ?? 0,
+      );
+      availableSurfaceHeightRef.current = nextHeight;
+      setAvailableSurfaceHeight((current) => current === nextHeight ? current : nextHeight);
     };
+    updateAvailableSurfaceRef.current = updateAvailableWidth;
 
-    updateAvailableWidth();
     resizeObserver?.observe(terminalLayer);
-    const mutationObserver = typeof MutationObserver === 'undefined'
-      ? null
-      : new MutationObserver(updateAvailableWidth);
     mutationObserver?.observe(terminalLayer, { childList: true });
+    // The focus sidebar is nested inside the workspace row wrapper, so a
+    // focus-mode toggle mutates the wrapper rather than the terminal layer
+    // (whose own dimensions stay unchanged). Watch the wrapper as well so the
+    // nested sidebar is discovered and observed when it mounts/unmounts.
+    const workspaceRow = terminalLayer.querySelector(
+      '[data-section="terminal-workspace-row"]',
+    );
+    if (workspaceRow) mutationObserver?.observe(workspaceRow, { childList: true });
+    updateAvailableWidth();
     return () => {
       resizeObserver?.disconnect();
       mutationObserver?.disconnect();
       observedFocusSidebar = null;
+      observedComposeBar = null;
+      observedWorkspaceColumn = null;
+      updateAvailableSurfaceRef.current = () => {};
+      setOverlayRoot(null);
     };
   }, []);
+  // The compose bar mounts inside the terminal pane, below the observed
+  // workspace column. Remeasure when it opens/closes or the active tab changes;
+  // the ResizeObserver above then follows subsequent compose-bar height drags.
+  useLayoutEffect(() => {
+    updateAvailableSurfaceRef.current();
+    // The compose bar is rendered by a sibling subtree. Its mount can land
+    // after this layout effect, so measure again once that commit has painted.
+    const frame = requestAnimationFrame(() => updateAvailableSurfaceRef.current());
+    return () => cancelAnimationFrame(frame);
+  }, [activeTabId, ctx.isComposeBarOpen]);
   const handlePaneHostChange = useCallback((tool: SidePanelTab, host: HTMLElement | null) => {
     setPaneHosts((current) => {
       if (host && current.get(tool) === host) return current;
@@ -715,8 +850,21 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
     resizePreviewWidth,
     sidePanelWidth,
   });
+  // Bottom dock reuses the same open/hidden gating with the height axis.
+  const requestedShellHeight = getTerminalSidePanelShellWidth({
+    activeSidePanelTab,
+    forceHideAiShell: AI_PANEL_FORCE_HIDE_SHELL && activePaneCount <= 1,
+    isSidePanelOpenForCurrentTab,
+    resizePreviewWidth: resizePreviewHeight,
+    sidePanelWidth: sidePanelHeight,
+  });
   const sidePanelContentMinimumWidth = activeSidePanelLayout
     ? getSidePanelNodeMinimumPixels(activeSidePanelLayout.root, 'vertical')
+    : 0;
+  const sidePanelContentMinimumHeight = activeSidePanelLayout
+    ? getSidePanelNodeMinimumPixels(activeSidePanelLayout.root, 'horizontal')
+      // The shared toolbar sits above the pane tree and consumes shell height.
+      + TERMINAL_SIDE_PANEL_TOOLBAR_HEIGHT
     : 0;
   const shellWidth = requestedShellWidth > 0
     ? clampTerminalSidePanelWidth(
@@ -725,12 +873,67 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
       sidePanelContentMinimumWidth,
     )
     : 0;
+  const shellHeight = requestedShellHeight > 0
+    ? clampTerminalSidePanelHeight(
+      requestedShellHeight,
+      availableSurfaceHeight,
+      sidePanelContentMinimumHeight,
+    )
+    : 0;
+  const shellSize = isBottomDock ? shellHeight : shellWidth;
 
   const handleSidePanelResizeStart = useCallback((event: React.MouseEvent) => {
     if (!isSidePanelOpenForCurrentTab) return;
     event.preventDefault();
     shellResizeCleanupRef.current?.();
     terminalLayoutSuppressStore.begin();
+    if (sidePanelPosition === 'bottom') {
+      const startY = event.clientY;
+      const startHeight = shellRef.current?.getBoundingClientRect().height ?? shellHeight;
+      let lastHeight = startHeight;
+      let rafId: number | null = null;
+
+      // Dragging the top edge upward grows the bottom-docked panel.
+      const onMouseMove = (moveEvent: MouseEvent) => {
+        lastHeight = clampTerminalSidePanelHeight(
+          startHeight + (startY - moveEvent.clientY),
+          availableSurfaceHeightRef.current,
+          sidePanelContentMinimumHeight,
+        );
+        if (rafId !== null) return;
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          setResizePreviewHeight(lastHeight);
+        });
+      };
+      let cleanedUp = false;
+      const cleanup = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        if (rafId !== null) cancelAnimationFrame(rafId);
+        rafId = null;
+        terminalLayoutSuppressStore.end();
+        window.removeEventListener('mousemove', onMouseMove);
+        window.removeEventListener('mouseup', finish);
+        window.removeEventListener('blur', finish);
+        if (shellResizeCleanupRef.current === cleanup) shellResizeCleanupRef.current = null;
+      };
+      const finish = () => {
+        // A narrow viewport may temporarily force the shell below its saved
+        // height. A click or blur must not overwrite that preference.
+        if (lastHeight !== startHeight && lastHeight >= TERMINAL_SIDE_PANEL_MIN_HEIGHT) {
+          setSidePanelHeight(lastHeight);
+          persistSidePanelHeight(lastHeight);
+        }
+        setResizePreviewHeight(null);
+        cleanup();
+      };
+      shellResizeCleanupRef.current = cleanup;
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', finish);
+      window.addEventListener('blur', finish);
+      return;
+    }
     const startX = event.clientX;
     const startWidth = shellRef.current?.getBoundingClientRect().width ?? shellWidth;
     let lastWidth = startWidth;
@@ -773,10 +976,14 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
     window.addEventListener('blur', finish);
   }, [
     isSidePanelOpenForCurrentTab,
+    persistSidePanelHeight,
     persistSidePanelWidth,
+    setSidePanelHeight,
     setSidePanelWidth,
+    sidePanelContentMinimumHeight,
     sidePanelContentMinimumWidth,
     sidePanelPosition,
+    shellHeight,
     shellWidth,
   ]);
 
@@ -863,6 +1070,30 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
     ? getFocusedSidePanelPane(activeSidePanelLayout)
     : null;
   const focusedPaneHost = focusedPane ? paneHosts.get(focusedPane.tool) ?? null : null;
+  const activeSidePanelPanes = useMemo(
+    () => activeSidePanelLayout ? collectSidePanelPanes(activeSidePanelLayout.root) : [],
+    [activeSidePanelLayout],
+  );
+  const activeMagnifiedPane = !!activeTabId && magnifiedPane?.tabId === activeTabId
+    ? magnifiedPane
+    : null;
+  const magnifiedSidePane = activeMagnifiedPane?.target.kind === 'side-panel'
+    ? activeSidePanelPanes.find((pane) => pane.id === activeMagnifiedPane.target.paneId) ?? null
+    : null;
+  const paneMagnificationShortcutLabel = getPaneMagnificationShortcutLabel(keyBindings, hotkeyScheme);
+  const [showMagnificationHint, setShowMagnificationHint] = useState(false);
+  useEffect(() => {
+    if (!magnifiedSidePane) {
+      setShowMagnificationHint(false);
+      return undefined;
+    }
+    setShowMagnificationHint(true);
+    const timerId = window.setTimeout(() => setShowMagnificationHint(false), 1800);
+    return () => window.clearTimeout(timerId);
+  }, [magnifiedSidePane]);
+  const panePortalHosts = useMemo(() => {
+    return resolveMagnifiedSidePanelHosts(paneHosts, magnifiedSidePane, overlayHost);
+  }, [magnifiedSidePane, overlayHost, paneHosts]);
   const [focusedPaneSplitAvailability, setFocusedPaneSplitAvailability] = useState({
     horizontal: false,
     vertical: false,
@@ -923,18 +1154,21 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
     }
     return parts;
   }, [activeSidePanelTab, partitionSidePanelTabs]);
+  // Bottom dock spans the full layer width (below the workspace focus
+  // sidebar row), so measure tab overflow against the terminal layer itself.
+  const sidePanelTabFitWidth = isBottomDock ? terminalLayerWidth : shellWidth;
   const { shown: shownSidePanelTabs, collapsed: collapsedSidePanelTabs } = useMemo(
     () => fitTerminalSidePanelTabs({
       shown: configuredShownSidePanelTabs,
       collapsed: configuredCollapsedSidePanelTabs,
       active: activeSidePanelTab,
-      maxShown: getTerminalSidePanelMaxShownTools(shellWidth),
+      maxShown: getTerminalSidePanelMaxShownTools(sidePanelTabFitWidth),
     }),
     [
       activeSidePanelTab,
       configuredCollapsedSidePanelTabs,
       configuredShownSidePanelTabs,
-      shellWidth,
+      sidePanelTabFitWidth,
     ],
   );
 
@@ -952,17 +1186,31 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
   );
 
   return (
+    <>
     <div
       ref={shellRef}
+      inert={activeMagnifiedPane ? true : undefined}
       style={{
-        width: shellWidth,
-        maxWidth: getTerminalSidePanelMaxWidth(availableSurfaceWidth),
+        ...(isBottomDock
+          ? {
+            height: shellSize,
+            maxHeight: getTerminalSidePanelMaxHeight(availableSurfaceHeight),
+          }
+          : {
+            width: shellSize,
+            maxWidth: getTerminalSidePanelMaxWidth(availableSurfaceWidth),
+          }),
         contain: 'layout paint style',
       }}
       className={cn(
-        'flex-shrink-0 h-full relative z-20',
-        shellWidth === 0 && 'overflow-hidden',
-        sidePanelPosition === 'right' && 'order-last',
+        'flex-shrink-0 relative z-20',
+        isBottomDock ? 'w-full' : 'h-full',
+        shellSize === 0 && 'overflow-hidden',
+        // Bottom dock: the section is the first child of the outer flex-col
+        // (stable tree position across dock changes); order-last keeps it
+        // visually below the workspace row. Side dock: order-last moves it to
+        // the right edge when docked right.
+        (sidePanelPosition === 'right' || isBottomDock) && 'order-last',
       )}
       data-section="terminal-side-panel-shell"
       data-side-panel-position={sidePanelPosition}
@@ -970,8 +1218,13 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
       {isSidePanelOpenForCurrentTab && !isAiShellForceHidden && (
         <div
           className={cn(
-            'absolute top-0 h-full w-2 cursor-ew-resize z-30',
-            sidePanelPosition === 'left' ? 'right-[-3px]' : 'left-[-3px]',
+            'absolute z-30',
+            isBottomDock
+              ? 'left-0 w-full h-2 cursor-ns-resize top-[-3px]'
+              : cn(
+                'top-0 h-full w-2 cursor-ew-resize',
+                sidePanelPosition === 'left' ? 'right-[-3px]' : 'left-[-3px]',
+              ),
           )}
           data-section="terminal-side-panel-resizer"
           onMouseDown={handleSidePanelResizeStart}
@@ -997,6 +1250,9 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
             : {}),
           ...(isSidePanelOpenForCurrentTab && sidePanelPosition === 'right'
             ? { borderLeft: `1px solid ${sidePanelTheme.separator}` }
+            : {}),
+          ...(isSidePanelOpenForCurrentTab && isBottomDock
+            ? { borderTop: `1px solid ${sidePanelTheme.separator}` }
             : {}),
         }}
       >
@@ -1112,6 +1368,25 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
                 </div>
               </ToolbarOverflowMenu>
               <div className="flex-1" />
+              {focusedPane && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Btn
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      style={{ color: sidePanelTheme.mutedFg }}
+                      aria-label={t('terminal.paneMagnification.magnify')}
+                      onClick={() => handleMagnifySidePanelPane(focusedPane.id)}
+                    >
+                      <Maximize2 size={15} />
+                    </Btn>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">
+                    {t('terminal.paneMagnification.magnify')}
+                  </TooltipContent>
+                </Tooltip>
+              )}
               <SidePanelSplitMenu
                 direction="horizontal"
                 items={sidePanelTabItems}
@@ -1145,15 +1420,27 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
                     size="icon"
                     className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
                     style={{ color: sidePanelTheme.mutedFg }}
-                    onClick={() => setSidePanelPosition((p: 'left' | 'right') => (p === 'left' ? 'right' : 'left'))}
+                    disabled={!activeSidePanelLayout || !ctx.onSaveWorkspaceLayoutAsDefault}
+                    aria-label={t('terminal.layer.saveLayoutAsDefault')}
+                    onClick={() => {
+                      if (activeSidePanelLayout) {
+                        ctx.onSaveWorkspaceLayoutAsDefault?.(activeSidePanelLayout);
+                      }
+                    }}
                   >
-                    {sidePanelPosition === 'left' ? <PanelRight size={15} /> : <PanelLeft size={15} />}
+                    <Save size={15} />
                   </Btn>
                 </TooltipTrigger>
                 <TooltipContent side="bottom">
-                  {sidePanelPosition === 'left' ? t('terminal.layer.movePanelRight') : t('terminal.layer.movePanelLeft')}
+                  {t('terminal.layer.saveLayoutAsDefault')}
                 </TooltipContent>
               </Tooltip>
+              <SidePanelDockSelect
+                position={sidePanelPosition}
+                onSelect={setSidePanelPosition}
+                t={t}
+                buttonColor={sidePanelTheme.mutedFg}
+              />
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Btn
@@ -1195,11 +1482,61 @@ function TerminalLayerSidePanelInner({ ctx }: { ctx: SidePanelContext }) {
           />
           <MemoizedSidePanelMountedContent
             ctx={ctx}
-            paneHosts={paneHosts}
+            paneHosts={panePortalHosts}
             parkingHost={parkingHost}
           />
         </div>
       </div>
     </div>
+    {overlayRoot && magnifiedSidePane && createPortal(
+      <div className="absolute inset-0 z-[70]" data-section="pane-magnification-overlay">
+        <div
+          className="absolute inset-0 bg-background/55 backdrop-blur-[1px]"
+          aria-hidden="true"
+          data-section="pane-magnification-backdrop"
+        />
+        <div
+          className="absolute inset-3 flex flex-col overflow-hidden rounded-md border bg-background shadow-2xl animate-in fade-in zoom-in-95 duration-150"
+          style={{
+            borderColor: sidePanelTheme.accent,
+            backgroundColor: sidePanelTheme.termBg,
+            color: sidePanelTheme.termFg,
+          }}
+        >
+          <div
+            className="flex h-8 items-center gap-2 border-b px-2"
+            style={{ borderColor: sidePanelTheme.separator }}
+          >
+            <span className="min-w-0 flex-1 truncate text-xs font-medium">
+              {sidePanelToolLabels.get(magnifiedSidePane.tool) ?? magnifiedSidePane.tool}
+            </span>
+            <button
+              type="button"
+              className="grid h-6 w-6 place-items-center rounded hover:bg-white/10"
+              aria-label={t('terminal.paneMagnification.restore')}
+              onClick={handleRestoreMagnifiedPane}
+            >
+              <Minimize2 size={14} />
+            </button>
+          </div>
+          <div
+            ref={setOverlayHost}
+            className="relative flex-1 min-h-0 overflow-hidden [contain:strict]"
+            data-section="pane-magnification-content"
+          />
+        </div>
+        {showMagnificationHint && (
+          <div
+            className="pointer-events-none absolute bottom-4 right-4 z-[80] rounded border border-border/70 bg-background/90 px-2 py-1 text-[10px] text-muted-foreground shadow-sm animate-in fade-in duration-150"
+            data-section="pane-magnification-hint"
+          >
+            {t('terminal.paneMagnification.hint')}: {sidePanelToolLabels.get(magnifiedSidePane.tool) ?? magnifiedSidePane.tool}
+            {paneMagnificationShortcutLabel ? ` · ${paneMagnificationShortcutLabel} / Esc` : ' · Esc'}
+          </div>
+        )}
+      </div>,
+      overlayRoot,
+    )}
+    </>
   );
 }

@@ -5,6 +5,7 @@ export interface RemoteFile {
   lastModified: string;
   linkTarget?: 'file' | 'directory' | null; // For symlinks: the type of the target, or null if broken
   permissions?: string; // rwx format for owner/group/others e.g. "rwxr-xr-x"
+  owner?: string;
   hidden?: boolean; // Windows hidden attribute (only set for local Windows filesystem)
 }
 
@@ -38,4 +39,9 @@ export interface Workspace {
   // Absent on legacy workspaces — the tab falls back to the default-title
   // string check for those. See resolveWorkspaceTabLabel.
   autoTitle?: boolean;
+  // `title` was composed from the panes' connection labels (e.g. a merged
+  // workspace "01/02"), not chosen by the user. The store keeps such titles
+  // synchronized with the workspace's membership and pane renames until the
+  // user renames the workspace (which clears this flag).
+  generatedTitle?: boolean;
 }

@@ -20,7 +20,7 @@ import { resolveSessionCodingCliProvider } from '../../domain/codingCliProviderM
 import type { CodingCliProvider } from '../../domain/codingCliProviders';
 import { resolveCodingCliActivityPhase, type CodingCliActivityPhase } from '../../domain/codingCliTitleParse';
 import { resolveSessionTabTitle, resolveWorkspaceTabLabel } from '../../domain/sessionTabTitle';
-import type { DynamicTabTitleMode } from '../../domain/models';
+import type { DynamicTabTitleMode, TerminalTabDoubleClickBehavior } from '../../domain/models';
 import { CodingCliProviderIcon } from '../icons/CodingCliProviderIcon';
 import { cn } from '../../lib/utils';
 import { Host, TerminalSession, Workspace } from '../../types';
@@ -242,9 +242,28 @@ export const formatSessionTopTabLabel = (
 };
 
 export const createTopTabCopyDoubleClickHandler = (
-  onCopySession: (sessionId: string) => void,
-  sessionId: string,
-): React.MouseEventHandler<HTMLDivElement> => () => onCopySession(sessionId);
+  onCopy: (id: string) => void,
+  id: string,
+): React.MouseEventHandler<HTMLDivElement> => () => onCopy(id);
+
+export const createTopTabSessionDoubleClickHandler = ({
+  behavior,
+  onCopySession,
+  onDuplicateSession,
+  sessionId,
+}: {
+  behavior: TerminalTabDoubleClickBehavior;
+  onCopySession: (sessionId: string) => void;
+  onDuplicateSession?: (sessionId: string) => void;
+  sessionId: string;
+}): React.MouseEventHandler<HTMLDivElement> => () => {
+  if (behavior === 'disabled') return;
+  if (behavior === 'duplicate') {
+    (onDuplicateSession ?? onCopySession)(sessionId);
+    return;
+  }
+  onCopySession(sessionId);
+};
 
 export const stopCloseButtonDoubleClickPropagation = (
   event: Pick<React.MouseEvent, 'stopPropagation'>,
@@ -293,7 +312,7 @@ export const WindowControls: React.FC = memo(() => {
   const closeControlClassName = 'window-control-btn window-control-btn--close app-no-drag';
 
   return (
-    <div className="ml-2 flex items-center h-7 overflow-visible app-no-drag">
+    <div className="ml-2 flex h-7 items-center overflow-visible app-no-drag">
       <button type="button" className={controlClassName} onClick={handleMinimize}>
         <Minus size={16} />
       </button>
@@ -708,10 +727,12 @@ interface SessionTopTabProps {
   onCloseSession: (sessionId: string, e?: React.MouseEvent) => void;
   onRenameSession: (sessionId: string) => void;
   onCopySession: (sessionId: string) => void;
+  onDuplicateSession?: (sessionId: string) => void;
   onCopySessionToNewWindow: (sessionId: string) => void;
   onEditHost?: (host: Host) => void;
   renderBulkCloseItems: RenderBulkCloseItems;
   dynamicTabTitleMode?: DynamicTabTitleMode;
+  tabDoubleClickBehavior: TerminalTabDoubleClickBehavior;
   t: TranslateFn;
   tabAnimationClass?: string;
   shortcutNumber?: number;
@@ -733,16 +754,23 @@ export const SessionTopTab: React.FC<SessionTopTabProps> = memo(({
   onCloseSession,
   onRenameSession,
   onCopySession,
+  onDuplicateSession,
   onCopySessionToNewWindow,
   onEditHost,
   renderBulkCloseItems,
   dynamicTabTitleMode,
+  tabDoubleClickBehavior,
   t,
   tabAnimationClass,
   shortcutNumber,
 }) => {
   // Per-session presentation: sibling title/provider updates do not re-render this tab.
   const session = usePresentedSession(sessionProp);
+  const reconnectActive = React.useSyncExternalStore(
+    terminalReconnectRegistry.subscribe,
+    () => terminalReconnectRegistry.isActive(session.id),
+    () => false,
+  );
   const isActive = useIsTabActive(session.id);
   // Per-session store snapshot so sibling activity dots do not re-render this tab.
   const hasActivity = useSessionActivity(session.id);
@@ -750,8 +778,13 @@ export const SessionTopTab: React.FC<SessionTopTabProps> = memo(({
     activeTabStore.setActiveTabId(session.id);
   }, [session.id]);
   const handleDoubleClick = useMemo(
-    () => createTopTabCopyDoubleClickHandler(onCopySession, session.id),
-    [onCopySession, session.id],
+    () => createTopTabSessionDoubleClickHandler({
+      behavior: tabDoubleClickBehavior,
+      onCopySession,
+      onDuplicateSession,
+      sessionId: session.id,
+    }),
+    [tabDoubleClickBehavior, onCopySession, onDuplicateSession, session.id],
   );
   const addressTooltip = formatSessionTopTabTooltip(session);
   const tabTitle = formatSessionTopTabLabel(session, dynamicTabTitleMode);
@@ -863,9 +896,11 @@ export const SessionTopTab: React.FC<SessionTopTabProps> = memo(({
         sessionId={session.id}
         onCloseSession={onCloseSession}
         onCopySession={onCopySession}
+        onDuplicateSession={onDuplicateSession}
         onCopySessionToNewWindow={onCopySessionToNewWindow}
         onReconnectSession={terminalReconnectRegistry.request}
         sessionStatus={session.status}
+        reconnectActive={reconnectActive}
         onRenameSession={onRenameSession}
         editHost={host}
         onEditHost={onEditHost}

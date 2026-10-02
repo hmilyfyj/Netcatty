@@ -7,6 +7,11 @@ import React, { memo, useCallback } from 'react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 import { cn } from '../../lib/utils';
 import { SftpFileEntry } from '../../types';
+import {
+    sftpFileRowDensityClass,
+    sftpFileRowIconDensityClass,
+    type SftpListDensity,
+} from '../../domain/sftpListDensity';
 import { buildSftpColumnTemplate, formatBytes, formatDate, getFileIcon, isNavigableDirectory, type ColumnWidths, type SftpColumnVisibility } from './utils';
 
 interface SftpFileRowProps {
@@ -24,6 +29,7 @@ interface SftpFileRowProps {
     onDragOver: (entry: SftpFileEntry, e: React.DragEvent) => void;
     onDragLeave: () => void;
     onDrop: (entry: SftpFileEntry, e: React.DragEvent) => void;
+    density?: SftpListDensity;
 }
 
 const SftpFileRowInner: React.FC<SftpFileRowProps> = ({
@@ -41,6 +47,7 @@ const SftpFileRowInner: React.FC<SftpFileRowProps> = ({
     onDragOver,
     onDragLeave,
     onDrop,
+    density = "comfortable",
 }) => {
     const isParentDir = entry.name === '..';
     // A symlink pointing to a directory behaves like a directory (navigable, accepts drops)
@@ -81,8 +88,10 @@ const SftpFileRowInner: React.FC<SftpFileRowProps> = ({
             onDrop={handleDrop}
             onClick={handleSelect}
             onDoubleClick={handleOpen}
+            data-sftp-list-density={density}
             className={cn(
-                "px-4 py-2 items-center cursor-pointer text-sm",
+                "items-center cursor-pointer",
+                sftpFileRowDensityClass(density),
                 isSelectionVisible
                     ? "bg-accent text-accent-foreground hover:bg-accent"
                     : "hover:bg-accent/50",
@@ -90,9 +99,10 @@ const SftpFileRowInner: React.FC<SftpFileRowProps> = ({
             )}
             style={{ display: 'grid', gridTemplateColumns: buildSftpColumnTemplate(columnWidths, visibleColumns) }}
         >
-            <div className="flex items-center gap-3 min-w-0">
+            <div className={cn("flex items-center min-w-0", density === "compact" ? "gap-2" : "gap-3")}>
                 <div className={cn(
-                    "h-7 w-7 rounded flex items-center justify-center shrink-0 relative",
+                    "rounded flex items-center justify-center shrink-0 relative",
+                    sftpFileRowIconDensityClass(density),
                     isSelectionVisible
                         ? "bg-accent-foreground/10 text-accent-foreground"
                         : isNavDir
@@ -141,6 +151,11 @@ const SftpFileRowInner: React.FC<SftpFileRowProps> = ({
                     {isSymlinkToDirectory ? 'link → folder' : entry.type === 'directory' ? 'folder' : entry.type === 'symlink' ? 'link' : entry.name.split('.').pop()?.toLowerCase() || 'file'}
                 </span>
             )}
+            {visibleColumns.owner && (
+                <span className={cn("text-xs truncate text-right", isSelectionVisible ? "text-accent-foreground/85" : "text-muted-foreground")}>
+                    {isParentDir ? '' : (entry.owner || '--')}
+                </span>
+            )}
         </div>
     );
 };
@@ -155,12 +170,15 @@ const areEqual = (prev: SftpFileRowProps, next: SftpFileRowProps): boolean => {
     if (prev.columnWidths.modified !== next.columnWidths.modified) return false;
     if (prev.columnWidths.size !== next.columnWidths.size) return false;
     if (prev.columnWidths.type !== next.columnWidths.type) return false;
+    if (prev.columnWidths.owner !== next.columnWidths.owner) return false;
     if (prev.visibleColumns.modified !== next.visibleColumns.modified) return false;
     if (prev.visibleColumns.size !== next.visibleColumns.size) return false;
     if (prev.visibleColumns.type !== next.visibleColumns.type) return false;
+    if (prev.visibleColumns.owner !== next.visibleColumns.owner) return false;
     // Compare callbacks - important for ".." entry which has static properties
     if (prev.onOpen !== next.onOpen) return false;
     if (prev.onSelect !== next.onSelect) return false;
+    if (prev.density !== next.density) return false;
     const prevEntry = prev.entry;
     const nextEntry = next.entry;
     return (
@@ -170,7 +188,8 @@ const areEqual = (prev: SftpFileRowProps, next: SftpFileRowProps): boolean => {
         prevEntry.lastModified === nextEntry.lastModified &&
         prevEntry.linkTarget === nextEntry.linkTarget &&
         prevEntry.sizeFormatted === nextEntry.sizeFormatted &&
-        prevEntry.lastModifiedFormatted === nextEntry.lastModifiedFormatted
+        prevEntry.lastModifiedFormatted === nextEntry.lastModifiedFormatted &&
+        prevEntry.owner === nextEntry.owner
     );
 };
 

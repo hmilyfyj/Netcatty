@@ -6,7 +6,7 @@
 
 - 报告 Netcatty 返回的 `code` 与 `message`。
 - `APP_NOT_RUNNING`：提示启动 Netcatty 桌面应用。
-- `SESSION_NOT_FOUND`：重新执行 `env --json --chat-session <chat-session-id>` 获取当前 scope 内 session。
+- `SESSION_NOT_FOUND`：重新执行 `env --json` 获取宿主环境绑定的当前 scope 内 session。
 - `COMMAND_ALREADY_RUNNING`：等待当前 session 的在途命令完成，或使用已有 job 的 poll/stop。
 - `RPC_TIMEOUT`：说明当前调用超过 Netcatty RPC 等待时间，长任务场景切换到 `job-start`。
 - 审批拒绝或 observer 模式：报告当前权限状态。

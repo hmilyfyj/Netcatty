@@ -21,6 +21,7 @@ npm run build
 - 插件运行时：`npm run test:plugin-runtime`；真实窗口冒烟：`npm run test:plugin-runtime:electron`。
 - 渲染进程保持 ASCII，除非已有文件本身需要非 ASCII。
 - 给上游 GitHub 开 issue 必须带 `[Bug]` / `[Feature]` / `[Other]` 前缀，并填 `.github/ISSUE_TEMPLATE/`。
+- 本机 npm 若设置 `ignore-scripts=true`，依赖虽安装成功但 patch-package、Electron 与 native rebuild 未执行。新 checkout 使用 `npm ci --ignore-scripts=false`，确认 postinstall 日志后再测试/打包；不要修改用户全局 npm 配置。
 
 ## 本仓 MR
 

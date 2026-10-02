@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { mcpEnvPairsToObject } = require("./injectMcp.cjs");
+const { withExclusiveProcessEnv } = require("./processEnvGate.cjs");
 const {
   buildOpenCodeNativeSkillsPermissionRules,
   buildOpenCodeSkillsPermissionRules,
@@ -59,7 +60,7 @@ function toOpenCodeMcpConfig(injectedMcpServers) {
   return mcp;
 }
 
-function buildOpenCodeConfig({ model, injectedMcpServers, toolIntegrationMode, skillsPathAllowlist } = {}) {
+function buildOpenCodeConfig({ model, injectedMcpServers, toolIntegrationMode, skillsPathAllowlist, nativeSkillOptions } = {}) {
   const allowBash = toolIntegrationMode === "skills";
   const permission = {
     edit: "deny",
@@ -71,10 +72,10 @@ function buildOpenCodeConfig({ model, injectedMcpServers, toolIntegrationMode, s
     // Keep external access locked down, but let OpenCode's native skills
     // (e.g. ~/.opencode/skills, ~/.config/opencode/skills) read their own
     // reference files in every mode (issue #1939).
-    ...buildOpenCodeNativeSkillsPermissionRules(),
+    ...buildOpenCodeNativeSkillsPermissionRules(nativeSkillOptions),
   };
   if (allowBash && Array.isArray(skillsPathAllowlist) && skillsPathAllowlist.length > 0) {
-    Object.assign(permission, buildOpenCodeSkillsPermissionRules(skillsPathAllowlist));
+    Object.assign(permission, buildOpenCodeSkillsPermissionRules(skillsPathAllowlist, nativeSkillOptions));
   }
   const config = {
     share: "disabled",
@@ -475,36 +476,22 @@ async function createDefaultOpenCode(options, env, binPath) {
   }
 
   const { env: nextEnv, cleanup: cleanupShim } = createOpenCodeProcessEnv(env, binPath);
-  const previous = {};
-  for (const [key, value] of Object.entries(nextEnv)) {
-    previous[key] = process.env[key];
-    process.env[key] = String(value);
-  }
 
   // Restore the Electron main-process environment as soon as the child has been
   // spawned. Keeping PATH/OPENCODE_BIN pointed at a temporary shim for the
   // server lifetime (or list-models idle window) can leak into later turns and
   // other spawns; see #2184 review. The on-disk shim stays until close() so a
   // still-running child that re-resolves helpers does not race a deleted path.
-  const restoreProcessEnv = () => {
-    if (restoreProcessEnv.done) return;
-    restoreProcessEnv.done = true;
-    for (const key of Object.keys(nextEnv)) {
-      if (previous[key] === undefined) delete process.env[key];
-      else process.env[key] = previous[key];
-    }
-  };
-
+  // Serialize the mutation so concurrent chats cannot swap
+  // NETCATTY_CLI_CHAT_SESSION_ID while createOpencode is still spawning.
   const cleanup = () => {
     if (cleanup.done) return;
     cleanup.done = true;
-    restoreProcessEnv();
     cleanupShim();
   };
 
   try {
-    const opencode = await sdk.createOpencode(options);
-    restoreProcessEnv();
+    const opencode = await withExclusiveProcessEnv(nextEnv, () => sdk.createOpencode(options));
     const originalClose = opencode.server?.close?.bind(opencode.server);
     if (typeof originalClose === "function") {
       opencode.server.close = () => {
@@ -933,6 +920,8 @@ module.exports = {
   classifyOpenCodeSpawnError,
   closeOpenCodeInstance,
   createOpenCodeProcessEnv,
+  getOpenCodeDefaultModelId,
+  getOpenCodeSessionIdFromEvent,
   withOpenCodeProcessEnv,
   listOpenCodeModels,
   mapOpenCodeModels,

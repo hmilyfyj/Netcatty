@@ -1,4 +1,4 @@
-import type { HostProtocol, TerminalSession } from "./terminal";
+import type { HostProtocol } from "./connection";
 
 export interface TerminalGroup {
   id: string;

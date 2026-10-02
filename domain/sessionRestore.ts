@@ -31,6 +31,11 @@ export type RestoredTerminalSession = {
   fontSizeOverride?: boolean;
   customName?: string;
   lastCwd?: string;
+  /**
+   * Duplicate-session marker: the restored clone must dial a fresh connection
+   * (fresh auth) instead of borrowing a pooled transport for this endpoint.
+   */
+  requireFreshConnection?: boolean;
   restoreState: "restored-disconnected";
 };
 
@@ -122,6 +127,11 @@ const sanitizeSerialConfig = (value: unknown): SerialConfig | undefined => {
     ...(isOneOf(value.backspaceBehavior, ["default", "ctrl-h"] as const)
       ? { backspaceBehavior: value.backspaceBehavior }
       : {}),
+    // Missing value = legacy session saved before byte-oriented backspace
+    // existed; the runtime defaults to enabled (byte-oriented deletion).
+    ...(readBoolean(value, "byteOrientedBackspace") !== undefined
+      ? { byteOrientedBackspace: readBoolean(value, "byteOrientedBackspace") }
+      : {}),
   };
 };
 
@@ -157,6 +167,7 @@ const restoreSession = (session: TerminalSession): RestoredTerminalSession => {
     ...(session.fontSizeOverride !== undefined ? { fontSizeOverride: session.fontSizeOverride } : {}),
     ...(session.customName ? { customName: session.customName } : {}),
     ...(session.lastCwd ? { lastCwd: session.lastCwd } : {}),
+    ...(session.requireFreshConnection ? { requireFreshConnection: true } : {}),
     status: "disconnected",
     restoreState: "restored-disconnected",
   };
@@ -202,6 +213,9 @@ const restoreSessionFromUnknown = (value: unknown): RestoredTerminalSession | nu
     ...(readBoolean(value, "fontSizeOverride") !== undefined ? { fontSizeOverride: readBoolean(value, "fontSizeOverride") } : {}),
     ...(readString(value, "customName") ? { customName: readString(value, "customName") } : {}),
     ...(readString(value, "lastCwd") ? { lastCwd: readString(value, "lastCwd") } : {}),
+    // Sanitized to a literal `true`: only an active duplicate-session marker is
+    // persisted, so a corrupted value (or `false`/absent) must not enable it.
+    ...(readBoolean(value, "requireFreshConnection") === true ? { requireFreshConnection: true } : {}),
     status: "disconnected",
     restoreState: "restored-disconnected",
   };
@@ -218,6 +232,7 @@ type RestoreCwdSession = Pick<TerminalSession, "status"> & {
   lastCwd?: string;
   moshEnabled?: boolean;
   etEnabled?: boolean;
+  requireFreshConnection?: boolean;
 };
 
 const isRestoreCwdPathEligible = (cwd: string | undefined): cwd is string => {
@@ -239,6 +254,9 @@ export function shouldAttemptRestoreCwd({
 }): boolean {
   if (!enabled) return false;
   if (!isRestoredDisconnectedSession(session)) return false;
+  // Restored duplicates still perform a fresh remote login, which may stop
+  // at a bastion selector rather than the previous target's shell.
+  if (session.requireFreshConnection === true && session.protocol !== "local") return false;
   return isCwdInjectionEligible({ session: { ...session, cwd: session.lastCwd }, isNetworkDevice });
 }
 
@@ -388,6 +406,7 @@ const restoreWorkspace = (workspace: Workspace, root: WorkspaceNode, sessionIds:
     // Preserve explicit-title state across restore; the boolean guard keeps a
     // deliberate `autoTitle: false` (a user-named workspace) from being dropped.
     ...(typeof workspace.autoTitle === "boolean" ? { autoTitle: workspace.autoTitle } : {}),
+    ...(workspace.generatedTitle === true ? { generatedTitle: true } : {}),
   };
 };
 

@@ -50,6 +50,8 @@ export interface CompletionSuggestion {
   score: number;
   /** For history entries: execution frequency */
   frequency?: number;
+  /** Matching rule used by recent history surfaced during path completion. */
+  historyMatch?: "path-argument";
   /** For path suggestions: file type */
   fileType?: "file" | "directory" | "symlink";
   /** For snippet suggestions: the source snippet (used by the accept path). */
@@ -249,6 +251,8 @@ export async function getCompletions(
     sessionId?: string;
     /** Connection protocol (ssh, local, telnet, serial) */
     protocol?: string;
+    /** Skip remote/local path listings that need extra SSH exec (single-channel bastions). */
+    skipPathCompletion?: boolean;
     /** Current working directory (from OSC 7) */
     cwd?: string;
     cwdSource?: AutocompleteCwdSource;
@@ -330,13 +334,14 @@ export async function getCompletions(
         source: "history",
         score: 720 - index,
         frequency: entry.frequency,
+        historyMatch: "path-argument",
       } satisfies CompletionSuggestion;
       suggestions.push(suggestion);
       seenSuggestionTexts.add(suggestion.text);
     }
   }
 
-  const canQueryPaths = options.protocol === "local" || options.sessionId !== undefined;
+  const canQueryPaths = !options.skipPathCompletion && (options.protocol === "local" || options.sessionId !== undefined);
 
   const pathEntries = canQueryPaths && pathCheck.shouldComplete
     ? await getPathSuggestionsWithinBudget(
@@ -373,8 +378,16 @@ export async function getCompletions(
     seenSuggestionTexts.add(suggestion.text);
   }
 
-  // 3. Fuzzy history fallback (if prefix match yields few results)
-  if (!preferPathSuggestions && suggestions.length < 3 && input.length >= 2) {
+  // 3. Fuzzy history fallback while typing the command name. Once arguments
+  // are present, history completion is prefix-only: fuzzy matching the whole
+  // line can borrow characters from later paths and keep an incompatible
+  // middle argument visible (issue #3088).
+  if (
+    ctx.wordIndex === 0 &&
+    !preferPathSuggestions &&
+    suggestions.length < 3 &&
+    input.length >= 2
+  ) {
     const fuzzyMatches = fuzzyQueryHistory(input, {
       ...historyOpts,
       limit: 5,

@@ -3,16 +3,28 @@ import type React from 'react';
 import type { Host, HostProtocol, TerminalSession } from '../../types';
 import type { PassphraseRequest } from '../../components/PassphraseModal';
 import type { TerminalPopupPayload } from '../../domain/systemManager/types';
-import { getEffectiveHostDistro, classifyDistroId, shouldProbeSessionCwd } from '../../domain/host';
+import { getEffectiveHostDistro, classifyDistroId, hostRestrictsExtraSshChannels, shouldProbeSessionCwd } from '../../domain/host';
+import { getAvailablePaneMagnificationController } from '../../domain/paneMagnification';
 import { sanitizeHostIconFields } from '../../domain/hostIcon';
 import { resolveEffectiveTerminalProtocol } from '../../domain/terminalProtocol';
 import { getTerminalPassthroughActions } from '../state/useGlobalHotkeys';
 import { tabShortcutDigitFromEvent } from '../../domain/models/keyBindings';
+import { isPortForwardingAutoReconnectEnabled } from '../../domain/portForwardingReconnect';
 import { buildNumberShortcutTabTargets } from './tabShortcutTargets';
 import { captureInheritedCwd } from '../state/inheritedCwd';
+import { fromEditorTabId, isEditorTabId } from '../state/activeTabStore';
+import { resolveBatchTabCloseFocus } from '../state/pluginViewTabStore';
+import { getSessionSurfaceTabId } from '../state/terminalGroups';
+import { resolveGlobalBroadcastSessionIds } from '../../domain/terminalBroadcast';
 
 type AppContextGetter = () => Record<string, any>;
 const TERMINAL_PASSTHROUGH_ACTIONS = getTerminalPassthroughActions();
+const forwardedNativeShortcutEvents = new WeakSet<KeyboardEvent>();
+
+export function markForwardedNativeShortcutEvent(event: KeyboardEvent): KeyboardEvent {
+  forwardedNativeShortcutEvents.add(event);
+  return event;
+}
 
 async function deliverKeyboardInteractiveResponse(
   ctx: Record<string, any>,
@@ -144,7 +156,7 @@ export function handleTrayTogglePortForwardImpl(getCtx: AppContextGetter, ruleId
         const effectiveHost = resolveEffectiveHost(host);
         void startTunnel(rule, effectiveHost, hosts.map(resolveEffectiveHost), keys, identities, (status, error) => {
           if (status === "error" && error) toast.error(error);
-        }, rule.autoStart, terminalSettings, knownHosts);
+        }, isPortForwardingAutoReconnectEnabled(rule), terminalSettings, knownHosts);
       }
       return;
     }
@@ -259,8 +271,18 @@ export function handleGlobalHotkeyKeyDownImpl(getCtx: AppContextGetter, e: Keybo
     const quickSwitchBinding = keyBindings.find((binding) => binding.action === 'quickSwitch');
     const quickSwitchKeyStr = quickSwitchBinding ? (isMac ? quickSwitchBinding.mac : quickSwitchBinding.pc) : null;
     const isQuickSwitchHotkey = quickSwitchKeyStr ? matchesKeyBinding(e, quickSwitchKeyStr, isMac) : false;
+    const paneZoomBinding = keyBindings.find((binding) => binding.action === 'togglePaneZoom');
+    const paneZoomKeyStr = paneZoomBinding ? (isMac ? paneZoomBinding.mac : paneZoomBinding.pc) : null;
+    const isPaneZoomHotkey = paneZoomKeyStr ? matchesKeyBinding(e, paneZoomKeyStr, isMac) : false;
 
-    if ((isFormElement || isMonacoElement) && !isXtermInput && e.key !== 'Escape' && !isQuickSwitchHotkey) {
+    if (
+      (isFormElement || isMonacoElement)
+      && !isXtermInput
+      && e.key !== 'Escape'
+      && !isQuickSwitchHotkey
+      && !isPaneZoomHotkey
+      && !forwardedNativeShortcutEvents.has(e)
+    ) {
       return;
     }
 
@@ -293,6 +315,16 @@ export function handleGlobalHotkeyKeyDownImpl(getCtx: AppContextGetter, e: Keybo
         continue;
       }
 
+      // An unavailable broadcast action must leave the chord to the terminal
+      // (notably tmux's Ctrl+B prefix). Dispatch once before consuming it.
+      if (binding.action === 'broadcast') {
+        if (executeHotkeyAction(binding.action, e) === true) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        return;
+      }
+
       e.preventDefault();
       e.stopPropagation();
       if (HOTKEY_DEBUG) {
@@ -315,10 +347,24 @@ export function handleGlobalHotkeyKeyDownImpl(getCtx: AppContextGetter, e: Keybo
 }
 
 export function handleEscapeKeyDownImpl(getCtx: AppContextGetter, e: KeyboardEvent) {
-  const { isQuickSwitcherOpen, setIsQuickSwitcherOpen } = getCtx();
+  const {
+    isQuickSwitcherOpen,
+    setIsQuickSwitcherOpen,
+    sftpPaneMagnificationRef,
+    terminalPaneMagnificationRef,
+  } = getCtx();
 {
-    if (e.key === 'Escape' && isQuickSwitcherOpen) {
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    if (isQuickSwitcherOpen) {
       setIsQuickSwitcherOpen(false);
+      return;
+    }
+    if (getAvailablePaneMagnificationController([
+      sftpPaneMagnificationRef?.current,
+      terminalPaneMagnificationRef?.current,
+    ])?.restore()) {
+      e.preventDefault();
+      e.stopPropagation();
     }
   }
 }
@@ -491,7 +537,11 @@ async function captureCtxInheritedCwd(getCtx: AppContextGetter, sessionId: strin
   if (!liveCwd && isConnectedSsh && !isNetworkDevice) {
     try {
       const info = await bridge?.getSessionRemoteInfo?.(sessionId);
-      allowSshProbe = shouldProbeSessionCwd({ isNetworkDevice: false, remoteSshVersion: info?.remoteSshVersion });
+      allowSshProbe = shouldProbeSessionCwd({
+        isNetworkDevice: false,
+        remoteSshVersion: info?.remoteSshVersion,
+        restrictExtraSshChannels: hostRestrictsExtraSshChannels(host),
+      });
     } catch {
       allowSshProbe = false;
     }
@@ -520,15 +570,35 @@ export async function splitSessionWithCurrentShellImpl(getCtx: AppContextGetter,
   });
 }
 
-export async function copySessionWithCurrentShellImpl(getCtx: AppContextGetter, sessionId: string) {
-  const { classifyLocalShellType, copySession, discoveredShells, resolveShellSetting, terminalSettings } = getCtx();
+export async function copySessionWithCurrentShellImpl(
+  getCtx: AppContextGetter,
+  sessionId: string,
+  options?: { reuseConnection?: boolean },
+) {
+  const { classifyLocalShellType, copySession, discoveredShells, resolveShellSetting, sessions, terminalSettings } = getCtx();
   const resolved = resolveShellSetting(terminalSettings.localShell, discoveredShells);
-  const inheritedCwd = await captureCtxInheritedCwd(getCtx, sessionId);
+  // A fresh remote login may stop at a bastion's host-selection prompt. Do
+  // not probe the old target or send its directory command to the new login.
+  // Local duplicates still open in the source terminal's current directory.
+  const inheritCwd = options?.reuseConnection !== false
+    || sessions?.find((session: { id: string }) => session.id === sessionId)?.protocol === "local";
+  const inheritedCwd = inheritCwd ? await captureCtxInheritedCwd(getCtx, sessionId) : undefined;
   const userAgent = typeof navigator !== 'undefined' ? navigator.userAgent : '';
   return copySession(sessionId, {
     localShellType: classifyLocalShellType(resolved?.command || terminalSettings.localShell, userAgent),
     inheritedCwd,
+    reuseConnection: options?.reuseConnection,
   });
+}
+
+/**
+ * "Duplicate session": clone the tab but open a brand-new connection instead of
+ * multiplexing over the source's established SSH channel (fresh auth; with a
+ * bastion/jump host this restarts the bastion login so the user can pick a new
+ * target host).
+ */
+export async function duplicateSessionWithCurrentShellImpl(getCtx: AppContextGetter, sessionId: string) {
+  return copySessionWithCurrentShellImpl(getCtx, sessionId, { reuseConnection: false });
 }
 
 export async function copyWorkspaceWithCurrentShellImpl(getCtx: AppContextGetter, workspaceId: string) {
@@ -626,57 +696,96 @@ export async function confirmIfBusyLocalTerminalImpl(getCtx: AppContextGetter, s
     }
 }
 
-export async function closeTabsBatchImpl(getCtx: AppContextGetter, targetIds: string[]) {
-  const { closeGroup, closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace, confirmIfBusyLocalTerminal, groups = [], logViews, sessions, workspaces } = getCtx();
-{
-      if (targetIds.length === 0) return true;
-      if (closeTabsInFlightRef.current) return false;
-
-      // Expand workspace ids into their constituent session ids so the busy
-      // probe sees every local shell that's about to be killed.
-      const sessionIdsToProbe: string[] = [];
-      for (const tabId of targetIds) {
-        const ws = workspaces.find((w) => w.id === tabId);
-        const group = groups.find((item) => item.id === tabId);
-        if (ws) {
-          for (const s of sessions) {
-            if (s.workspaceId === tabId) sessionIdsToProbe.push(s.id);
-          }
-        } else if (group) {
-          sessionIdsToProbe.push(...group.sessionIds);
-        } else if (sessions.find((s) => s.id === tabId)) {
-          sessionIdsToProbe.push(tabId);
-        }
+/**
+ * Expand batch-close target ids into the terminal session ids whose local
+ * shells the busy probe must inspect: workspace ids contribute every session
+ * they contain; standalone session ids pass through.
+ */
+export function collectBatchBusyProbeSessionIds(
+  sessions: readonly { id: string; workspaceId?: string | null }[],
+  workspaces: readonly { id: string }[],
+  targetIds: readonly string[],
+  groups: readonly { id: string; sessionIds: string[] }[] = [],
+): string[] {
+  const sessionIdsToProbe: string[] = [];
+  for (const tabId of targetIds) {
+    const ws = workspaces.find((w) => w.id === tabId);
+    if (ws) {
+      for (const s of sessions) {
+        if (s.workspaceId === tabId) sessionIdsToProbe.push(s.id);
       }
-
-      closeTabsInFlightRef.current = true;
-      try {
-        const ok = await confirmIfBusyLocalTerminal(sessionIdsToProbe);
-        if (!ok) return false;
-        const standaloneSessionIds = targetIds.filter((tabId) => (
-          sessions.some((session) => session.id === tabId)
-        ));
-        if (standaloneSessionIds.length > 0) {
-          closeSessions(standaloneSessionIds);
-        }
-        for (const tabId of targetIds) {
-          if (workspaces.find((w) => w.id === tabId)) {
-            closeWorkspace(tabId);
-          } else if (groups.find((item) => item.id === tabId)) {
-            closeGroup?.(tabId);
-          } else if (logViews.find((lv) => lv.id === tabId)) {
-            closeLogView(tabId);
-          }
-        }
-        return true;
-      } finally {
-        closeTabsInFlightRef.current = false;
-      }
+    } else if (groups.some((group) => group.id === tabId)) {
+      sessionIdsToProbe.push(...groups.find((group) => group.id === tabId)!.sessionIds);
+    } else if (sessions.find((s) => s.id === tabId)) {
+      sessionIdsToProbe.push(tabId);
     }
+  }
+  return sessionIdsToProbe;
+}
+
+export async function closeTabsBatchImpl(getCtx: AppContextGetter, targetIds: string[]) {
+  const {
+    closeGroup, groups = [], closeLogView, closeSessions, closeTabsInFlightRef, closeWorkspace,
+    confirmIfBusyLocalTerminal, logViews, sessions, workspaces,
+    activeTabStore, editorTabStore, pluginViewTabStore,
+    handleRequestCloseEditorTabRef, findEditorSftpOwnerTabId, orderedTabsWithEditors,
+  } = getCtx();
+  if (targetIds.length === 0) return true;
+  if (closeTabsInFlightRef.current) return false;
+  closeTabsInFlightRef.current = true;
+  try {
+    const activeBeforeClose = activeTabStore.getActiveTabId();
+    const pluginIds = targetIds.filter((id) => pluginViewTabStore.getTab(id));
+    const editorIds = targetIds.filter(isEditorTabId);
+    const regularIds = targetIds.filter((id) => !pluginViewTabStore.getTab(id) && !isEditorTabId(id));
+    // Cancel busy-terminal confirmation before making any changes, including editors.
+    if (regularIds.length && !await confirmIfBusyLocalTerminal(
+      collectBatchBusyProbeSessionIds(sessions, workspaces, regularIds, groups),
+    )) return false;
+
+    const closedEditorIds: string[] = [];
+    for (const id of editorIds) {
+      if (await handleRequestCloseEditorTabRef.current(fromEditorTabId(id))) closedEditorIds.push(id);
+    }
+
+    // Owners must remain mounted while any editor survives (cancelled or outside
+    // the range), because unmounting their SFTP panel discards its editors.
+    const keepTabIds = new Set<string>();
+    for (const editor of editorTabStore.getTabs()) {
+      const owner = findEditorSftpOwnerTabId(editor.sessionId, editor.sftpTabId);
+      if (owner) keepTabIds.add(owner);
+    }
+    const effectiveRegularIds = regularIds.filter((id) => !keepTabIds.has(id) && !(
+      workspaces.some((workspace) => workspace.id === id) &&
+      sessions.some((session) => session.workspaceId === id && keepTabIds.has(session.id))
+    ) && !(
+      groups.some((group) => group.id === id && group.sessionIds.some((sessionId) => keepTabIds.has(sessionId)))
+    ));
+    const standaloneSessionIds = effectiveRegularIds.filter((id) => sessions.some((session) => session.id === id));
+    if (standaloneSessionIds.length) closeSessions(standaloneSessionIds);
+    for (const id of effectiveRegularIds) {
+      if (workspaces.some((workspace) => workspace.id === id)) closeWorkspace(id);
+      else if (groups.some((group) => group.id === id)) closeGroup?.(id);
+      else if (logViews.some((logView) => logView.id === id)) closeLogView(id);
+    }
+    for (const id of pluginIds) pluginViewTabStore.close(id);
+
+    const closingTabIds = new Set([...effectiveRegularIds, ...closedEditorIds, ...pluginIds]);
+    if (closingTabIds.has(activeBeforeClose)) {
+      activeTabStore.setActiveTabId(resolveBatchTabCloseFocus({
+        orderedTabIds: orderedTabsWithEditors,
+        closingTabIds,
+        activeTabId: activeBeforeClose,
+      }));
+    }
+    return true;
+  } finally {
+    closeTabsInFlightRef.current = false;
+  }
 }
 
 export function executeHotkeyActionImpl(getCtx: AppContextGetter, action: string, e: KeyboardEvent) {
-  const { IS_DEV, MOVE_FOCUS_DEBOUNCE_MS, activeTabStore, addConnectionLogRef, closePluginViewTab, closeSession, closeTabInFlightRef, closeWorkspace, collectSessionIds, confirmIfBusyLocalTerminal, createLocalTerminalWithCurrentShell, editorTabs, fromEditorTabId, handleOpenSettingsRef, handleRequestCloseEditorTabRef, isEditorTabId, isPluginViewTabId, isQuickSwitcherOpen, lastMoveFocusTimeRef, moveFocusInWorkspace, orderedTabs, resolveCloseIntent, resolveSnippetsShortcutIntent, sessions, setActiveTabId, setAddToWorkspaceDialog, setIsQuickSwitcherOpen, setNavigateToSection, settings, splitSessionWithCurrentShell, systemInfoRef, toEditorTabId, toggleBroadcast, toggleScriptsSidePanelRef, toggleSidePanelRef, toggleWorkspaceViewMode, workspaces } = getCtx();
+  const { IS_DEV, MOVE_FOCUS_DEBOUNCE_MS, activeTabStore, addConnectionLogRef, canUseGlobalBroadcast, closePluginViewTab, closeSession, closeTabInFlightRef, closeWorkspace, collectSessionIds, confirmIfBusyLocalTerminal, createLocalTerminalWithCurrentShell, editorTabs, fromEditorTabId, handleOpenSettingsRef, handleRequestCloseEditorTabRef, isEditorTabId, isPluginViewTabId, isQuickSwitcherOpen, lastMoveFocusTimeRef, moveFocusInWorkspace, orderedTabs, resolveCloseIntent, resolveSnippetsShortcutIntent, sessions, setActiveTabId, setAddToWorkspaceDialog, setIsQuickSwitcherOpen, setNavigateToSection, settings, sftpPaneMagnificationRef, splitSessionWithCurrentShell, systemInfoRef, terminalPaneMagnificationRef, toEditorTabId, toggleBroadcast, toggleGlobalBroadcast, toggleScriptsSidePanelRef, toggleSidePanelRef, workspaces } = getCtx();
 {
     const shortcutTabs = buildNumberShortcutTabTargets({
       showSftpTab: settings.showSftpTab ?? true,
@@ -870,13 +979,21 @@ export function executeHotkeyActionImpl(getCtx: AppContextGetter, action: string
         toggleSidePanelRef.current?.();
         break;
       case 'broadcast': {
-        // Toggle broadcast mode for the active workspace
+        // Workspace tabs keep local broadcast; other visible terminal tabs share global input.
         const currentId = activeTabStore.getActiveTabId();
         const activeWs = workspaces.find(w => w.id === currentId);
         if (activeWs) {
           toggleBroadcast(activeWs.id);
+          return true;
         }
-        break;
+        const participantIds = new Set(resolveGlobalBroadcastSessionIds(sessions, getCtx().groups ?? []));
+        if (sessions.some((session: TerminalSession) => (
+          getSessionSurfaceTabId(session) === currentId && participantIds.has(session.id)
+        )) && canUseGlobalBroadcast) {
+          toggleGlobalBroadcast();
+          return true;
+        }
+        return false;
       }
       case 'openSettings':
         handleOpenSettingsRef.current();
@@ -912,15 +1029,18 @@ export function executeHotkeyActionImpl(getCtx: AppContextGetter, action: string
         break;
       }
       case 'togglePaneZoom': {
-        // Toggle workspace between split and focus (zoom) mode
-        const currentId = activeTabStore.getActiveTabId();
-        const activeWs = workspaces.find(w => w.id === currentId);
-        if (activeWs) {
-          toggleWorkspaceViewMode(activeWs.id);
-        }
+        getAvailablePaneMagnificationController([
+          sftpPaneMagnificationRef?.current,
+          terminalPaneMagnificationRef?.current,
+        ])?.toggle();
         break;
       }
       case 'moveFocus': {
+        const magnificationController = getAvailablePaneMagnificationController([
+          sftpPaneMagnificationRef?.current,
+          terminalPaneMagnificationRef?.current,
+        ]);
+        if (magnificationController?.getState() === 'focused') break;
         // Debounce to prevent double-triggering when focus switches between terminals
         const now = Date.now();
         if (now - lastMoveFocusTimeRef.current < MOVE_FOCUS_DEBOUNCE_MS) {

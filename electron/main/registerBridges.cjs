@@ -3,6 +3,7 @@
 let bridgesRegistered = false;
 let cloudSyncSessionPassword = null;
 const { readClipboardFiles, readClipboardImage, hasClipboardImage } = require("../bridges/clipboardFiles.cjs");
+const { registerSystemNotificationHandlers } = require("../bridges/systemNotification.cjs");
 
 const excludedFigSpecPrefixes = ["aws", "gcloud", "az"];
 
@@ -40,6 +41,25 @@ function waitForApplicationSpawn(child, requireCleanLauncherExit = false) {
     child.once("error", onError);
     if (requireCleanLauncherExit) child.once("close", onClose);
   });
+}
+
+function createCloudSyncSessionPasswordReader({
+  getAppLockController,
+  getCachedPassword,
+  setCachedPassword,
+  readPersistedPassword,
+}) {
+  return async function readCloudSyncSessionPassword() {
+    const controller = getAppLockController?.();
+    if (controller?.getRuntimeState?.()?.locked === true) {
+      return null;
+    }
+    const cached = getCachedPassword();
+    if (cached) return cached;
+    const persisted = readPersistedPassword();
+    setCachedPassword(persisted);
+    return persisted;
+  };
 }
 
 function createBridgeRegistrar(context) {
@@ -87,6 +107,7 @@ function createBridgeRegistrar(context) {
     getHttpNetworkProxyBridge,
     getWindowManager,
     getVaultBackupBridge,
+    getAppLockController,
     isPathInside,
   } = context;
 
@@ -116,6 +137,7 @@ function createBridgeRegistrar(context) {
     const aiBridge = getAiBridge();
     const httpNetworkProxyBridge = getHttpNetworkProxyBridge();
     const vaultBackupBridge = getVaultBackupBridge();
+    const appLockController = getAppLockController?.();
     const {
       createTrustedPluginBridgeSender,
       registerPluginBridge,
@@ -417,7 +439,10 @@ function createBridgeRegistrar(context) {
     transferBridge.init(deps);
     terminalBridge.init(deps);
     fileWatcherBridge.init(deps);
-    globalShortcutBridge.init(deps);
+    globalShortcutBridge.init({
+      ...deps,
+      getAppLockController,
+    });
     aiBridge.init(deps);
     crashLogBridge.init(deps);
   
@@ -434,6 +459,11 @@ function createBridgeRegistrar(context) {
     sshBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     sftpBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     localFsBridge.registerHandlers(ipcMain);
+    require("../bridges/localFileDragBridge.cjs").registerHandlers(ipcMain, {
+      getWindows: () => getWindowManager().getAppContentWindows?.() || [],
+      nativeImage: electronModule.nativeImage,
+      app,
+    });
     transferBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     portForwardingBridge.registerHandlers(ipcMain, { terminalWorkerManager });
     terminalBridge.registerHandlers(ipcMain, { terminalWorkerManager });
@@ -473,6 +503,7 @@ function createBridgeRegistrar(context) {
     httpNetworkProxyBridge.registerHandlers(ipcMain, electronModule);
     crashLogBridge.registerHandlers(ipcMain);
     vaultBackupBridge.registerHandlers(ipcMain, electronModule);
+    appLockController?.registerHandlers?.(ipcMain);
   
     // ZMODEM cancel handler
     ipcMain.on("netcatty:zmodem:cancel", (event, payload) => {
@@ -684,10 +715,15 @@ function createBridgeRegistrar(context) {
           registerAsMainWindow: false,
           onRegisterBridge: registerBridges,
         });
-        try {
-          win.setTitle(title);
-        } catch {
-          // ignore
+        const appLockController = getAppLockController?.();
+        if (typeof appLockController?.setWindowTitle === "function") {
+          appLockController.setWindowTitle(win, title);
+        } else {
+          try {
+            win.setTitle(title);
+          } catch {
+            // ignore
+          }
         }
         const delivery = await getWindowManager().sendWhenRendererReady(
           win,
@@ -758,18 +794,27 @@ function createBridgeRegistrar(context) {
       cloudSyncSessionPassword = typeof password === "string" && password.length ? password : null;
       if (cloudSyncSessionPassword) {
         persistCloudSyncPassword(cloudSyncSessionPassword);
+        // Peer renderers may have observed MASTER_KEY_CONFIG before the
+        // settings renderer finished unlocking and shared this password.
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+            win.webContents.send("netcatty:cloudSync:session:passwordAvailable");
+          }
+        }
       } else {
         clearPersistedCloudSyncPassword();
       }
       return true;
     });
   
-    ipcMain.handle("netcatty:cloudSync:session:getPassword", async () => {
-      if (cloudSyncSessionPassword) return cloudSyncSessionPassword;
-      const persisted = readPersistedCloudSyncPassword();
-      cloudSyncSessionPassword = persisted;
-      return persisted;
-    });
+    ipcMain.handle("netcatty:cloudSync:session:getPassword", createCloudSyncSessionPasswordReader({
+      getAppLockController,
+      getCachedPassword: () => cloudSyncSessionPassword,
+      setCachedPassword: (password) => {
+        cloudSyncSessionPassword = password;
+      },
+      readPersistedPassword: readPersistedCloudSyncPassword,
+    }));
   
     ipcMain.handle("netcatty:cloudSync:session:clearPassword", async () => {
       cloudSyncSessionPassword = null;
@@ -847,6 +892,9 @@ function createBridgeRegistrar(context) {
       },
     );
   
+    // OSC 9/777/99 desktop notifications (Codex, iTerm2, kitty, rxvt)
+    registerSystemNotificationHandlers(ipcMain, { electronModule, BrowserWindow });
+
     // Clipboard helpers for renderer fallback paths (e.g. Monaco paste in Electron)
     ipcMain.handle("netcatty:clipboard:readText", async () => {
       try {
@@ -1142,6 +1190,7 @@ function createBridgeRegistrar(context) {
 }
 
 module.exports = {
+  createCloudSyncSessionPasswordReader,
   createBridgeRegistrar,
   filterExcludedFigSpecs,
   isExcludedFigSpec,

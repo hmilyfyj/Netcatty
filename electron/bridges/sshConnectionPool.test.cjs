@@ -32,6 +32,8 @@ const {
   endpointAllowsReuse,
   fingerprintAuth,
   resetSshTransportRegistryForTests,
+  markEndpointNoIdlePark,
+  endpointAllowsIdlePark,
   DEFAULT_SSH_TRANSPORT_IDLE_TTL_MS,
   DEFAULT_MAX_IDLE_SSH_TRANSPORTS,
   LEASE_KINDS,
@@ -267,6 +269,53 @@ test("failed in-flight dial releases the slot so a later open can retry", async 
 
   const retry = beginTransportDial(endpoint, { kind: "shell" });
   assert.equal(retry.role, "leader");
+});
+
+test("TERM-SSHD last lease ends the transport instead of idle-parking", () => {
+  const conn = makeConn();
+  conn._remoteVer = "TERM-SSHD";
+  const owner = { remoteSshVersion: "TERM-SSHD" };
+  const connRef = createConnectionRef(owner, conn, []);
+  assert.equal(connRef.allowIdlePark, false);
+  assert.equal(endpointAllowsIdlePark(connRef.endpoint, "TERM-SSHD"), false);
+
+  const ended = releaseConnectionRef(owner);
+  assert.equal(ended, true);
+  assert.equal(conn.ended, 1);
+  assert.equal(connRef.state, "dead");
+  assert.equal(connRef.endedReason, "no-idle-park");
+});
+
+test("TERM-SSHD last shell with an SFTP lease refuses later shell reuse", () => {
+  const conn = makeConn();
+  conn._remoteVer = "TERM-SSHD";
+  const endpoint = { hostname: "blj.yd.com.cn", username: "test", port: 22 };
+  const owner = { stream: {}, remoteSshVersion: "TERM-SSHD", _reuseEndpoint: endpoint };
+  const sftp = { id: "sftp", __sshLeaseKind: "sftp" };
+  const transport = createConnectionRef(owner, conn, []);
+  acquireConnectionRef(sftp, transport);
+  assert.equal(releaseConnectionRef(owner), false);
+  assert.equal(transport.state, "live");
+  assert.equal(transport.allowShellReuse, false);
+  assert.equal(findTransportByEndpoint(transport.endpoint, { kind: "shell" }), null);
+  assert.equal(findTransportByEndpoint(transport.endpoint, { kind: "channel" }), transport);
+});
+
+test("an endpoint denylisted after a dead parked shell does not idle-park later transports", () => {
+  const endpoint = { hostname: "bastion.example", username: "alice", port: 22 };
+  markEndpointNoIdlePark(endpoint);
+  assert.equal(endpointAllowsIdlePark(endpoint, "OpenSSH_9.0"), false);
+
+  const conn = makeConn();
+  conn._remoteVer = "OpenSSH_9.0";
+  const transport = createTransport({ conn, endpoint });
+  assert.equal(transport.allowIdlePark, false);
+
+  const holder = {};
+  borrowTransport(transport, { kind: "shell", holder });
+  assert.equal(releaseConnectionRef(holder), true);
+  assert.equal(transport.state, "dead");
+  assert.equal(conn.ended, 1);
 });
 
 test("releaseConnectionRef parks on last channel when TTL is 0 (until quit)", () => {
@@ -1372,4 +1421,40 @@ test("transferConnectionRef rebinds a lease without changing count", () => {
   assert.equal(transport.state, "idle");
   fireIdleTimers(timers);
   assert.equal(conn.ended, 1);
+});
+
+test("findReusableSession refuses a single-channel source", () => {
+  const sessions = new Map();
+  const source = {
+    singleChannelSsh: true,
+    conn: { _sock: { destroyed: false } },
+    stream: {},
+    connRef: { count: 1, state: "live", endpoint: { singleChannelSsh: true } },
+    _reuseEndpoint: { hostname: "10.0.0.1", port: 22, username: "alice", singleChannelSsh: true },
+  };
+  sessions.set("src", source);
+  assert.equal(findReusableSession(sessions, "src"), null);
+  assert.equal(
+    findReusableSession(sessions, "src", { hostname: "10.0.0.1", port: 22, username: "alice", singleChannelSsh: true }),
+    null,
+  );
+});
+
+test("createConnectionRef keeps singleChannelSsh and does not idle-park the terminal", () => {
+  const conn = makeConn();
+  const owner = {
+    singleChannelSsh: true,
+    _reuseEndpoint: {
+      hostname: "bastion.example",
+      port: 22,
+      username: "root",
+      singleChannelSsh: true,
+    },
+  };
+  const transport = createConnectionRef(owner, conn, []);
+  assert.equal(transport.endpoint.singleChannelSsh, true);
+  assert.equal(transport.allowIdlePark, false);
+  assert.equal(releaseConnectionRef(owner), true);
+  assert.equal(conn.ended, 1);
+  assert.equal(transport.state, "dead");
 });

@@ -78,6 +78,7 @@ declare global {
       // connection (issue #1198) negotiates the same KEX / cipher / host-key
       // set the interactive session would.
       legacyAlgorithms?: boolean;
+      singleChannelSsh?: boolean;
       skipEcdsaHostKey?: boolean;
       algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
       // Known hosts, used to verify the host key before the stats companion
@@ -112,6 +113,7 @@ declare global {
       port?: number;
       etPort?: number;
       legacyAlgorithms?: boolean;
+      singleChannelSsh?: boolean;
       skipEcdsaHostKey?: boolean;
       algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
       knownHosts?: import("../../domain/models").KnownHost[];
@@ -144,6 +146,9 @@ declare global {
       stopBits?: 1 | 1.5 | 2;
       parity?: 'none' | 'even' | 'odd' | 'mark' | 'space';
       flowControl?: 'none' | 'xon/xoff' | 'rts/cts';
+      // Optional auto-login credentials saved on the host (#3417)
+      username?: string;
+      password?: string;
       charset?: string;
       sessionLog?: { enabled: boolean; directory: string; format: string; timestampsEnabled?: boolean };
     }): Promise<string>;
@@ -223,6 +228,7 @@ declare global {
       enableKeyboardInteractive?: boolean;
       sessionId?: string;
       legacyAlgorithms?: boolean;
+      singleChannelSsh?: boolean;
       skipEcdsaHostKey?: boolean;
       algorithmOverrides?: import("../../domain/models").HostAlgorithmOverrides;
     }): Promise<{ stdout: string; stderr: string; code: number | null }>;
@@ -281,6 +287,10 @@ declare global {
         cpu: number | null;           // CPU usage percentage (0-100)
         cpuCores: number | null;      // Number of CPU cores
         cpuPerCore: number[];         // Per-core CPU usage array
+        gpu?: number | null;          // NVIDIA utilization; absent on unsupported transports
+        gpuName?: string | null;      // First GPU name
+        gpuMemUsed?: number | null;   // Summed VRAM used in MB
+        gpuMemTotal?: number | null;  // Summed VRAM total in MB
         memTotal: number | null;      // Total memory in MB
         memUsed: number | null;       // Used memory in MB (excluding buffers/cache)
         memFree: number | null;       // Free memory in MB
@@ -327,13 +337,29 @@ declare global {
       data: string,
       options?: {
         automated?: boolean;
+        pasteRequestId?: string;
         /** Host-classified secret/no-echo input; always bypasses plugin observers and interceptors. */
         sensitive?: boolean;
+        /** Whole character to erase on an explicitly byte-oriented serial device. */
+        serialEraseChar?: string;
         lineDelayMs?: number;
         logRewrite?: { sentCommand: string; displayCommand: string };
       },
     ): void;
-    interruptSession?(sessionId: string, trace?: NetcattyTerminalInterruptTrace): void;
+    /** Notify login-assist detectors about locally buffered user input. */
+    notifySessionUserInput?(sessionId: string): void;
+    /** Opt-in transport handoff receipts; cancellation ends with done and no index. */
+    onTerminalPasteWrite?(cb: (event: {
+      sessionId: string;
+      requestId: string;
+      index?: number;
+      done?: boolean;
+    }) => void): () => void;
+    interruptSession?(
+      sessionId: string,
+      trace?: NetcattyTerminalInterruptTrace,
+      options?: { cancelPendingWritesOnly?: boolean },
+    ): void;
     resizeSession(sessionId: string, cols: number, rows: number): void;
     /**
      * Sync Windows ConPTY after the renderer clears the xterm viewport.
@@ -486,6 +512,8 @@ declare global {
           droppedOutputAlternateScreenAction?: "enter" | "leave";
           /** True while Mosh is still on the ephemeral SSH handshake PTY. */
           moshHandshake?: boolean;
+          /** The Mosh SSH bootstrap is blocked on input that Netcatty cannot answer automatically. */
+          moshHandshakeRequiresUserInput?: boolean;
           terminalPerf?: NetcattyTerminalOutputPerfMeta;
           /** Original host output units acknowledged even when an interceptor changes display length. */
           pluginPipelineIngressBytes?: number;

@@ -34,7 +34,7 @@ const SAFE_TASK_KEYS: ReadonlySet<keyof TransferTask> = new Set([
   "sourceConnectionId", "targetConnectionId", "targetHostId", "targetConnectionKey",
   "direction", "status", "totalBytes", "transferredBytes", "speed", "error",
   "startTime", "endTime", "isDirectory", "progressMode", "childTasks", "parentTaskId",
-  "sourceLastModified", "skipConflictCheck", "replaceExistingTarget", "retryable",
+  "sourceLastModified", "preflightStatSkipped", "skipConflictCheck", "replaceExistingTarget", "retryable",
   "ownerId", "sourceHostId", "sourceHostLabel", "targetHostLabel", "origin", "background",
   "phase", "controlKind", "resumable", "checkpointBytes", "priority", "updatedAt", "pauseUnavailableReason",
   "resumeStage", "downloadCheckpointBytes", "uploadCheckpointBytes",
@@ -58,6 +58,7 @@ export function sanitizeSftpTransferTask(value: unknown): TransferTask | null {
     if (source[key] !== undefined) sanitized[key] = source[key];
   }
   const task = sanitized as unknown as TransferTask;
+  if (task.preflightStatSkipped !== true) task.preflightStatSkipped = undefined;
   if (!Number.isSafeInteger(task.directoryEntryIndex) || (task.directoryEntryIndex ?? -1) < 0) {
     task.directoryEntryIndex = undefined;
   }
@@ -252,9 +253,25 @@ export function pruneSftpTransferHistory(
 
 export function validateTransferResumeSource(
   task: Pick<TransferTask, "totalBytes" | "sourceLastModified" | "checkpointBytes">,
-  source: { size: number; lastModified?: number },
+  source: { size: number; lastModified?: number; sizeKnown?: boolean },
   options?: { allowSourceGrowth?: boolean },
 ): string | null {
+  // Stat-less SCP endpoints report size as a placeholder 0 (sizeKnown false).
+  // Size-based checks would misread any saved progress against that fake zero
+  // as a shrunk/changed source and silently restart the transfer, so only the
+  // mtime guard applies while the size is unknown.
+  const sizeKnown = source.sizeKnown !== false && Number.isFinite(source.size);
+  if (!sizeKnown) {
+    if (
+      !options?.allowSourceGrowth
+      && task.sourceLastModified
+      && source.lastModified
+      && source.lastModified !== task.sourceLastModified
+    ) {
+      return "Source was modified while the transfer was paused";
+    }
+    return null;
+  }
   const checkpoint = Math.max(0, task.checkpointBytes ?? 0);
   if (checkpoint > source.size) return "Saved checkpoint is beyond the current source size";
   const plannedSize = Number(task.totalBytes);

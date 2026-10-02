@@ -56,10 +56,15 @@ if (!fs.existsSync(skillFile)) {
     }
   }
 
-  if (!body.includes("--chat-session <chat-session-id>")) {
-    fail("SKILL.md must require --chat-session");
+  if (!body.includes("NETCATTY_CLI_CHAT_SESSION_ID")) {
+    fail("SKILL.md must document host-bound NETCATTY_CLI_CHAT_SESSION_ID");
   } else {
-    pass("chat session requirement");
+    pass("host-bound chat session requirement");
+  }
+  for (const file of [skillFile, ...requiredReferences.map((ref) => path.join(skillDir, "references", ref))]) {
+    if (fs.existsSync(file) && read(file).includes("--chat-session")) {
+      fail(`${path.relative(root, file)} documents the removed chat-session flag`);
+    }
   }
 }
 

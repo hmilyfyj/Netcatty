@@ -2,7 +2,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   probeClaudeAuth, probeCopilotAuth, probeCodexAuth, probeCodebuddyAuth, probeCursorCliAuth, probeGrokAuth,
+  parseCursorStatusJson, resolveCursorCliSpawnSpec,
 } = require("./agentAuthProbes.cjs");
+const { prepareCommandForSpawn } = require("../ai/shellUtils.cjs");
+const { resolveCursorCliSpawnSpec: resolveSharedCursorCliSpawnSpec } = require("./cursorCliSpawn.cjs");
 
 test("probeClaudeAuth: env ANTHROPIC_API_KEY -> authenticated env", () => {
   const r = probeClaudeAuth({
@@ -270,4 +273,62 @@ test("probeCursorCliAuth: status command failure -> not authenticated", () => {
     runStatus: () => ({ exitCode: 1, stdout: "", stderr: "boom" }),
   });
   assert.equal(r.authenticated, false);
+  assert.equal(r.binPath, "/bin/cursor-agent");
+});
+
+test("probeCursorCliAuth: unrecognized status stdout keeps resolved binPath", () => {
+  const r = probeCursorCliAuth({
+    resolveBinary: () => "/bin/cursor-agent",
+    runStatus: () => ({ exitCode: 0, stdout: "cursor-agent 1.2.3\nnot json" }),
+  });
+  assert.equal(r.authenticated, false);
+  assert.equal(r.authSource, null);
+  assert.equal(r.binPath, "/bin/cursor-agent");
+});
+
+test("probeCursorCliAuth: thrown status probe keeps resolved binPath", () => {
+  const r = probeCursorCliAuth({
+    resolveBinary: () => "/bin/cursor-agent",
+    runStatus: () => { throw new Error("timeout"); },
+  });
+  assert.equal(r.authenticated, false);
+  assert.equal(r.authSource, null);
+  assert.equal(r.binPath, "/bin/cursor-agent");
+});
+
+test("probeCursorCliAuth: extracts authenticated JSON wrapped in cmd noise", () => {
+  const r = probeCursorCliAuth({
+    resolveBinary: () => "C:\\Users\\me\\AppData\\Local\\cursor-agent\\cursor-agent.cmd",
+    runStatus: () => ({
+      exitCode: 0,
+      stdout: "Starting...\r\n{\"status\":\"authenticated\",\"isAuthenticated\":true,\"userInfo\":{\"email\":\"user@example.com\"}}\r\n",
+    }),
+  });
+  assert.equal(r.authenticated, true);
+  assert.equal(r.authSource, "cli-login");
+  assert.equal(r.email, "user@example.com");
+});
+
+test("parseCursorStatusJson accepts BOM and surrounding text", () => {
+  const parsed = parseCursorStatusJson(
+    "\uFEFFnoise\n{\"isAuthenticated\":true,\"status\":\"authenticated\"}\n",
+  );
+  assert.equal(parsed.isAuthenticated, true);
+  assert.equal(parsed.status, "authenticated");
+});
+
+test("resolveCursorCliSpawnSpec re-exports the shared native launch helper", () => {
+  const shim = "C:\\Users\\me\\AppData\\Local\\cursor-agent\\cursor-agent.cmd";
+  const args = ["status", "--format", "json"];
+  assert.deepEqual(
+    resolveCursorCliSpawnSpec(shim, args),
+    resolveSharedCursorCliSpawnSpec(shim, args),
+  );
+  assert.deepEqual(
+    resolveSharedCursorCliSpawnSpec(shim, args, {
+      exists: () => false,
+      readFile: () => { throw new Error("missing"); },
+    }),
+    prepareCommandForSpawn(shim, args, { unwrapNativeExe: false }),
+  );
 });

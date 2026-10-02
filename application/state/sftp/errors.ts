@@ -18,12 +18,13 @@ export const isSessionError = (err: unknown): boolean => {
   );
 };
 
-/** True absence only — ENOTSUP / unknown inspection must not map to "no conflict". */
-export const isMissingStatError = (error: unknown): boolean => {
-  const code = (error as { code?: string | number } | null)?.code;
-  return code === 2
-    || code === "ENOENT"
-    || code === "NO_SUCH_FILE"
-    || code === "SSH_FX_NO_SUCH_FILE"
-    || String((error as { message?: string } | null)?.message || "").trim() === "ENOENT";
-};
+const SFTP_IPC_ERROR_PREFIX = /^Error invoking remote method 'netcatty:[^']+':\s*/i;
+
+/** Drop Electron IPC wrapper so dialogs can show the server error. */
+export function unwrapSftpIpcError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err ?? "");
+  const unwrapped = raw.replace(SFTP_IPC_ERROR_PREFIX, "").replace(/^Error:\s*/, "").trim();
+  return unwrapped || raw;
+}
+
+export { isMissingStatError } from "../../../domain/sftpStatError";

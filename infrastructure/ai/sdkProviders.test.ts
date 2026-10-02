@@ -28,7 +28,30 @@ test("createModelFromConfig routes by explicit style: google on top of custom pr
 
 test("createModelFromConfig defaults legacy custom providerId to the OpenAI-compatible client", () => {
   const model = createModelFromConfig(makeConfig({ providerId: "custom", defaultModel: "gpt-4o" }));
-  assert.match(String((model as { provider?: string }).provider ?? ""), /^openai/);
+  assert.match(String((model as { provider?: string }).provider ?? ""), /^openai\.chat/);
+});
+
+test("createModelFromConfig keeps Chat Completions as the OpenAI default", () => {
+  const model = createModelFromConfig(makeConfig({ providerId: "openai", defaultModel: "gpt-4o" }));
+  assert.equal((model as { provider?: string }).provider, "openai.chat");
+});
+
+test("createModelFromConfig uses Responses API when openaiApi is responses", () => {
+  const model = createModelFromConfig(makeConfig({
+    providerId: "openai",
+    defaultModel: "gpt-4o",
+    openaiApi: "responses",
+  }));
+  assert.equal((model as { provider?: string }).provider, "openai.responses");
+});
+
+test("createModelFromConfig ignores openaiApi when style is not openai", () => {
+  const model = createModelFromConfig(makeConfig({
+    style: "anthropic",
+    openaiApi: "responses",
+    defaultModel: "claude",
+  }));
+  assert.match(String((model as { provider?: string }).provider ?? ""), /^anthropic/);
 });
 
 test("createModelFromConfig keeps the Anthropic providerId fallback when style is unset", () => {
@@ -129,20 +152,131 @@ test("resolveProviderEndpoint applies the ollama URL fallback for every style ov
   }
 });
 
-test("resolveProviderEndpoint only swaps in the literal 'ollama' apiKey on the OpenAI-compat client", () => {
-  const openai = resolveProviderEndpoint(
+test("resolveProviderEndpoint only swaps in the literal 'ollama' apiKey when no key is configured", () => {
+  const local = resolveProviderEndpoint(
     { id: "p", providerId: "ollama", name: "Ollama", enabled: true },
     "openai",
-    "PLACEHOLDER",
+    undefined,
   );
-  assert.equal(openai.apiKey, "ollama");
+  assert.equal(local.apiKey, "ollama");
 
-  // For Anthropic/Google styles the user supplied a real key; preserve it
-  // verbatim so the SDK forwards the right header instead of "ollama".
+  // Cloud / any configured key must keep the IPC placeholder so the main
+  // process can inject the decrypted key. Overwriting it with 'ollama'
+  // produced Authorization: Bearer ollama and 401s against ollama.com.
+  const cloud = resolveProviderEndpoint(
+    {
+      id: "p",
+      providerId: "ollama",
+      name: "Ollama",
+      enabled: true,
+      baseURL: "https://ollama.com/v1",
+    },
+    "openai",
+    "__IPC_SECURED__",
+  );
+  assert.equal(cloud.apiKey, "__IPC_SECURED__");
+  assert.equal(cloud.baseURL, "https://ollama.com/v1");
+
   const anthropic = resolveProviderEndpoint(
     { id: "p", providerId: "ollama", name: "Ollama", enabled: true },
     "anthropic",
     "PLACEHOLDER",
   );
   assert.equal(anthropic.apiKey, "PLACEHOLDER");
+
+  const empty = resolveProviderEndpoint(
+    { id: "p", providerId: "ollama", name: "Ollama", enabled: true },
+    "openai",
+    "",
+  );
+  assert.equal(empty.apiKey, "ollama");
+});
+
+test("resolveProviderEndpoint adds /v1 to a bare ollama.com Cloud host", () => {
+  assert.equal(
+    resolveProviderEndpoint(
+      {
+        id: "p",
+        providerId: "ollama",
+        name: "Ollama",
+        enabled: true,
+        baseURL: "https://ollama.com",
+      },
+      "openai",
+      "__IPC_SECURED__",
+    ).baseURL,
+    "https://ollama.com/v1",
+  );
+  assert.equal(
+    resolveProviderEndpoint(
+      {
+        id: "p",
+        providerId: "ollama",
+        name: "Ollama",
+        enabled: true,
+        baseURL: "https://ollama.com/",
+      },
+      "openai",
+      "__IPC_SECURED__",
+    ).baseURL,
+    "https://ollama.com/v1",
+  );
+  assert.equal(
+    resolveProviderEndpoint(
+      {
+        id: "p",
+        providerId: "ollama",
+        name: "Ollama",
+        enabled: true,
+        baseURL: "https://ollama.com/api",
+      },
+      "openai",
+      "__IPC_SECURED__",
+    ).baseURL,
+    "https://ollama.com/v1",
+  );
+});
+
+// Exercise the real SDK request builders through the Electron fetch boundary.
+// A rejected request is sufficient here: headers are inspected before parsing.
+test("SDK requests forward custom headers and scope OpenCode sessions", async (t) => {
+  const browserGlobal = globalThis as typeof globalThis & { window?: unknown };
+  const originalWindow = browserGlobal.window;
+  t.after(() => { browserGlobal.window = originalWindow; });
+  const requests: Array<{ url: string; headers: Headers }> = [];
+  browserGlobal.window = {
+    netcatty: {
+      aiFetch: async (url: string, _method: string, headers: Record<string, string>) => {
+        requests.push({ url, headers: new Headers(headers) });
+        return { ok: false, status: 400, data: '{"error":{"message":"test response"}}' };
+      },
+    },
+  };
+
+  for (const style of ["openai", "anthropic", "google"] as const) {
+    for (const openaiApi of style === "openai" ? ["chat", "responses"] as const : ["chat"] as const) {
+      for (const sessionId of ["conversation-a", "conversation-a", "conversation-b"]) {
+        const model = createModelFromConfig(makeConfig({
+          style,
+          openaiApi,
+          apiKey: "test-key",
+          baseURL: "https://opencode.ai/zen/go/v1",
+          customHeaders: { "X-Test-Header": "configured" },
+        }), { chatSessionId: sessionId });
+        await assert.rejects(model.doGenerate({ prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }] }));
+        const request = requests.at(-1)!;
+        assert.equal(request.headers.get("x-opencode-session"), sessionId);
+        assert.equal(request.headers.get("x-test-header"), "configured");
+      }
+    }
+  }
+  for (const baseURL of ["https://opencode.ai/zen/go/v1", "https://example.test/v1"]) {
+    for (const customHeaders of [undefined, { "X-OpenCode-Session": "override" }]) {
+      const model = createModelFromConfig(makeConfig({ baseURL, apiKey: "test-key", customHeaders }), { chatSessionId: "automatic" });
+      await assert.rejects(model.doGenerate({ prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }] }));
+      assert.equal(requests.at(-1)!.headers.get("x-opencode-session"),
+        customHeaders ? "override" : baseURL.includes("opencode.ai") ? "automatic" : null);
+    }
+  }
+  assert.equal(requests.length, 16);
 });

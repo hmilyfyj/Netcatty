@@ -85,7 +85,9 @@ function buildListCommand(remotePath, encoding = "utf-8") {
     '  if [ -L "$f" ]; then t=l',
     '  elif [ -d "$f" ]; then t=d',
     '  else t=f; fi',
-    '  mode=$(ls -ld -- "$f" 2>/dev/null | awk \'{print $1}\')',
+    '  lsline=$(ls -ld -- "$f" 2>/dev/null)',
+    '  mode=$(printf "%s\\n" "$lsline" | awk \'{print $1}\')',
+    '  owner=$(printf "%s\\n" "$lsline" | awk \'{print $3}\')',
     // Use metadata only — never open the file (FIFOs/special files would hang on wc -c).
     '  size=$(stat -c %s -- "$f" 2>/dev/null || stat -f %z -- "$f" 2>/dev/null || echo 0)',
     '  [ -z "$size" ] && size=0',
@@ -96,7 +98,7 @@ function buildListCommand(remotePath, encoding = "utf-8") {
     '  if command -v base64 >/dev/null 2>&1; then b64=$(printf "%s" "$f" | base64 2>/dev/null | tr -d "\\r\\n")',
     '  elif command -v openssl >/dev/null 2>&1; then b64=$(printf "%s" "$f" | openssl base64 2>/dev/null | tr -d "\\r\\n")',
     '  else b64=; fi',
-    '  printf "%s|%s|%s|%s|%s\\n" "$t" "${mode:-?}" "$size" "$mtime" "$b64"',
+    '  printf "%s|%s|%s|%s|%s|%s\\n" "$t" "${mode:-?}" "$size" "$mtime" "$b64" "${owner:-}"',
     "done",
   ].join("\n");
   return `cd ${q} || exit 1; ${loop}`;
@@ -124,11 +126,15 @@ function buildStatCommand(remotePath, encoding = "utf-8") {
     'elif [ -d "$p" ]; then t=d',
     'else t=f; fi',
     'mode=$(ls -ld -- "$p" 2>/dev/null | awk \'{print $1}\')',
-    'size=$(stat -c %s -- "$p" 2>/dev/null || stat -f %z -- "$p" 2>/dev/null || echo 0)',
+    // A missing/unsupported stat binary must not masquerade as a real 0-byte
+    // file: post-upload size verification would then reject a successful
+    // upload with "expected N bytes, got 0" (#3399). Emit the same "?" unknown
+    // marker used for mode so the parser can report an unknown size instead.
+    'size=$(stat -c %s -- "$p" 2>/dev/null || stat -f %z -- "$p" 2>/dev/null || echo "?")',
     'mtime=$(date -r "$p" +%s 2>/dev/null || stat -c %Y -- "$p" 2>/dev/null || stat -f %m -- "$p" 2>/dev/null || echo 0)',
     'abs=$(cd "$(dirname -- "$p")" 2>/dev/null && printf "%s/%s\\n" "$(pwd -P 2>/dev/null || pwd)" "$(basename -- "$p")" || printf "%s\\n" "$p")',
     'ino=$(stat -c %i -- "$p" 2>/dev/null || stat -f %i -- "$p" 2>/dev/null || echo)',
-    'printf "%s|%s|%s|%s|%s|%s\\n" "$t" "${mode:-?}" "${size:-0}" "${mtime:-0}" "$abs" "${ino}"',
+    'printf "%s|%s|%s|%s|%s|%s\\n" "$t" "${mode:-?}" "${size:-?}" "${mtime:-0}" "$abs" "${ino}"',
   ].join("; ");
 }
 
@@ -225,8 +231,37 @@ function shellQuotePath(remotePath, encoding = "utf-8") {
 }
 
 /**
+ * Parse a username from an SFTP longname / `ls -l` line.
+ * Example: "-rwxr-xr-x  1 root  root  4096 Jan 1 00:00 filename"
+ */
+function ownerFromSftpLongname(longname) {
+  if (!longname) return undefined;
+  const match = String(longname).match(/^[dlbcps\-][rwxsStT\-]{9}[+.@]?\s+\d+\s+(\S+)\s+\S+\s+/);
+  const owner = match?.[1]?.trim();
+  return owner || undefined;
+}
+
+function ownerFromUid(uid) {
+  if (typeof uid !== "number" || !Number.isFinite(uid)) return undefined;
+  return String(uid);
+}
+
+function normalizeListingOwner(value) {
+  if (typeof value !== "string") return undefined;
+  const owner = value.trim();
+  if (!owner || owner === "?" || owner === "UNKNOWN") return undefined;
+  return owner;
+}
+
+function resolveListingOwner({ owner, longname, uid } = {}) {
+  return normalizeListingOwner(owner)
+    || ownerFromSftpLongname(longname)
+    || ownerFromUid(uid);
+}
+
+/**
  * Parse records from buildListCommand output.
- * @returns {Array<{ name: string, type: 'file'|'directory'|'symlink', size: number, modifyTime: number, permissions?: string }>}
+ * @returns {Array<{ name: string, type: 'file'|'directory'|'symlink', size: number, modifyTime: number, permissions?: string, owner?: string }>}
  */
 function parseListRecords(stdout, encoding = "utf-8") {
   const lines = String(stdout || "").split(/\r?\n/).filter(Boolean);
@@ -234,7 +269,7 @@ function parseListRecords(stdout, encoding = "utf-8") {
   for (const line of lines) {
     const parts = line.split("|");
     if (parts.length < 5) continue;
-    const [t, modeStr, sizeStr, mtimeStr, b64] = parts;
+    const [t, modeStr, sizeStr, mtimeStr, b64, ownerRaw] = parts;
     let name;
     try {
       name = decodeListBasename(b64, encoding);
@@ -246,7 +281,8 @@ function parseListRecords(stdout, encoding = "utf-8") {
     const size = Number(sizeStr) || 0;
     const modifyTime = (Number(mtimeStr) || 0) * 1000;
     const permissions = parseLsModeToPermissions(modeStr);
-    results.push({ name, type, size, modifyTime, permissions });
+    const owner = resolveListingOwner({ owner: ownerRaw });
+    results.push({ name, type, size, modifyTime, permissions, ...(owner ? { owner } : {}) });
   }
   return results;
 }
@@ -261,13 +297,14 @@ function parseLsLaOutput(stdout, { basePath = "" } = {}) {
     if (!line || line.startsWith("total ")) continue;
     // permissions links owner group size month day time/year name
     const match = line.match(
-      /^([dlbcps\-])([rwxsStT\-]{9})\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(\S+\s+\S+\s+\S+)\s+(.+)$/,
+      /^([dlbcps\-])([rwxsStT\-]{9})[+.@]?\s+\d+\s+(\S+)\s+\S+\s+(\d+)\s+(\S+\s+\S+\s+\S+)\s+(.+)$/,
     );
     if (!match) continue;
     const typeChar = match[1];
     const perm = match[2];
-    const size = Number(match[3]) || 0;
-    let name = match[5];
+    const owner = resolveListingOwner({ owner: match[3] });
+    const size = Number(match[4]) || 0;
+    let name = match[6];
     // strip " -> target" only for symlink rows (backslash filenames may contain " -> ")
     if (typeChar === "l") {
       const arrow = name.indexOf(" -> ");
@@ -288,31 +325,78 @@ function parseLsLaOutput(stdout, { basePath = "" } = {}) {
       size,
       modifyTime: Date.now(),
       permissions: perm,
+      ...(owner ? { owner } : {}),
     });
   }
   return results;
 }
 
-function parseStatRecord(stdout) {
+function parseStatRecord(stdout, { stderr = "", exitCode = null } = {}) {
   const line = String(stdout || "").trim().split(/\r?\n/)[0] || "";
+  const stderrText = String(stderr || "").trim();
+  // A missing path emits an ENOENT marker and exits 2. Shell startup
+  // messages may precede it on either stream; exit status alone is not enough.
+  const hasMissingMarker = line === "ENOENT"
+    || stderrText.split(/\r?\n/).some((entry) => entry.trim() === "ENOENT");
+  if (hasMissingMarker && (exitCode == null || exitCode === 2)) {
+    throw new ScpShellError("No such file", "ENOENT");
+  }
   if (!line || line === "ENOENT") {
-    const err = new ScpShellError("No such file", "ENOENT");
-    err.code = "ENOENT";
+    const detail = [
+      "exec channel returned empty response",
+      exitCode != null ? `exit ${exitCode}` : null,
+      stderrText ? `stderr: ${stderrText.slice(0, 200)}` : null,
+    ].filter(Boolean).join("; ");
+    const err = new ScpShellError(detail, "EMPTY_RESPONSE");
+    err.code = "EMPTY_RESPONSE";
+    err.exitCode = exitCode;
+    err.stderr = stderrText;
+    throw err;
+  }
+  // Any other nonzero status is a remote execution failure — even when stdout
+  // looks like a valid record (e.g. a forced-command wrapper that forwards the
+  // stat record before failing). Such metadata is untrustworthy, so reject it
+  // instead of letting the caller proceed on it.
+  if (exitCode != null && exitCode !== 0) {
+    const detail = [
+      `stat command exited ${exitCode}`,
+      stderrText ? `stderr: ${stderrText.slice(0, 200)}` : null,
+    ].filter(Boolean).join("; ");
+    const err = new ScpShellError(detail);
+    err.exitCode = exitCode;
+    err.stderr = stderrText;
     throw err;
   }
   const parts = line.split("|");
   if (parts.length < 5) {
-    throw new ScpShellError(`Malformed stat record: ${line.slice(0, 80)}`);
+    // Non-empty stdout that isn't a stat record: the remote command may have
+    // failed (nonzero exit, e.g. a restricted shell printing a banner) while
+    // still writing to stdout. Preserve exit code and stderr so failures with
+    // output aren't reduced to a bare "malformed" message.
+    const detail = [
+      `Malformed stat record: ${line.slice(0, 80)}`,
+      exitCode != null ? `exit ${exitCode}` : null,
+      stderrText ? `stderr: ${stderrText.slice(0, 200)}` : null,
+    ].filter(Boolean).join("; ");
+    const err = new ScpShellError(detail);
+    err.exitCode = exitCode;
+    err.stderr = stderrText;
+    throw err;
   }
   const [t, modeStr, sizeStr, mtimeStr, abs, inoStr] = parts;
   const ino = inoStr && /^\d+$/.test(String(inoStr).trim())
     ? String(inoStr).trim()
     : undefined;
+  // "?" (or an empty field) means the remote could not measure the size —
+  // e.g. a device without a stat binary. Report undefined rather than a fake
+  // 0 so callers can skip size-sensitive checks instead of failing them.
+  const sizeStrTrim = String(sizeStr ?? "").trim();
+  const size = /^\d+$/.test(sizeStrTrim) ? Number(sizeStrTrim) : undefined;
   return {
     type: t === "d" ? "directory" : t === "l" ? "symlink" : "file",
     isDirectory: t === "d",
     isSymbolicLink: t === "l",
-    size: Number(sizeStr) || 0,
+    size,
     modifyTime: (Number(mtimeStr) || 0) * 1000,
     mode: lsModeToNumber(modeStr),
     permissions: parseLsModeToPermissions(modeStr),
@@ -395,6 +479,9 @@ module.exports = {
   buildRealpathCommand,
   parseListRecords,
   parseLsLaOutput,
+  ownerFromSftpLongname,
+  ownerFromUid,
+  resolveListingOwner,
   parseStatRecord,
   parseLsModeToPermissions,
   lsModeToNumber,

@@ -138,3 +138,32 @@ test("remote delete exec rejects before exposing a character cut by its byte lim
   ));
   assert.ok(stream.closeCalls + stream.destroyCalls > 0);
 });
+
+test("remote extract exec drains stdout without treating progress as a hard limit", async () => {
+  const stream = createRemoteStream();
+  const sshClient = {
+    exec(_command, next) { next(null, stream); },
+  };
+  const running = execRemoteShellCommand(sshClient, "unzip -qo archive.zip", {
+    openingTimeoutMs: 100,
+    runTimeoutMs: 100,
+    maxOutputBytes: 8,
+    discardStdout: true,
+  });
+  stream.emit("data", Buffer.alloc(64, "x"));
+  stream.stderr.emit("data", Buffer.from("ok"));
+  stream.emit("close", 0);
+
+  assert.deepEqual(await running, { stdout: "", stderr: "ok", code: 0 });
+});
+
+test("remote sha256 skips exec on a single-channel SFTP login", async () => {
+  const { _tryRemoteSha256SumForTests } = require("./sftpBridge.cjs");
+  let execCalls = 0;
+  const digest = await _tryRemoteSha256SumForTests({
+    __netcattySingleChannelSsh: true,
+    exec() { execCalls += 1; },
+  }, "/tmp/file");
+  assert.equal(digest, null);
+  assert.equal(execCalls, 0);
+});

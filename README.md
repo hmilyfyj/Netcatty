@@ -35,7 +35,7 @@
 </p>
 
 <p align="center">
-  <a href="./README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a> · <a href="./README.ja-JP.md">日本語</a>
+  <a href="./README.md">English</a> · <a href="./README.zh-CN.md">简体中文</a> · <a href="./README.zh-TW.md">繁體中文</a> · <a href="./README.ja-JP.md">日本語</a>
 </p>
 
 ---
@@ -127,6 +127,7 @@ If you regularly work with a fleet of servers, Netcatty is built for speed and f
 ### 🖥️ Terminal Workspaces
 - **Split panes** — horizontal and vertical splits for multi-tasking
 - **Session management** — run multiple connections side-by-side
+- **Save current screen** — right-click a terminal to save the visible final text, without replaying keystrokes or overwritten output; scroll first to save an earlier screen.
 - **Inline images** — render Kitty graphics, SIXEL and iTerm inline images from remote programs
 
 ### 📁 SFTP + Built-in Editor
@@ -221,6 +222,30 @@ application and integration are complete.
 
 > **macOS Users:** Current releases are expected to be code-signed and notarized. If Gatekeeper still warns, make sure you downloaded the latest official build from GitHub Releases.
 
+### Scoop (Windows x64, community-maintained)
+
+With [Scoop](https://scoop.sh/) installed, you can install Netcatty from the community-maintained [lemon bucket](https://github.com/hoilc/scoop-lemon/blob/master/bucket/netcatty.json), which downloads the installer from Netcatty's official GitHub Releases:
+
+```powershell
+scoop bucket add lemon https://github.com/hoilc/scoop-lemon
+scoop install lemon/netcatty
+```
+
+Exit Netcatty before updating or uninstalling:
+
+```powershell
+scoop update
+scoop update netcatty
+```
+
+To uninstall:
+
+```powershell
+scoop uninstall netcatty
+```
+
+This is a third-party package, not an official Netcatty bucket, and updates may lag behind GitHub Releases. It currently supports x64 only. Settings remain in `%APPDATA%\netcatty` across updates and normal uninstalls; `scoop uninstall netcatty --purge` also deletes those settings. Use Scoop to manage updates for this installation.
+
 ### Nix / NixOS
 
 Netcatty provides a flake that wraps the official Linux AppImage release for Nix and NixOS users:
@@ -296,7 +321,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-See [agents.md](agents.md) for architecture overview and coding conventions.
+See [AGENTS.md](AGENTS.md) for architecture overview and coding conventions.
 
 ---
 
