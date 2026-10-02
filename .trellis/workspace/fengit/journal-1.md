@@ -125,3 +125,26 @@ FEATURE-346 已 done 且 PR #5 已合入 main。核验单测 AC 后归档 input/
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: FEATURE-346 十月上游同步
+<!-- trellis-session: v=2 fp=e546a9cd25d35786 -->
+
+**Date**: 2026-10-02
+**Task**: FEATURE-346 十月上游同步
+**Package**: desktop
+**Branch**: `agent/agent/e6de7a5e5448`
+
+### Summary
+
+合入 upstream b2ed83ae 的 971 个提交；保留 fork 主机组/SFTP/Monaco/CLI，修复广播、放大与关闭接缝。全量 13036 pass/47 skip、定向273通过，lint/build/ARM目录打包/插件Electron冒烟通过；类型检查与插件单测的继承失败已基线复现并记录。后续交付 fork main 与本地主仓，保留11个用户脏文件。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `37b49f9e` | merge: sync upstream main through b2ed83ae |
+
+### Status
+
+[OK] **Completed**
