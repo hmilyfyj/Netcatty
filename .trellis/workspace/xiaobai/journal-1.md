@@ -28,3 +28,26 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: 本地备份记忆目录并直接保存
+<!-- trellis-session: v=2 fp=fadc2d9e014aeae2 -->
+
+**Date**: 2026-10-03
+**Task**: 本地备份记忆目录并直接保存
+**Package**: desktop
+**Branch**: `agent/agent/6944e0745ed5`
+
+### Summary
+
+实现主进程目录持久化、只在更改目录时选择路径、直接生成唯一加密文件及跨窗口刷新；75 项受影响测试通过，独立审查无问题，lint/build/ARM64 打包通过，TypeScript 基线 746 项且零新增；本机已安装并验证启动，更新既有 PR #14。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5cc54095` | feat: remember local backup directory and save directly (FEATURE-346) |
+
+### Status
+
+[OK] **Completed**
