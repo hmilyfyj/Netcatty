@@ -1,4 +1,5 @@
-import type { S3Config, SyncedFile, WebDAVConfig } from "../../domain/sync";
+import type { S3Config, SyncedFile, WebDAVConfig, SyncPayload } from "../../domain/sync";
+import type { LocalVaultBackupPreview } from "../../application/localVaultBackups";
 import type { AppLockSettings } from "../../domain/appLock";
 
 type AppLockRuntimeReason = 'startup' | 'idle' | 'manual' | 'background' | null;
@@ -166,7 +167,7 @@ declare global {
     }): Promise<boolean>;
     getVaultBackupCapabilities?(): Promise<{ encryptionAvailable: boolean }>;
     createVaultBackup?(payload: {
-      payload: import('./domain/sync').SyncPayload;
+      payload: SyncPayload;
       reason: 'app_version_change' | 'before_restore';
       sourceAppVersion?: string;
       targetAppVersion?: string;
@@ -224,7 +225,20 @@ declare global {
           portForwardingRuleCount: number;
         };
       };
-      payload: import('./domain/sync').SyncPayload;
+      payload: SyncPayload;
+    }>;
+    getVaultBackupDirectory?(): Promise<{ path: string }>;
+    chooseVaultBackupDirectory?(): Promise<{ canceled: boolean; path?: string }>;
+    exportVaultBackupFile?(input: { payload: SyncPayload }): Promise<{
+      canceled: boolean;
+      path?: string;
+      backup?: LocalVaultBackupPreview;
+    }>;
+    readVaultBackupFile?(): Promise<{
+      canceled: boolean;
+      path?: string;
+      backup?: LocalVaultBackupPreview;
+      payload?: SyncPayload;
     }>;
     trimVaultBackups?(payload: { maxCount: number }): Promise<{ deletedCount: number; keptCount: number }>;
     openVaultBackupDir?(): Promise<{ success: boolean; path: string }>;

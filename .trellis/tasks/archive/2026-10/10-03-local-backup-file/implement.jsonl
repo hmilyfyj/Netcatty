@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/desktop/app/index.md", "reason": "桌面入口"}
+{"file": ".trellis/spec/desktop/app/electron-guidelines.md", "reason": "文件对话框与加密边界"}
+{"file": ".trellis/spec/desktop/app/component-guidelines.md", "reason": "备份面板"}
+{"file": ".trellis/spec/desktop/app/application-state.md", "reason": "保护性恢复与快照"}

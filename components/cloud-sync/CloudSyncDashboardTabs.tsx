@@ -46,6 +46,7 @@ interface CloudSyncDashboardTabsProps {
   handleOpenHistory: () => Promise<void>;
   handleSync: (provider: CloudProvider) => Promise<void>;
   onApplyPayload: (payload: SyncPayload) => void | Promise<void>;
+  onBuildLocalPayload: () => SyncPayload | Promise<SyncPayload>;
   onApplyLocalPayload?: (payload: SyncPayload) => void | Promise<void>;
   setShowClearLocalDialog: Dispatch<SetStateAction<boolean>>;
   convergentConfig: { enabled: boolean; initialized: boolean };
@@ -79,6 +80,7 @@ export const CloudSyncDashboardTabs: React.FC<CloudSyncDashboardTabsProps> = ({
   handleSync,
   onApplyPayload,
   onApplyLocalPayload,
+  onBuildLocalPayload,
   setShowClearLocalDialog,
   convergentConfig,
   convergentPreview,
@@ -662,6 +664,7 @@ export const CloudSyncDashboardTabs: React.FC<CloudSyncDashboardTabsProps> = ({
                     <div ref={localBackupsRef}>
                         <LocalBackupsPanel
                             onApplyPayload={onApplyLocalPayload ?? onApplyPayload}
+                            onBuildLocalPayload={onBuildLocalPayload}
                         />
                     </div>
                     </SettingsAnchor>

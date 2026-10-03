@@ -7,19 +7,23 @@
  * - Sync status and conflict resolution
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
     AlertTriangle,
     Download,
     FolderOpen,
     Loader2,
     RefreshCw,
+    Save,
 } from 'lucide-react';
 import { useLocalVaultBackups } from '../../application/state/useLocalVaultBackups';
 import {
     MAX_LOCAL_VAULT_BACKUP_MAX_COUNT,
     MIN_LOCAL_VAULT_BACKUP_MAX_COUNT,
     withRestoreBarrier,
+    saveLocalVaultBackupFile,
+    readLocalVaultBackupFile,
+    type LocalVaultBackupPreview,
 } from '../../application/localVaultBackups';
 import { useI18n } from '../../application/i18n/I18nProvider';
 
@@ -33,6 +37,7 @@ import { toast } from '../ui/toast';
 
 // ============================================================================
 interface LocalBackupsPanelProps {
+    onBuildLocalPayload: () => SyncPayload | Promise<SyncPayload>;
     onApplyPayload: (payload: SyncPayload) => void | Promise<void>;
     /**
      * When true, the panel hides the Restore button entirely — e.g. while the
@@ -45,6 +50,7 @@ interface LocalBackupsPanelProps {
 
 export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
     onApplyPayload,
+    onBuildLocalPayload,
     restoreDisabledReason = null,
 }) => {
     const { t, resolvedLocale } = useI18n();
@@ -53,6 +59,9 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
         isLoading,
         maxBackups,
         encryptionAvailable,
+        backupDirectory,
+        directoryError,
+        chooseBackupDirectory,
         refreshBackups,
         readBackup,
         setMaxBackups,
@@ -61,10 +70,13 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
     const [maxBackupsInput, setMaxBackupsInput] = useState(String(maxBackups));
     const [isSavingMaxBackups, setIsSavingMaxBackups] = useState(false);
     const [restoringBackupId, setRestoringBackupId] = useState<string | null>(null);
+    const [fileAction, setFileAction] = useState<'save' | 'read' | 'choose' | null>(null);
+    const actionInProgress = useRef(false);
+    const busy = fileAction !== null || restoringBackupId !== null || isSavingMaxBackups;
     // Backup chosen in the list but not yet confirmed. A two-step flow keeps
     // users from wiping their vault with a single accidental click (I2).
     const [pendingRestoreBackup, setPendingRestoreBackup] = useState<
-        (typeof backups)[number] | null
+        (LocalVaultBackupPreview & { payload?: SyncPayload }) | null
     >(null);
 
     useEffect(() => {
@@ -74,12 +86,15 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
     const formatTimestamp = (timestamp: number) =>
         new Date(timestamp).toLocaleString(resolvedLocale || undefined);
 
-    const getReasonLabel = (reason: 'app_version_change' | 'before_restore') =>
-        reason === 'app_version_change'
+    const getReasonLabel = (reason: LocalVaultBackupPreview['reason']) =>
+        reason === 'manual'
+            ? t('cloudSync.localBackups.reason.manual')
+            : reason === 'app_version_change'
             ? t('cloudSync.localBackups.reason.appVersionChange')
             : t('cloudSync.localBackups.reason.beforeRestore');
 
     const handleSaveMaxBackups = async () => {
+        if (actionInProgress.current) return;
         // Validate BEFORE calling setMaxBackups, which hands off to the
         // renderer's `sanitizeLocalVaultBackupMaxCount` clamp. Two failure
         // modes must be surfaced rather than silently clamped, because
@@ -109,6 +124,7 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
             );
             return;
         }
+        actionInProgress.current = true;
         setIsSavingMaxBackups(true);
         try {
             const next = await setMaxBackups(parsed);
@@ -120,6 +136,7 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
                 t('sync.toast.errorTitle'),
             );
         } finally {
+            actionInProgress.current = false;
             setIsSavingMaxBackups(false);
         }
     };
@@ -135,8 +152,42 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
         }
     };
 
-    const performRestore = async (backupId: string) => {
-        setRestoringBackupId(backupId);
+    const handleBackupFile = async (action: 'save' | 'read' | 'choose') => {
+        if (actionInProgress.current || pendingRestoreBackup || !encryptionAvailable) return;
+        if (action === 'read' && restoreDisabledReason !== null) return;
+        actionInProgress.current = true;
+        setFileAction(action);
+        try {
+            if (action === 'choose') {
+                await chooseBackupDirectory();
+            } else if (action === 'save') {
+                const result = await saveLocalVaultBackupFile(onBuildLocalPayload);
+                if (!result.canceled) {
+                    toast.success(t('cloudSync.localBackups.fileSaved', { path: result.path ?? '' }));
+                }
+            } else {
+                const result = await readLocalVaultBackupFile();
+                if (!result.canceled && result.backup && result.payload) {
+                    setPendingRestoreBackup({ ...result.backup, payload: result.payload });
+                }
+            }
+        } catch (error) {
+            toast.error(
+                error instanceof Error ? error.message : t('common.unknownError'),
+                t(action === 'choose'
+                    ? 'cloudSync.localBackups.directoryChangeFailed'
+                    : action === 'save' ? 'cloudSync.localBackups.fileSaveFailed' : 'cloudSync.localBackups.restoreFailedTitle'),
+            );
+        } finally {
+            actionInProgress.current = false;
+            setFileAction(null);
+        }
+    };
+
+    const performRestore = async (target: LocalVaultBackupPreview & { payload?: SyncPayload }) => {
+        if (actionInProgress.current || restoreDisabledReason !== null || !encryptionAvailable) return;
+        actionInProgress.current = true;
+        setRestoringBackupId(target.id);
         try {
             // Hold the cross-window restore barrier around both the load
             // and the apply so another window's auto-sync cannot push a
@@ -157,7 +208,9 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
             // `rehydrateAllFromStorage` call here — do not assume
             // restore is "just" a payload swap.
             await withRestoreBarrier(async () => {
-                const detail = await readBackup(backupId);
+                const detail = target.payload
+                    ? { backup: target, payload: target.payload }
+                    : await readBackup(target.id);
                 if (!detail) {
                     throw new Error(t('cloudSync.localBackups.restoreMissing'));
                 }
@@ -171,6 +224,7 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
                 t('cloudSync.localBackups.restoreFailedTitle'),
             );
         } finally {
+            actionInProgress.current = false;
             setRestoringBackupId(null);
         }
     };
@@ -203,6 +257,69 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
 
     return (
         <div className="space-y-4">
+            <div className="rounded-lg border bg-card p-4 space-y-3">
+                <div>
+                    <div className="text-sm font-medium">{t('cloudSync.localBackups.fileTitle')}</div>
+                    <div className="text-xs text-muted-foreground mt-1">
+                        {t('cloudSync.localBackups.fileDesc')}
+                    </div>
+                </div>
+                <div className="space-y-2">
+                    <div className="text-xs font-medium" id="local-backup-directory-label">
+                        {t('cloudSync.localBackups.directoryLabel')}
+                    </div>
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
+                        <div className="min-w-0 flex-1">
+                            <div
+                                id="local-backup-directory"
+                                aria-labelledby="local-backup-directory-label"
+                                className="rounded-md border bg-muted/30 px-3 py-2 text-xs break-all select-text"
+                                aria-live="polite"
+                            >
+                                {backupDirectory ?? (directoryError
+                                    ? t('cloudSync.localBackups.directoryUnavailable')
+                                    : t('common.loading'))}
+                            </div>
+                            {directoryError && (
+                                <div className="mt-1 text-xs text-destructive" role="alert">
+                                    {t('cloudSync.localBackups.directoryLoadFailed', { message: directoryError })}
+                                </div>
+                            )}
+                        </div>
+                        <Button
+                            variant="outline"
+                            onClick={() => void handleBackupFile('choose')}
+                            disabled={busy || pendingRestoreBackup !== null || !encryptionUsable}
+                            className="gap-2 shrink-0"
+                        >
+                            {fileAction === 'choose' ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
+                            {t('cloudSync.localBackups.changeDirectory')}
+                        </Button>
+                    </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                        variant="outline"
+                        onClick={() => void handleBackupFile('save')}
+                        disabled={busy || pendingRestoreBackup !== null || !encryptionUsable || !backupDirectory}
+                        className="gap-2"
+                    >
+                        {fileAction === 'save' ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                        {t('cloudSync.localBackups.saveFile')}
+                    </Button>
+                    {restoreAllowed && (
+                        <Button
+                            variant="outline"
+                            onClick={() => void handleBackupFile('read')}
+                            disabled={busy || pendingRestoreBackup !== null || !encryptionUsable}
+                            className="gap-2"
+                        >
+                            {fileAction === 'read' ? <Loader2 size={14} className="animate-spin" /> : <FolderOpen size={14} />}
+                            {t('cloudSync.localBackups.restoreFile')}
+                        </Button>
+                    )}
+                </div>
+            </div>
             <div className="rounded-lg border bg-card p-4">
                 <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
                     <div className="max-w-lg">
@@ -224,7 +341,7 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
                             <Button
                                 variant="outline"
                                 onClick={() => void handleSaveMaxBackups()}
-                                disabled={isSavingMaxBackups}
+                                disabled={busy || pendingRestoreBackup !== null || !encryptionUsable}
                                 className="gap-2"
                             >
                                 {isSavingMaxBackups && <Loader2 size={14} className="animate-spin" />}
@@ -260,7 +377,7 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
                             variant="ghost"
                             size="sm"
                             onClick={() => void refreshBackups()}
-                            disabled={isLoading}
+                            disabled={isLoading || busy || pendingRestoreBackup !== null}
                             className="gap-1"
                         >
                             <RefreshCw size={14} className={cn(isLoading && 'animate-spin')} />
@@ -270,6 +387,7 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
                             variant="ghost"
                             size="sm"
                             onClick={() => void handleOpenBackupDirectory()}
+                            disabled={busy || pendingRestoreBackup !== null}
                             className="gap-1"
                         >
                             <FolderOpen size={14} />
@@ -339,7 +457,7 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
                                         // clicks here would interleave destructive
                                         // writes and the second run's sentinel-clear
                                         // could mask a still-partial first apply.
-                                        disabled={restoringBackupId !== null}
+                                        disabled={busy || pendingRestoreBackup !== null || !encryptionUsable}
                                         className="gap-2"
                                     >
                                         {restoringBackupId === backup.id ? (
@@ -416,7 +534,7 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
                         <Button
                             variant="outline"
                             onClick={() => setPendingRestoreBackup(null)}
-                            disabled={restoringBackupId !== null}
+                            disabled={busy || !encryptionUsable}
                         >
                             {t('cloudSync.localBackups.restoreConfirmCancel')}
                         </Button>
@@ -426,9 +544,9 @@ export const LocalBackupsPanel: React.FC<LocalBackupsPanelProps> = ({
                                 const target = pendingRestoreBackup;
                                 if (!target) return;
                                 setPendingRestoreBackup(null);
-                                await performRestore(target.id);
+                                await performRestore(target);
                             }}
-                            disabled={restoringBackupId !== null}
+                            disabled={busy || !encryptionUsable}
                             className="gap-2"
                         >
                             {restoringBackupId !== null ? (

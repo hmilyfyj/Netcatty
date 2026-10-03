@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, useRef } from 'react';
 import {
   type LocalVaultBackupPreview,
   getLocalVaultBackupCapabilities,
+  getLocalVaultBackupDirectory,
+  chooseLocalVaultBackupDirectory,
   getLocalVaultBackupMaxCount,
   listLocalVaultBackups,
   openLocalVaultBackupDir,
@@ -20,6 +22,33 @@ export function useLocalVaultBackups() {
   // a destructive action that might later be disabled.
   const [encryptionAvailable, setEncryptionAvailable] = useState<boolean | null>(null);
 
+  const [backupDirectory, setBackupDirectory] = useState<string | null>(null);
+  const [directoryError, setDirectoryError] = useState<string | null>(null);
+  const directoryRequest = useRef(0);
+  const refreshBackupDirectory = useCallback(async () => {
+    const request = ++directoryRequest.current;
+    try {
+      const { path } = await getLocalVaultBackupDirectory();
+      if (request !== directoryRequest.current) return;
+      setBackupDirectory(path);
+      setDirectoryError(null);
+    } catch (error) {
+      if (request !== directoryRequest.current) return;
+      setBackupDirectory(null);
+      setDirectoryError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  const chooseBackupDirectory = useCallback(async () => {
+    const result = await chooseLocalVaultBackupDirectory();
+    if (!result.canceled && result.path) {
+      ++directoryRequest.current;
+      setBackupDirectory(result.path);
+      setDirectoryError(null);
+    }
+    return result;
+  }, []);
+
   const refreshBackups = useCallback(async () => {
     setIsLoading(true);
     try {
@@ -32,6 +61,7 @@ export function useLocalVaultBackups() {
 
   useEffect(() => {
     let cancelled = false;
+    const invalidateDirectoryRequest = () => { ++directoryRequest.current; };
     void (async () => {
       try {
         const caps = await getLocalVaultBackupCapabilities();
@@ -45,10 +75,12 @@ export function useLocalVaultBackups() {
       }
     })();
     void refreshBackups();
+    void refreshBackupDirectory();
     return () => {
+      invalidateDirectoryRequest();
       cancelled = true;
     };
-  }, [refreshBackups]);
+  }, [refreshBackups, refreshBackupDirectory]);
 
   // Cross-window live refresh: the main process broadcasts when any
   // renderer's createBackup or trimBackups actually mutated the on-disk
@@ -62,11 +94,12 @@ export function useLocalVaultBackups() {
     if (typeof subscribe !== 'function') return undefined;
     const unsubscribe = subscribe(() => {
       void refreshBackups();
+      void refreshBackupDirectory();
     });
     return () => {
       try { unsubscribe?.(); } catch { /* ignore */ }
     };
-  }, [refreshBackups]);
+  }, [refreshBackups, refreshBackupDirectory]);
 
   const updateMaxBackups = useCallback(async (value: number) => {
     const sanitized = setLocalVaultBackupMaxCount(value);
@@ -85,6 +118,9 @@ export function useLocalVaultBackups() {
     isLoading,
     maxBackups,
     encryptionAvailable,
+    backupDirectory,
+    directoryError,
+    chooseBackupDirectory,
     refreshBackups,
     readBackup: readLocalVaultBackup,
     setMaxBackups: updateMaxBackups,
