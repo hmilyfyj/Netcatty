@@ -225,26 +225,115 @@ function decodePayload(record, safeStorage) {
 const MAX_BACKUP_FILE_BYTES = MAX_PAYLOAD_BYTES * 2;
 
 async function readBackupRecord(filePath) {
-  // Refuse oversized files BEFORE readFile. `fs.readFile` buffers the
-  // whole file into memory, so an attacker (or a corrupted state) that
-  // places a huge file in the backup dir could OOM the renderer during
-  // listBackups enumeration. Stat-then-read keeps the failure mode to
-  // a cheap rejection.
-  let stat;
+  // Hold one file handle and cap every read, including if the file grows
+  // after stat. Never buffer an unbounded external file or read a directory.
+  const handle = await fs.promises.open(filePath, "r");
+  let raw;
   try {
-    stat = await fs.promises.stat(filePath);
-  } catch (error) {
-    throw new Error(`Unable to stat vault backup ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error("Vault backup path is not a regular file.");
+    if (stat.size > MAX_BACKUP_FILE_BYTES) throw new VaultBackupTooLargeError(stat.size);
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const chunk = Buffer.alloc(Math.min(64 * 1024, MAX_BACKUP_FILE_BYTES - total + 1));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (!bytesRead) break;
+      total += bytesRead;
+      if (total > MAX_BACKUP_FILE_BYTES) throw new VaultBackupTooLargeError(total);
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    raw = Buffer.concat(chunks, total).toString("utf8");
+  } finally {
+    await handle.close();
   }
-  if (stat.size > MAX_BACKUP_FILE_BYTES) {
-    throw new VaultBackupTooLargeError(stat.size);
-  }
-  const raw = await fs.promises.readFile(filePath, "utf8");
   const parsed = JSON.parse(raw);
   if (!parsed || typeof parsed !== "object" || typeof parsed.id !== "string") {
     throw new Error(`Invalid vault backup record: ${filePath}`);
   }
   return parsed;
+}
+
+function validateFilePayload(payload) {
+  const required = ["hosts", "keys", "snippets", "customGroups"];
+  const optional = ["identities", "proxyProfiles", "snippetPackages", "notes", "noteGroups", "groupConfigs", "portForwardingRules", "knownHosts"];
+  if (!isPlainObject(payload) || required.some((key) => !Array.isArray(payload[key])) ||
+      optional.some((key) => payload[key] !== undefined && !Array.isArray(payload[key]))) {
+    throw new Error("Invalid vault backup payload: required vault arrays are missing or malformed.");
+  }
+  const size = estimatePayloadSize(payload);
+  if (size > MAX_PAYLOAD_BYTES) throw new VaultBackupTooLargeError(size);
+}
+
+function validateFileRecord(record) {
+  if (record.formatVersion !== 1 || record.payloadEncoding !== "safeStorage-v1") {
+    throw new Error("Unsupported vault backup file format or encryption.");
+  }
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(record.id) || !Number.isFinite(record.createdAt) ||
+      record.createdAt <= 0 || record.createdAt > 8640000000000000 ||
+      !["manual", ...ALLOWED_REASONS].includes(record.reason) ||
+      typeof record.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(record.fingerprint) ||
+      typeof record.payloadData !== "string" || !record.payloadData ||
+      Buffer.from(record.payloadData, "base64").toString("base64") !== record.payloadData) {
+    throw new Error("Invalid vault backup file record.");
+  }
+}
+
+async function writeBackupRecord(filePath, record) {
+  // Durable atomic write: serialize to a sibling tmp file, fsync the
+  // file's data+metadata to stable storage, rename into place, then
+  // fsync the directory entry itself. Without the file fsync a system
+  // crash between writeFile and rename can leave the OS with a
+  // successfully-renamed entry whose data blocks are still only in
+  // page cache — the file is visible but reads back as zeros or torn
+  // content. Without the directory fsync the rename itself may not be
+  // durable: on recovery listBackups sees an empty directory even
+  // though the file's blocks made it to disk. Both matter for the
+  // protective-before-restore case, where the user is about to
+  // overwrite their vault and the safety net MUST survive a crash
+  // between backup and restore.
+  const tmpPath = `${filePath}.tmp-${crypto.randomUUID()}`;
+  try {
+    const tmpHandle = await fs.promises.open(tmpPath, 'wx', 0o600);
+    try {
+      await tmpHandle.writeFile(`${JSON.stringify(record, null, 2)}\n`);
+      await tmpHandle.sync();
+    } finally {
+      await tmpHandle.close();
+    }
+    await fs.promises.rename(tmpPath, filePath);
+  } catch (error) {
+    try { await fs.promises.unlink(tmpPath); } catch { /* preserve original error */ }
+    throw error;
+  }
+  // fsync the directory so the rename itself is durably recorded.
+  // On Linux this is required; on macOS it is a no-op at the FS
+  // layer but still safe and portable. On Windows fs.open on a
+  // directory is not supported — the rename is durable as part of
+  // NTFS's journal, so skip the sync there.
+  if (process.platform !== 'win32') {
+    let dirHandle;
+    try {
+      dirHandle = await fs.promises.open(path.dirname(filePath), 'r');
+      await dirHandle.sync();
+    } catch (dirSyncError) {
+      // Directory fsync is a defense-in-depth hardening step — if
+      // the filesystem refuses (tmpfs, some network mounts) the
+      // rename already happened and the file is reachable, so a
+      // failure here should not abort the backup. Log so a
+      // systematic issue is diagnosable.
+      console.warn('[vaultBackupBridge] Directory fsync failed:', dirSyncError);
+    } finally {
+      if (dirHandle) {
+        try {
+          await dirHandle.close();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
 }
 
 async function listBackupRecords(dirPath) {
@@ -258,7 +347,7 @@ async function listBackupRecords(dirPath) {
     const fullPath = path.join(dirPath, entry.name);
     try {
       const record = await readBackupRecord(fullPath);
-      records.push({ record, filePath: fullPath });
+      if (record.reason !== "manual") records.push({ record, filePath: fullPath });
     } catch (error) {
       console.warn("[vaultBackupBridge] Failed to parse backup:", fullPath, error);
     }
@@ -305,7 +394,7 @@ async function pruneBackupRecords(dirPath, maxCount, records = null) {
   };
 }
 
-function createVaultBackupService({ app, safeStorage, shell }) {
+function createVaultBackupService({ app, safeStorage, shell, dialog }) {
   if (!app?.getPath) {
     throw new Error("Electron app is unavailable.");
   }
@@ -361,6 +450,59 @@ function createVaultBackupService({ app, safeStorage, shell }) {
         backup: toBackupSummary(match.record),
         payload: decodePayload(match.record, safeStorage),
       };
+    },
+
+    async exportBackupFile(options = {}, parentWindow) {
+      const payload = options.payload;
+      validateFilePayload(payload);
+      if (!isSafeStorageAvailable(safeStorage)) throw new VaultBackupEncryptionUnavailableError();
+      if (!dialog?.showSaveDialog) throw new Error("Native save dialog is unavailable.");
+      const dialogOptions = {
+        defaultPath: `netcatty-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.json`,
+        filters: [{ name: "Netcatty encrypted backup", extensions: ["json"] }],
+      };
+      const selection = await dialog.showSaveDialog(...(parentWindow ? [parentWindow, dialogOptions] : [dialogOptions]));
+      if (selection.canceled || !selection.filePath) return { canceled: true };
+      const encoded = encodePayload(payload, safeStorage);
+      const record = {
+        formatVersion: 1,
+        id: crypto.randomUUID(),
+        createdAt: Date.now(),
+        reason: "manual",
+        sourceAppVersion: sanitizeOptionalVersionString(app.getVersion?.()),
+        fingerprint: computePayloadFingerprint(payload),
+        preview: buildPreview(payload),
+        payloadEncoding: encoded.encoding,
+        payloadData: encoded.data,
+      };
+      await writeBackupRecord(selection.filePath, record);
+      return { canceled: false, path: selection.filePath, backup: toBackupSummary(record) };
+    },
+
+    async readBackupFile(parentWindow) {
+      if (!dialog?.showOpenDialog) throw new Error("Native open dialog is unavailable.");
+      const dialogOptions = {
+        properties: ["openFile"],
+        filters: [{ name: "Netcatty encrypted backup", extensions: ["json"] }],
+      };
+      const selection = await dialog.showOpenDialog(...(parentWindow ? [parentWindow, dialogOptions] : [dialogOptions]));
+      if (selection.canceled || !selection.filePaths?.[0]) return { canceled: true };
+      const filePath = selection.filePaths[0];
+      const record = await readBackupRecord(filePath);
+      validateFileRecord(record);
+      const payload = decodePayload(record, safeStorage);
+      validateFilePayload(payload);
+      if (computePayloadFingerprint(payload) !== record.fingerprint) {
+        throw new Error("Vault backup file fingerprint does not match its payload.");
+      }
+      // Derive counts from decrypted content, never from external metadata.
+      return { canceled: false, path: filePath, backup: toBackupSummary({
+        ...record,
+        sourceAppVersion: sanitizeOptionalVersionString(record.sourceAppVersion),
+        targetAppVersion: sanitizeOptionalVersionString(record.targetAppVersion),
+        syncDataVersion: sanitizeOptionalSyncDataVersion(record.syncDataVersion),
+        preview: buildPreview(payload),
+      }), payload };
     },
 
     async trimBackups(options = {}) {
@@ -439,73 +581,7 @@ function createVaultBackupService({ app, safeStorage, shell }) {
       dirPath,
       `${BACKUP_FILE_PREFIX}${createdAt}-${id}${BACKUP_FILE_EXT}`,
     );
-    // Durable atomic write: serialize to a sibling tmp file, fsync the
-    // file's data+metadata to stable storage, rename into place, then
-    // fsync the directory entry itself. Without the file fsync a system
-    // crash between writeFile and rename can leave the OS with a
-    // successfully-renamed entry whose data blocks are still only in
-    // page cache — the file is visible but reads back as zeros or torn
-    // content. Without the directory fsync the rename itself may not be
-    // durable: on recovery listBackups sees an empty directory even
-    // though the file's blocks made it to disk. Both matter for the
-    // protective-before-restore case, where the user is about to
-    // overwrite their vault and the safety net MUST survive a crash
-    // between backup and restore.
-    const tmpPath = `${filePath}.tmp-${crypto.randomUUID()}`;
-    let tmpHandle;
-    try {
-      tmpHandle = await fs.promises.open(tmpPath, 'w', 0o600);
-      await tmpHandle.writeFile(`${JSON.stringify(record, null, 2)}\n`);
-      await tmpHandle.sync();
-    } finally {
-      if (tmpHandle) {
-        try {
-          await tmpHandle.close();
-        } catch {
-          /* ignore — close failure after successful sync still leaves
-             data durable on disk */
-        }
-      }
-    }
-    try {
-      await fs.promises.rename(tmpPath, filePath);
-    } catch (renameError) {
-      // Best-effort cleanup; swallow unlink errors so the rename error
-      // surfaces to the caller.
-      try {
-        await fs.promises.unlink(tmpPath);
-      } catch {
-        /* ignore */
-      }
-      throw renameError;
-    }
-    // fsync the directory so the rename itself is durably recorded.
-    // On Linux this is required; on macOS it is a no-op at the FS
-    // layer but still safe and portable. On Windows fs.open on a
-    // directory is not supported — the rename is durable as part of
-    // NTFS's journal, so skip the sync there.
-    if (process.platform !== 'win32') {
-      let dirHandle;
-      try {
-        dirHandle = await fs.promises.open(dirPath, 'r');
-        await dirHandle.sync();
-      } catch (dirSyncError) {
-        // Directory fsync is a defense-in-depth hardening step — if
-        // the filesystem refuses (tmpfs, some network mounts) the
-        // rename already happened and the file is reachable, so a
-        // failure here should not abort the backup. Log so a
-        // systematic issue is diagnosable.
-        console.warn('[vaultBackupBridge] Directory fsync failed:', dirSyncError);
-      } finally {
-        if (dirHandle) {
-          try {
-            await dirHandle.close();
-          } catch {
-            /* ignore */
-          }
-        }
-      }
-    }
+    await writeBackupRecord(filePath, record);
 
     // Reuse the enumeration we already did for dedupe, prepending the
     // newly-written record so pruneBackupRecords can trim without
@@ -525,6 +601,7 @@ function registerHandlers(ipcMain, electronModule) {
     app: electronModule?.app,
     safeStorage: electronModule?.safeStorage,
     shell: electronModule?.shell,
+    dialog: electronModule?.dialog,
   });
 
   const BrowserWindow = electronModule?.BrowserWindow;
@@ -569,6 +646,17 @@ function registerHandlers(ipcMain, electronModule) {
   });
   ipcMain.handle("netcatty:vaultBackups:read", async (_event, payload) => {
     return service.readBackup(payload || {});
+  });
+  const parentForEvent = (event) => {
+    if (!event?.sender || !BrowserWindow?.fromWebContents) return undefined;
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    return parent && !parent.isDestroyed?.() ? parent : undefined;
+  };
+  ipcMain.handle("netcatty:vaultBackups:exportFile", async (event, payload) => {
+    return service.exportBackupFile(payload || {}, parentForEvent(event));
+  });
+  ipcMain.handle("netcatty:vaultBackups:readFile", async (event) => {
+    return service.readBackupFile(parentForEvent(event));
   });
   ipcMain.handle("netcatty:vaultBackups:trim", async (_event, payload) => {
     const result = await service.trimBackups(payload || {});

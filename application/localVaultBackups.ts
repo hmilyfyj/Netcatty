@@ -25,7 +25,7 @@ function captureCurrentSyncDataVersion(): number | undefined {
   }
 }
 
-export type LocalVaultBackupReason = 'app_version_change' | 'before_restore';
+export type LocalVaultBackupReason = 'app_version_change' | 'before_restore' | 'manual';
 
 export interface LocalVaultBackupPreview {
   id: string;
@@ -109,6 +109,32 @@ export async function readLocalVaultBackup(id: string): Promise<LocalVaultBackup
   return bridge.readVaultBackup({ id });
 }
 
+/** Save an independent file; automatic history retention never owns this file. */
+export async function saveLocalVaultBackupFile(
+  buildPayload: () => SyncPayload | Promise<SyncPayload>,
+): Promise<{ canceled: boolean; path?: string; backup?: LocalVaultBackupPreview }> {
+  const bridge = netcattyBridge.get();
+  if (!bridge?.exportVaultBackupFile) throw new Error('Local backup file export unavailable');
+  const payload = await buildPayload();
+  return bridge.exportVaultBackupFile({ payload });
+}
+
+/** Read and decrypt only. The caller must preview and confirm before applying. */
+export async function readLocalVaultBackupFile(): Promise<{
+  canceled: boolean;
+  path?: string;
+  backup?: LocalVaultBackupPreview;
+  payload?: SyncPayload;
+}> {
+  const bridge = netcattyBridge.get();
+  if (!bridge?.readVaultBackupFile) throw new Error('Local backup file import unavailable');
+  const result = await bridge.readVaultBackupFile();
+  if (!result.canceled && (!result.backup || !result.payload)) {
+    throw new Error('Invalid local backup file');
+  }
+  return result;
+}
+
 export async function openLocalVaultBackupDir(): Promise<void> {
   const bridge = netcattyBridge.get();
   await bridge?.openVaultBackupDir?.();
@@ -117,7 +143,7 @@ export async function openLocalVaultBackupDir(): Promise<void> {
 export async function createLocalVaultBackup(
   payload: SyncPayload,
   options: {
-    reason: LocalVaultBackupReason;
+    reason: Exclude<LocalVaultBackupReason, 'manual'>;
     syncDataVersion?: number;
     sourceAppVersion?: string;
     targetAppVersion?: string;

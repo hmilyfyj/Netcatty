@@ -1240,6 +1240,10 @@ function createPreloadApi(ctx) {
     ipcRenderer.invoke("netcatty:vaultBackups:list"),
   readVaultBackup: (payload) =>
     ipcRenderer.invoke("netcatty:vaultBackups:read", payload),
+  exportVaultBackupFile: (payload) =>
+    ipcRenderer.invoke("netcatty:vaultBackups:exportFile", payload),
+  readVaultBackupFile: () =>
+    ipcRenderer.invoke("netcatty:vaultBackups:readFile"),
   trimVaultBackups: (payload) =>
     ipcRenderer.invoke("netcatty:vaultBackups:trim", payload),
   openVaultBackupDir: () =>

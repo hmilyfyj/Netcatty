@@ -136,7 +136,7 @@ export async function prepareConvergentSyncMigration(
 export async function initializePreparedConvergentMigration(options: {
   prepared: PreparedConvergentMigration;
   buildCurrentPayload: () => SyncPayload | Promise<SyncPayload>;
-  buildPreApplyPayload: () => SyncPayload;
+  buildPreApplyPayload: () => SyncPayload | Promise<SyncPayload>;
   preparePayloadApply: (payload: SyncPayload) => Promise<() => Promise<void>>;
   translateProtectiveBackupFailure: (message: string) => string;
   manager?: CloudSyncManager;
