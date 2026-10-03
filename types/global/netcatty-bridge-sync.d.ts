@@ -227,6 +227,8 @@ declare global {
       };
       payload: SyncPayload;
     }>;
+    getVaultBackupDirectory?(): Promise<{ path: string }>;
+    chooseVaultBackupDirectory?(): Promise<{ canceled: boolean; path?: string }>;
     exportVaultBackupFile?(input: { payload: SyncPayload }): Promise<{
       canceled: boolean;
       path?: string;

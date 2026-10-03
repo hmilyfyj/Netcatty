@@ -5,6 +5,9 @@ const crypto = require("node:crypto");
 const BACKUP_DIR_NAME = "vault-backups";
 const BACKUP_FILE_PREFIX = "vault-backup-";
 const BACKUP_FILE_EXT = ".json";
+const BACKUP_SETTINGS_FILE = "vault-backup-settings.json";
+const MANUAL_BACKUP_DIR_NAME = "manual-backups";
+const MAX_DIRECTORY_CONFIG_BYTES = 16 * 1024;
 
 // The renderer is the untrusted input boundary for this bridge, so every
 // piece of user-controlled data is validated before it reaches disk or
@@ -401,6 +404,48 @@ function createVaultBackupService({ app, safeStorage, shell, dialog }) {
 
   const getBackupDir = () => path.join(app.getPath("userData"), BACKUP_DIR_NAME);
 
+  const getDefaultDirectory = () => path.join(app.getPath("userData"), MANUAL_BACKUP_DIR_NAME);
+  const getSettingsPath = () => path.join(app.getPath("userData"), BACKUP_SETTINGS_FILE);
+
+  async function readDirectoryConfig() {
+    let handle;
+    try {
+      handle = await fs.promises.open(getSettingsPath(), "r");
+    } catch (error) {
+      if (error.code === "ENOENT") return null;
+      throw new Error(`Unable to read backup directory configuration: ${error.message}`);
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > MAX_DIRECTORY_CONFIG_BYTES) throw new Error("Invalid configuration file size or type.");
+      const buffer = Buffer.alloc(MAX_DIRECTORY_CONFIG_BYTES + 1);
+      let total = 0;
+      while (total < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, total, buffer.length - total, null);
+        if (!bytesRead) break;
+        total += bytesRead;
+      }
+      if (total > MAX_DIRECTORY_CONFIG_BYTES) throw new Error("Configuration file is too large.");
+      const config = JSON.parse(buffer.subarray(0, total).toString("utf8"));
+      if (!isPlainObject(config) || config.formatVersion !== 1 || typeof config.path !== "string" ||
+          !path.isAbsolute(config.path) || config.path.includes("\0")) throw new Error("Unsupported configuration format or directory path.");
+      return config;
+    } catch (error) {
+      throw new Error(`Unable to read backup directory configuration: ${error.message}`);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async function validateDirectory(directory) {
+    if (typeof directory !== "string" || !path.isAbsolute(directory) || directory.includes("\0")) {
+      throw new Error("Invalid backup directory path.");
+    }
+    const stat = await fs.promises.stat(directory);
+    if (!stat.isDirectory()) throw new Error("Backup destination is not a directory.");
+    await fs.promises.access(directory, fs.constants.W_OK);
+  }
+
   // Serialize createBackup so two concurrent calls (version-change backup
   // running at startup + an explicit protective-before-restore triggered
   // by the user's click, etc.) observe each other's writes. Without this,
@@ -452,17 +497,35 @@ function createVaultBackupService({ app, safeStorage, shell, dialog }) {
       };
     },
 
-    async exportBackupFile(options = {}, parentWindow) {
+    async getBackupDirectory() {
+      const config = await readDirectoryConfig();
+      return { path: config?.path ?? getDefaultDirectory() };
+    },
+
+    async chooseBackupDirectory(parentWindow) {
+      if (!dialog?.showOpenDialog) throw new Error("Native directory dialog is unavailable.");
+      let currentDirectory = getDefaultDirectory();
+      try { currentDirectory = (await readDirectoryConfig())?.path ?? currentDirectory; }
+      catch { /* Selecting a new directory can repair unreadable old settings. */ }
+      const dialogOptions = { defaultPath: currentDirectory, properties: ["openDirectory", "createDirectory"] };
+      const selection = await dialog.showOpenDialog(...(parentWindow ? [parentWindow, dialogOptions] : [dialogOptions]));
+      if (selection.canceled || !selection.filePaths?.[0]) return { canceled: true };
+      const selectedDirectory = selection.filePaths[0];
+      await validateDirectory(selectedDirectory);
+      await writeBackupRecord(getSettingsPath(), { formatVersion: 1, path: selectedDirectory });
+      return { canceled: false, path: selectedDirectory };
+    },
+
+    async exportBackupFile(options = {}) {
       const payload = options.payload;
       validateFilePayload(payload);
       if (!isSafeStorageAvailable(safeStorage)) throw new VaultBackupEncryptionUnavailableError();
-      if (!dialog?.showSaveDialog) throw new Error("Native save dialog is unavailable.");
-      const dialogOptions = {
-        defaultPath: `netcatty-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.json`,
-        filters: [{ name: "Netcatty encrypted backup", extensions: ["json"] }],
-      };
-      const selection = await dialog.showSaveDialog(...(parentWindow ? [parentWindow, dialogOptions] : [dialogOptions]));
-      if (selection.canceled || !selection.filePath) return { canceled: true };
+      const config = await readDirectoryConfig();
+      const directory = config?.path ?? getDefaultDirectory();
+      if (!config) await fs.promises.mkdir(directory, { recursive: true, mode: 0o700 });
+      // A configured folder must remain available; never silently recreate
+      // a removed mount point or switch destinations after a failed save.
+      await validateDirectory(directory);
       const encoded = encodePayload(payload, safeStorage);
       const record = {
         formatVersion: 1,
@@ -475,8 +538,9 @@ function createVaultBackupService({ app, safeStorage, shell, dialog }) {
         payloadEncoding: encoded.encoding,
         payloadData: encoded.data,
       };
-      await writeBackupRecord(selection.filePath, record);
-      return { canceled: false, path: selection.filePath, backup: toBackupSummary(record) };
+      const filePath = path.join(directory, `netcatty-backup-${record.createdAt}-${record.id}.json`);
+      await writeBackupRecord(filePath, record);
+      return { canceled: false, path: filePath, backup: toBackupSummary(record) };
     },
 
     async readBackupFile(parentWindow) {
@@ -652,8 +716,14 @@ function registerHandlers(ipcMain, electronModule) {
     const parent = BrowserWindow.fromWebContents(event.sender);
     return parent && !parent.isDestroyed?.() ? parent : undefined;
   };
-  ipcMain.handle("netcatty:vaultBackups:exportFile", async (event, payload) => {
-    return service.exportBackupFile(payload || {}, parentForEvent(event));
+  ipcMain.handle("netcatty:vaultBackups:directory", async () => service.getBackupDirectory());
+  ipcMain.handle("netcatty:vaultBackups:chooseDirectory", async (event) => {
+    const result = await service.chooseBackupDirectory(parentForEvent(event));
+    if (!result.canceled) broadcastBackupsChanged();
+    return result;
+  });
+  ipcMain.handle("netcatty:vaultBackups:exportFile", async (_event, payload) => {
+    return service.exportBackupFile(payload || {});
   });
   ipcMain.handle("netcatty:vaultBackups:readFile", async (event) => {
     return service.readBackupFile(parentForEvent(event));

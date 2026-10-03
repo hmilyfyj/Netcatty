@@ -109,6 +109,20 @@ export async function readLocalVaultBackup(id: string): Promise<LocalVaultBackup
   return bridge.readVaultBackup({ id });
 }
 
+export async function getLocalVaultBackupDirectory(): Promise<{ path: string }> {
+  const bridge = netcattyBridge.get();
+  if (!bridge?.getVaultBackupDirectory) throw new Error('Local backup directory unavailable');
+  return bridge.getVaultBackupDirectory();
+}
+
+export async function chooseLocalVaultBackupDirectory(): Promise<{ canceled: boolean; path?: string }> {
+  const bridge = netcattyBridge.get();
+  if (!bridge?.chooseVaultBackupDirectory) throw new Error('Local backup directory selection unavailable');
+  const result = await bridge.chooseVaultBackupDirectory();
+  if (!result.canceled && !result.path) throw new Error('Invalid local backup directory');
+  return result;
+}
+
 /** Save an independent file; automatic history retention never owns this file. */
 export async function saveLocalVaultBackupFile(
   buildPayload: () => SyncPayload | Promise<SyncPayload>,

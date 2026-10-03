@@ -23,6 +23,8 @@ let container: HTMLDivElement;
 let successes: string[];
 let errors: string[];
 let bridge: Record<string, unknown>;
+let directory: string;
+let directoryListeners: Set<() => void>;
 
 test.beforeEach(() => {
   dom.window.localStorage.clear();
@@ -30,10 +32,15 @@ test.beforeEach(() => {
   errors = [];
   toast.success = (message) => { successes.push(message); };
   toast.error = (message) => { errors.push(message); };
+  directory = '/default/manual-backups';
+  directoryListeners = new Set();
   bridge = {
     getVaultBackupCapabilities: async () => ({ encryptionAvailable: true }),
     listVaultBackups: async () => [],
-    exportVaultBackupFile: async () => ({ canceled: true }),
+    getVaultBackupDirectory: async () => ({ path: directory }),
+    chooseVaultBackupDirectory: async () => ({ canceled: true }),
+    onVaultBackupsChanged: (listener: () => void) => { directoryListeners.add(listener); return () => { directoryListeners.delete(listener); }; },
+    exportVaultBackupFile: async () => ({ canceled: false, path: `${directory}/backup.json`, backup }),
     readVaultBackupFile: async () => ({ canceled: true }),
   };
   Object.assign(dom.window, { netcatty: bridge });
@@ -67,15 +74,15 @@ test('save accepts a full asynchronous snapshot without a cloud master key', asy
   bridge.exportVaultBackupFile = async (options: unknown) => { saved = options; return { canceled: false, path: '/chosen/backup.json', backup }; };
   await render({ restoreDisabledReason: 'no-master-key', onBuildLocalPayload: async () => snapshot });
   assert.equal([...document.querySelectorAll('button')].some((entry) => entry.textContent === 'Restore from file…'), false);
-  await click('Save backup…');
+  await click('Save backup');
   assert.deepEqual(saved, { payload: snapshot });
   assert.deepEqual(successes, ['Backup saved to /chosen/backup.json']);
 });
 
-test('canceling either native dialog does not apply or show success', async () => {
+test('canceling directory selection or file import does not apply or show success', async () => {
   let applied = false;
   await render({ onApplyPayload: () => { applied = true; } });
-  await click('Save backup…');
+  await click('Change directory…');
   await click('Restore from file…');
   assert.equal(applied, false);
   assert.deepEqual(successes, []);
@@ -131,28 +138,29 @@ test('busy save prevents same-window duplicate actions', async () => {
   let saves = 0;
   bridge.exportVaultBackupFile = () => { saves += 1; return new Promise((resolve) => { finish = resolve; }); };
   await render();
-  await click('Save backup…');
-  assert.equal(button('Save backup…').disabled, true);
+  await click('Save backup');
+  assert.equal(button('Save backup').disabled, true);
   assert.equal(button('Restore from file…').disabled, true);
-  await click('Save backup…');
+  await click('Save backup');
   assert.equal(saves, 1);
-  await act(async () => finish({ canceled: true }));
-  assert.equal(button('Save backup…').disabled, false);
+  await act(async () => finish({ canceled: false }));
+  assert.equal(button('Save backup').disabled, false);
 });
 
-for (const action of ['save', 'read'] as const) {
+for (const action of ['save', 'read', 'choose'] as const) {
   test(`failed file ${action} clears busy and does not apply`, async () => {
     let applied = false;
-    bridge[action === 'save' ? 'exportVaultBackupFile' : 'readVaultBackupFile'] = async () => {
+    bridge[action === 'save' ? 'exportVaultBackupFile' : action === 'choose' ? 'chooseVaultBackupDirectory' : 'readVaultBackupFile'] = async () => {
       throw new Error('File operation failed');
     };
     await render({ onApplyPayload: () => { applied = true; } });
-    await click(action === 'save' ? 'Save backup…' : 'Restore from file…');
+    await click(action === 'save' ? 'Save backup' : action === 'choose' ? 'Change directory…' : 'Restore from file…');
     assert.deepEqual(errors, ['File operation failed']);
     assert.deepEqual(successes, []);
     assert.equal(applied, false);
-    assert.equal(button('Save backup…').disabled, false);
+    assert.equal(button('Save backup').disabled, false);
     assert.equal(button('Restore from file…').disabled, false);
+    assert.equal(button('Change directory…').disabled, false);
     assert.equal(document.querySelector('[role="dialog"]'), null);
   });
 }
@@ -163,4 +171,83 @@ test('both settings hosts wire complete snapshots and the protected local apply 
   assert.match(dashboard, /<LocalBackupsPanel\s+onApplyPayload=\{onApplyLocalPayload \?\? onApplyPayload\}\s+onBuildLocalPayload=\{onBuildLocalPayload\}/);
   assert.match(settings, /<LocalBackupsPanel\s+onApplyPayload=\{props.onApplyLocalPayload \?\? props.onApplyPayload\}\s+onBuildLocalPayload=\{props.onBuildLocalPayload\}\s+restoreDisabledReason="no-master-key"/);
   assert.match(settings, /<CloudSyncDashboardTabs[\s\S]*?onBuildLocalPayload=\{onBuildLocalPayload\}/);
+});
+
+test('shows the full read-only directory and saves without choosing again', async () => {
+  let choices = 0;
+  bridge.chooseVaultBackupDirectory = async () => { choices += 1; directory = '/remembered/path with spaces/Backups'; return { canceled: false, path: directory }; };
+  await render({ restoreDisabledReason: 'no-master-key' });
+  assert.equal(container.querySelector('#local-backup-directory')?.textContent, '/default/manual-backups');
+  assert.equal(container.querySelector('input[type="text"]'), null);
+  await click('Change directory…');
+  assert.equal(container.querySelector('#local-backup-directory')?.textContent, directory);
+  await click('Save backup');
+  await click('Save backup');
+  assert.equal(choices, 1);
+  assert.equal(successes.length, 2);
+  await act(async () => root.unmount());
+  root = createRoot(container);
+  await render();
+  assert.equal(container.querySelector('#local-backup-directory')?.textContent, directory);
+});
+
+test('canceled directory selection preserves the displayed directory', async () => {
+  await render();
+  await click('Change directory…');
+  assert.equal(container.querySelector('#local-backup-directory')?.textContent, directory);
+  assert.deepEqual(successes, []);
+  assert.deepEqual(errors, []);
+});
+
+test('failed initial directory load allows repair and file import', async () => {
+  bridge.getVaultBackupDirectory = async () => { throw new Error('Invalid directory configuration'); };
+  bridge.chooseVaultBackupDirectory = async () => ({ canceled: false, path: '/repaired/backups' });
+  await render();
+  assert.match(container.textContent ?? '', /Invalid directory configuration/);
+  assert.equal(button('Save backup').disabled, true);
+  assert.equal(button('Change directory…').disabled, false);
+  assert.equal(button('Restore from file…').disabled, false);
+  await click('Change directory…');
+  assert.equal(container.querySelector('#local-backup-directory')?.textContent, '/repaired/backups');
+  assert.equal(container.querySelector('[role="alert"]'), null);
+  assert.equal(button('Save backup').disabled, false);
+});
+
+test('choosing a directory blocks duplicate choices and save until canceled', async () => {
+  let finish!: (value: { canceled: boolean }) => void;
+  let choices = 0;
+  let saves = 0;
+  bridge.chooseVaultBackupDirectory = () => { choices += 1; return new Promise((resolve) => { finish = resolve; }); };
+  bridge.exportVaultBackupFile = () => { saves += 1; return Promise.resolve({ canceled: false }); };
+  await render();
+  await click('Change directory…');
+  assert.equal(button('Change directory…').disabled, true);
+  assert.equal(button('Save backup').disabled, true);
+  await click('Change directory…');
+  await click('Save backup');
+  assert.equal(choices, 1);
+  assert.equal(saves, 0);
+  await act(async () => finish({ canceled: true }));
+  assert.equal(button('Change directory…').disabled, false);
+  assert.equal(button('Save backup').disabled, false);
+  assert.deepEqual(successes, []);
+});
+
+test('directory broadcasts update mounted windows and unsubscribe on unmount', async () => {
+  const secondContainer = document.createElement('div');
+  document.body.appendChild(secondContainer);
+  const secondRoot = createRoot(secondContainer);
+  try {
+    await render();
+    await act(async () => secondRoot.render(<I18nProvider locale="en"><LocalBackupsPanel onBuildLocalPayload={() => payload} onApplyPayload={() => {}} /></I18nProvider>));
+    assert.equal(directoryListeners.size, 2);
+    directory = '/selected/in-other-window';
+    await act(async () => { for (const listener of directoryListeners) listener(); });
+    assert.equal(container.querySelector('#local-backup-directory')?.textContent, directory);
+    assert.equal(secondContainer.querySelector('[id="local-backup-directory"]')?.textContent, directory);
+  } finally {
+    await act(async () => secondRoot.unmount());
+    secondContainer.remove();
+  }
+  assert.equal(directoryListeners.size, 1);
 });
