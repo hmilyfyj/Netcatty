@@ -23,6 +23,12 @@ npm run build
 - 给上游 GitHub 开 issue 必须带 `[Bug]` / `[Feature]` / `[Other]` 前缀，并填 `.github/ISSUE_TEMPLATE/`。
 - 本机 npm 若设置 `ignore-scripts=true`，依赖虽安装成功但 patch-package、Electron 与 native rebuild 未执行。新 checkout 使用 `npm ci --ignore-scripts=false`，确认 postinstall 日志后再测试/打包；不要修改用户全局 npm 配置。
 
+## SSH 加密补丁
+
+- 改 ssh2 或加密依赖后，跑 `node --test electron/bridges/sshAlgorithms.test.cjs electron/bridges/sshChaCha20.test.cjs electron/bridges/sshChaCha20.integration.test.cjs`，覆盖缺原生/缺依赖、OpenSSL 包对照、篡改拒绝、重协商、主机密钥与 AES 跳板。
+- 另用真实 Electron 和独立打包应用验证动态 import、Poly1305 WASM 与实际连接；系统 Node 的通过不能替代 BoringSSL/ASAR 验证。
+- 重新生成 ssh2 patch 时排除 `package.json` 和 `lib/protocol/crypto/build/.*`，保留既有证书、SFTP、Comware 补丁；统一补丁的空白上下文前缀不是源码尾空格。
+
 ## 本仓 MR
 
 本地 fork 的 Multica 任务 MR 目标是 `origin/main`。不要推 `upstream`（`binaricat/Netcatty`）。

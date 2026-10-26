@@ -21,6 +21,40 @@
 - `electron/bridges/`
 - `AGENTS.md` Capability exposure / Plugin host runtime
 
+## SSH ChaCha20 后备
+
+### 1. 触发范围
+
+Electron 缺少原始 `chacha20` 时，通过既有 ssh2 补丁补齐；终端、SFTP、跳板和转发复用同一后端与共享算法过滤。
+
+### 2. 内部接口
+
+`require('ssh2/lib/protocol/crypto.js')` 导出 `CHACHA20_SUPPORTED: boolean` 和既有 `init: Promise`。支持列表与 `sshAlgorithms.cjs` 共用此能力，握手必须等待 `init`。
+
+### 3. 加密约定
+
+无原生能力时，`init` 动态 import 锁定的 `@noble/ciphers/chacha.js`，使用 `chacha20orig(key, iv.subarray(8), data, undefined, iv.readUInt32LE(0))`。保持动态 import，兼容 Node 22 和 ASAR 中的 ESM 依赖。SSH 使用两把32字节密钥、8字节 nonce；复用 ssh2 的 Poly1305 与恒定时间标签校验，验证成功后才能交付明文。
+
+### 4. 错误行为
+
+| 条件 | 结果 |
+| --- | --- |
+| 原生和后备依赖都缺失 | 能力为 false，列表排除 ChaCha20，保留可运行的 AES |
+| 后备可 resolve，但 import 失败或缺少函数导出 | `init` 拒绝，连接终止，不误报握手成功 |
+| 包长度错误、MAC 篡改或截断 | 拒绝或等待完整包，不交付未认证明文 |
+
+### 5. 兼容场景
+
+原生可用时沿用原路径；仅后备可用时保留 ChaCha20；无原生能力时跳过 ChaCha addon，但保留 AES 绑定和默认 AES 优先顺序。
+
+### 6. 验证
+
+协议测试断言与 OpenSSL 完整包逐字节一致、分片和序号回绕正确、篡改不交付明文；另用真实打包应用验证 ASAR 导入、独立 OpenSSH、SFTP、跳板和主机校验。命令见质量规范。
+
+### 7. 常见误用
+
+仅放开算法列表，或改用 TLS/IETF 的 ChaCha20-Poly1305，都会破坏 SSH 互通。应保留 SSH 包结构，仅补齐原始流加密，并同步支持列表和初始化边界。
+
 ## 反模式
 
 - 在组件里直接 `ipcRenderer.invoke`。

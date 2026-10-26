@@ -1,6 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const fs = require("node:fs");
+const Module = require("node:module");
 const { KexInit, HANDLERS: KEX_HANDLERS } = require("../../node_modules/ssh2/lib/protocol/kex.js");
 const { COMPAT, COMPAT_CHECKS, MESSAGE } = require("../../node_modules/ssh2/lib/protocol/constants.js");
 
@@ -144,27 +146,28 @@ for (const [label, buildAlgorithms] of [
     });
   });
 
-  test(`${label} drops chacha20-poly1305 when the runtime lacks chacha20`, () => {
+  test(`${label} keeps chacha20-poly1305 when the runtime lacks chacha20 but ssh2 has a fallback`, () => {
     const ciphersWithoutChacha20 = crypto.getCiphers().filter((cipher) => cipher !== "chacha20");
 
     withAlgorithmRuntime({ ciphers: ciphersWithoutChacha20 }, () => {
       const algorithms = buildAlgorithms(false);
 
-      assert.equal(algorithms.cipher.includes("chacha20-poly1305@openssh.com"), false);
+      assert.equal(algorithms.cipher.includes("chacha20-poly1305@openssh.com"), true);
+      assert.equal(buildAlgorithms(true).cipher.includes("chacha20-poly1305@openssh.com"), true);
     });
   });
 
-  test(`${label} cipher override is filtered against runtime support`, () => {
-    const ciphersWithoutChacha20 = crypto.getCiphers().filter((cipher) => cipher !== "chacha20");
+  test(`${label} cipher override keeps the fallback and filters unavailable AES`, () => {
+    const ciphersWithoutChacha20 = crypto.getCiphers().filter((cipher) => !["chacha20", "aes-128-ctr"].includes(cipher));
 
     withAlgorithmRuntime({ ciphers: ciphersWithoutChacha20 }, () => {
       const algorithms = buildAlgorithms(false, {
         algorithmOverrides: {
-          cipher: ["chacha20-poly1305@openssh.com", "aes256-ctr"],
+          cipher: ["chacha20-poly1305@openssh.com", "aes128-ctr", "aes256-ctr"],
         },
       });
 
-      assert.deepEqual(algorithms.cipher, ["aes256-ctr"]);
+      assert.deepEqual(algorithms.cipher, ["chacha20-poly1305@openssh.com", "aes256-ctr"]);
     });
   });
 
@@ -220,6 +223,26 @@ for (const [label, buildAlgorithms] of [
     });
   });
 }
+
+test("SSH and SFTP omit ChaCha20 when ssh2 has neither native nor fallback support", () => {
+  const filename = require.resolve("./sshAlgorithms.cjs");
+  const isolated = new Module(filename, module);
+  isolated.filename = filename;
+  isolated.require = (name) => name === "ssh2/lib/protocol/crypto.js"
+    ? { CHACHA20_SUPPORTED: false }
+    : require(name);
+  isolated._compile(fs.readFileSync(filename, "utf8"), filename);
+  const ciphers = crypto.getCiphers().filter((cipher) => cipher !== "chacha20");
+  withAlgorithmRuntime({ ciphers }, () => {
+    for (const build of [isolated.exports.buildAlgorithms, isolated.exports.buildSftpAlgorithms]) {
+      assert.equal(build(false).cipher.includes("chacha20-poly1305@openssh.com"), false);
+      assert.equal(build(true).cipher.includes("chacha20-poly1305@openssh.com"), false);
+      assert.deepEqual(build(false, {
+        algorithmOverrides: { cipher: ["chacha20-poly1305@openssh.com", "aes128-ctr"] },
+      }).cipher, ["aes128-ctr"]);
+    }
+  });
+});
 
 test("SFTP legacy HMAC algorithms match SSH legacy compatibility", () => {
   withAlgorithmRuntime({}, () => {

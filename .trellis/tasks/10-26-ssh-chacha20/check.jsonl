@@ -1,0 +1,5 @@
+{"file":".trellis/spec/desktop/app/index.md","reason":"核对完整受影响范围"}
+{"file":".trellis/spec/desktop/app/electron-guidelines.md","reason":"主机校验、认证与共享桥接"}
+{"file":".trellis/spec/desktop/app/quality-guidelines.md","reason":"复核必需检查和交付"}
+{"file":".trellis/spec/guides/tdd-thinking-guide.md","reason":"核对可观察行为及安全回归"}
+{"file":".trellis/tasks/10-26-ssh-chacha20/design.md","reason":"核对补丁、初始化时序和范围"}
