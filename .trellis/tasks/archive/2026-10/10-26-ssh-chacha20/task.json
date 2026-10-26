@@ -2,7 +2,7 @@
   "id": "ssh-chacha20",
   "name": "ssh-chacha20",
   "title": "补齐 SSH ChaCha20",
-  "description": "按已批准评估补齐 Electron SSH ChaCha20 后备实现，保留共享连接路径、主机校验和已有算法顺序，完成测试及 macOS arm64 包验证。",
+  "description": "按已批准评估补齐Electron SSH ChaCha20后备和发布包算法守卫，保留共享连接路径、主机校验和算法顺序，完成隔离测试及macOS arm64包验证；原路由器完整登录待签名。",
   "status": "completed",
   "dev_type": null,
   "scope": null,
@@ -15,12 +15,12 @@
   "branch": "agent/agent/a62e6ce604e4",
   "base_branch": "main",
   "worktree_path": null,
-  "commit": "f1bfd6ec",
+  "commit": "8c977337",
   "pr_url": "https://github.com/hmilyfyj/Netcatty/pull/15",
   "subtasks": [],
   "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "实现与独立 arm64 包验证已交付 PR #15，Multica 等待验收。原路由器已通过 ChaCha20 握手和主机指纹校验；完整登录待1Password签名放行。Windows/Linux/Intel Mac未实机验证。",
+  "notes": "PR #15补齐SSH ChaCha20及发布包算法守卫，macOS arm64实际包23项应用检查通过。原路由器完整登录仍待1Password签名；Windows/Linux和完整React验证码弹窗未实测；大测试包上传失败，交付小型验证报告。",
   "meta": {}
 }

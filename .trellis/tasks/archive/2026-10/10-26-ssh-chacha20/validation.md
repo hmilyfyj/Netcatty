@@ -17,6 +17,7 @@
 | AC-4 | host key 匹配登录、换 key 拒绝；AES/ChaCha 两向跳板和 forwardOut；实际应用验证 | GREEN |
 | AC-5 | 真实 Electron、ASAR、arm64包、原路由器 | 包及路由器握手 GREEN；路由器登录待 1Password 签名放行 |
 | AC-6 | focused test/lint；全库检查、构建及PR | 测试/lint/构建 GREEN；tsc 与基线相同；自有 fork main 的 PR #15 |
+| AC-7 | 包内6种cipher、4种密钥交换、6种签名；缺依赖拒绝；CI上传前门槛 | macOS arm64实际包 GREEN；Windows/Linux路径与失败传播夹具 GREEN，未实机 |
 
 ## RED
 
@@ -82,6 +83,32 @@ CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder \
 
 默认顺序仍为 AES128-GCM、AES256-GCM、AES128-CTR、AES192-CTR、AES256-CTR、ChaCha20。独立 userData/TMPDIR 隔离测试，使用 mock keychain 避免夹具 profile 触碰用户凭据；SSH 加密和主机校验未替换。Electron、sshd 和相关子进程均已收尾。
 
+### 补齐的应用回归
+
+在同一独立构建包上，通过真实 preload/IPC 继续验证，共23项应用检查全部通过：
+
+- local、remote、dynamic forwarding 各64KiB随机数据往返一致，随后正常停止；动态转发实际提供 SOCKS5 SSH 代理。
+- HTTP CONNECT、SOCKS5、ProxyCommand 三种 SSH 代理均可登录并运行终端命令。
+- 首次主机密钥信任接受/拒绝均符合选择；密钥变化仍被拒绝。
+- 临时独立系统 ssh-agent 仅装入合成密钥，认证成功；未调用真实1Password agent。
+- 混合 AES/ChaCha OpenSSH 的新日志确认默认实际协商 AES128-GCM。
+- 密码及 PAM 单密码 keyboard-interactive 经终端 worker 登录并收到终端数据；外部 SFTP 的验证码 keyboard-interactive 成功及取消经真实 IPC 验证，成功后 REALPATH 返回正确。验证码由夹具监听器提交，未验证完整 React 终端验证码弹窗操作。
+
+早期终端验证码夹具直接启动后端、未创建对应 React 标签页，UI 按现有规则自动取消。已改用支持外部交互认证的 SFTP 入口完成验证码验证；没有更改生产 MFA 逻辑来迎合夹具。所有测试连接、agent、应用及fixture进程均由 finally 收尾。
+
+### 发布包算法守卫
+
+```sh
+npx eslint --no-ignore --global process --global Buffer --global console --global __filename scripts/verify-packaged-ssh-crypto.cjs
+node scripts/verify-packaged-ssh-crypto.cjs release/FEATURE-942
+```
+
+均退出0。守卫启动实际包内 Electron，以其默认后端完成6种现代 AES/ChaCha SSH 包往返，核对 SSH/SFTP 默认、legacy和自定义列表；完成 X25519及3种ECDH共享值比对、Ed25519/RSA-SHA2/ECDSA共6种签名与篡改拒绝。返回 Electron42.3.3、arm64、nativeChaCha=false、result=PASS。
+
+旧安装包的缺依赖负向检查退出1。独立复核的VM夹具覆盖5种宿主路径、非零退出传播、空输出/FAIL、超时和包外依赖拒绝；YAML解析及macOS/Windows、Linux x64、Linux arm64三个构建job在上传前执行的门槛检查通过。Windows/Linux仅模拟路径与控制流，实际包仍由对应平台构建验证。
+
+依赖解析必须留在ASAR内，不能借用开发目录；外层除退出0还必须收到PASS JSON。CI在构建后、上传前运行，失败阻止该job上传。本次只新增守卫、CI和文档，产品代码未再改变，因此复用已通过的全库测试和独立构建包。
+
 ### 原 Dropbear 路由器
 
 使用真实新构建包的主进程、ssh2和共享算法列表，与原 Dropbear 2024.86 路由器完成握手：双向均协商 `chacha20-poly1305@openssh.com`，且与已知主机密钥指纹匹配。原 cipher 不匹配问题已消失。
@@ -96,4 +123,6 @@ Windows/Linux、Intel Mac 未实机验证。未安装到日用应用、未发布
 
 原始日志和夹具留在任务工作区；不提交安装包提取源码、密钥、profile或本机用户路径。公开交付仅包含脱敏结果及必要的维护说明。
 
-实现提交：`f1bfd6ec`；PR：<https://github.com/hmilyfyj/Netcatty/pull/15>（base `main`，head `agent/agent/a62e6ce604e4`）。Multica issue 为 in_review，等待用户验收。
+产品实现提交：`f1bfd6ec`；发布包守卫提交：`8c977337`；PR：<https://github.com/hmilyfyj/Netcatty/pull/15>（base `main`，head `agent/agent/a62e6ce604e4`）。完整路由器登录仍待用户允许签名，未将握手结果当作验收完成。
+
+独立arm64测试包已生成并通过ZIP完整性检查；150MB附件上传返回Multica服务器错误，确认没有发布评论，不反复上传大包。最终评论交付PR及小型验证报告，不声称安装包已成功交付。
