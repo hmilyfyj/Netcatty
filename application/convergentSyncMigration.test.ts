@@ -131,7 +131,7 @@ test('initialization applies the protected preview before persisting and enablin
     manager,
     now: NOW,
     buildCurrentPayload: () => localPayload,
-    buildPreApplyPayload: () => {
+    buildPreApplyPayload: async () => {
       calls.push('snapshot');
       return liveLocalPayload;
     },
@@ -144,7 +144,7 @@ test('initialization applies the protected preview before persisting and enablin
       calls.push('protect');
       if (!options.prepareApply) throw new Error('Expected prepared migration apply');
       const apply = await options.prepareApply();
-      assert.equal(options.buildPreApplyPayload(), liveLocalPayload);
+      assert.equal(await options.buildPreApplyPayload(), liveLocalPayload);
       await apply();
     },
   });

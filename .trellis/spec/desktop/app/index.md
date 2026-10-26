@@ -13,6 +13,7 @@
 | [Infrastructure](./infrastructure.md) | 改 storage key、adapter、service |
 | [Electron](./electron-guidelines.md) | 改 main / bridge / preload / CLI / plugin host |
 | [Quality](./quality-guidelines.md) | 写测试、lint、提交前检查 |
+| [Local Vault Backup Files](./local-vault-backup-files.md) | 手动加密备份保存、文件恢复及路径选择 |
 | [Capability Registry](./capability-registry.md) | 复用已有 bridge、catalog、AI harness |
 
 ## 数据流

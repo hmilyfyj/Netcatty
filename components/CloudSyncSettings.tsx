@@ -49,7 +49,7 @@ import { CloudSyncDialogs } from './cloud-sync/CloudSyncDialogs';
 import { CloudSyncDashboardTabs } from './cloud-sync/CloudSyncDashboardTabs';
 interface SyncDashboardProps {
     onBuildPayload: () => SyncPayload | Promise<SyncPayload>;
-    onBuildLocalPayload: () => SyncPayload;
+    onBuildLocalPayload: () => SyncPayload | Promise<SyncPayload>;
     onPrepareMigrationPayload: (payload: SyncPayload) => Promise<() => Promise<void>>;
     onApplyPayload: (payload: SyncPayload) => void | Promise<void>;
     onApplyConvergentPayload: (
@@ -918,6 +918,7 @@ const SyncDashboard: React.FC<SyncDashboardProps> = ({
                 handleSync={handleSync}
                 onApplyPayload={onApplyPayload}
                 onApplyLocalPayload={onApplyLocalPayload}
+                onBuildLocalPayload={onBuildLocalPayload}
                 setShowClearLocalDialog={setShowClearLocalDialog}
                 convergentConfig={sync.convergentSyncConfig}
                 convergentPreview={convergentPreview}
@@ -1052,7 +1053,7 @@ const SyncDashboard: React.FC<SyncDashboardProps> = ({
 
 interface CloudSyncSettingsProps {
     onBuildPayload: () => SyncPayload | Promise<SyncPayload>;
-    onBuildLocalPayload: () => SyncPayload;
+    onBuildLocalPayload: () => SyncPayload | Promise<SyncPayload>;
     onPrepareMigrationPayload: (payload: SyncPayload) => Promise<() => Promise<void>>;
     onApplyPayload: (payload: SyncPayload) => void | Promise<void>;
     onApplyConvergentPayload: (
@@ -1077,7 +1078,8 @@ export const CloudSyncSettings: React.FC<CloudSyncSettingsProps> = (props) => {
                     vault encryption layer can't re-protect the restored
                     credentials until the user finishes master-key setup (I3). */}
                 <LocalBackupsPanel
-                    onApplyPayload={props.onApplyPayload}
+                    onApplyPayload={props.onApplyLocalPayload ?? props.onApplyPayload}
+                    onBuildLocalPayload={props.onBuildLocalPayload}
                     restoreDisabledReason="no-master-key"
                 />
             </div>
