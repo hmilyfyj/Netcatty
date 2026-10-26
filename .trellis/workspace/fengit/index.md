@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 7
+- **Total Sessions**: 8
 - **Last Active**: 2026-10-26
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~196 | Active |
+| `journal-1.md` | ~219 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 8 | 2026-10-26 | FEATURE-942 原路由器登录验收 | `356c93f8` | `agent/agent/a62e6ce604e4` |
 | 7 | 2026-10-26 | FEATURE-942 发布包算法守卫与应用回归 | `8c977337` | `agent/agent/a62e6ce604e4` |
 | 6 | 2026-10-26 | FEATURE-942：补齐 SSH ChaCha20 | `f1bfd6ec` | `agent/agent/a62e6ce604e4` |
 | 5 | 2026-10-02 | FEATURE-346 十月上游同步 | `37b49f9e` | `agent/agent/e6de7a5e5448` |

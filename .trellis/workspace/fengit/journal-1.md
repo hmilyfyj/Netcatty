@@ -194,3 +194,26 @@ FEATURE-346 已 done 且 PR #5 已合入 main。核验单测 AC 后归档 input/
 ### Status
 
 [OK] **Completed**
+
+
+## Session 8: FEATURE-942 原路由器登录验收
+<!-- trellis-session: v=2 fp=9d1758f9779d4fd6 -->
+
+**Date**: 2026-10-26
+**Task**: FEATURE-942 原路由器登录验收
+**Package**: desktop
+**Branch**: `agent/agent/a62e6ce604e4`
+
+### Summary
+
+用户允许1Password签名后，实际arm64包内ssh2成功登录原Dropbear路由器；主机密钥、双向ChaCha20、shell命令/正常退出及只读SFTP目录验证通过。目标缺stty，未核验实际尺寸；没有修改产品代码或路由器配置，PR验证记录已更新。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `356c93f8` | docs: 验证原路由器 ChaCha20 登录 (FEATURE-942) |
+
+### Status
+
+[OK] **Completed**
