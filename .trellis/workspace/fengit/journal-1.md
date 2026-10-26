@@ -217,3 +217,34 @@ FEATURE-346 已 done 且 PR #5 已合入 main。核验单测 AC 后归档 input/
 ### Status
 
 [OK] **Completed**
+
+
+## Session 9: Dropbear cwd 断开修复
+<!-- trellis-session: v=2 fp=4f4b4a9e7a98ac40 -->
+
+**Date**: 2026-10-26
+**Task**: Dropbear cwd 断开修复
+**Package**: desktop
+**Branch**: `fix/feature-942-dropbear-cwd`
+
+### Summary
+
+FEATURE-942 截图问题已定位为 cwd 超长 exec 触发 Dropbear String too long，改为 stdin 传脚本，PR #16；本机 arm64 已安装并以隔离配置通过完整 React、目录与 SFTP 验证。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `202a8f81` | fix(ssh): send cwd probe through stdin for Dropbear |
+
+### Testing
+
+- [OK] 176 通过、10 跳过；lint/build/包内算法与签名校验通过。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 等待 PR #16 验收；原配置日用启动的 macOS 钥匙串读取需确认，未修改凭据或路由器配置。
