@@ -148,3 +148,26 @@ FEATURE-346 已 done 且 PR #5 已合入 main。核验单测 AC 后归档 input/
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: FEATURE-942：补齐 SSH ChaCha20
+<!-- trellis-session: v=2 fp=b025ea6fedda48c3 -->
+
+**Date**: 2026-10-26
+**Task**: FEATURE-942：补齐 SSH ChaCha20
+**Package**: desktop
+**Branch**: `agent/agent/a62e6ce604e4`
+
+### Summary
+
+通过锁定 noble 依赖和既有 ssh2 补丁补齐 Electron ChaCha20，保留 AES 和主机校验。46项针对性及全库13052项通过，lint/build/arm64包及真实OpenSSH应用验证通过；tsc与基线同为747项。PR #15；原路由器握手通过，完整登录待1Password签名，其他平台未实机验证。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f1bfd6ec` | fix: 补齐 Electron SSH ChaCha20 支持 (FEATURE-942) |
+
+### Status
+
+[OK] **Completed**
