@@ -11,7 +11,7 @@
 - [ ] 原路由器完整只读登录：等待1Password签名放行；不影响独立应用验证结果。
 - [x] 执行 lint、tsc、全库测试、build 及打包；tsc与未改基线的747项错误完全相同，无新增。
 - [x] 由 check 子代理复核完整 diff、安全边界、补丁完整性、测试与规范。
-- [ ] 提交自有 fork，目标 main 创建 PR，最终一次评论交付，issue 置 in_review。
+- [x] 提交自有 fork，目标 main 创建 PR #15；issue 已置 in_review，最终仅以一次评论交付。
 
 ## 分工
 

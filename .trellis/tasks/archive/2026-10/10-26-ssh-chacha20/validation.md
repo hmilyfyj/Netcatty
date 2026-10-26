@@ -16,7 +16,7 @@
 | AC-3 | ChaCha-only 本地 SSH shell、64KiB exec/SFTP、server rekey；真实构建包连接 OpenSSH | GREEN |
 | AC-4 | host key 匹配登录、换 key 拒绝；AES/ChaCha 两向跳板和 forwardOut；实际应用验证 | GREEN |
 | AC-5 | 真实 Electron、ASAR、arm64包、原路由器 | 包及路由器握手 GREEN；路由器登录待 1Password 签名放行 |
-| AC-6 | focused test/lint；全库检查、构建及PR | 测试/lint/构建 GREEN；tsc 与基线相同，PR 在交付时记录 |
+| AC-6 | focused test/lint；全库检查、构建及PR | 测试/lint/构建 GREEN；tsc 与基线相同；自有 fork main 的 PR #15 |
 
 ## RED
 
@@ -95,3 +95,5 @@ check 子代理复核完整产品 diff、安全边界、原补丁保留及针对
 Windows/Linux、Intel Mac 未实机验证。未安装到日用应用、未发布上游或 Release、未合并 PR；外部 CI 由托管平台执行，本地通过不代表远端 CI 已完成。
 
 原始日志和夹具留在任务工作区；不提交安装包提取源码、密钥、profile或本机用户路径。公开交付仅包含脱敏结果及必要的维护说明。
+
+实现提交：`f1bfd6ec`；PR：<https://github.com/hmilyfyj/Netcatty/pull/15>（base `main`，head `agent/agent/a62e6ce604e4`）。Multica issue 为 in_review，等待用户验收。
