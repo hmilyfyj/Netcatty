@@ -62,6 +62,12 @@ Electron 缺少原始 `chacha20` 时，通过既有 ssh2 补丁补齐；终端�
 - 绕过 `PluginManager` 从 renderer IPC 改插件状态。
 - 把 vault 密码或 privateKey 返回给 AI / MCP。
 
+## Dropbear 目录探测
+
+Dropbear 的 SSH exec 请求超过 9000 字节会关闭整条传输，连带断开交互终端。`getSessionPwd` 使用短命令 `exec sh -s`，复用 `executeBoundedSshCommand` 的 `onStream` 将原脚本通过 stdin 发送并结束输入；保留 sshd PPID、watchdog 与共享会话归属校验。增加内部探测脚本时检查请求长度，必要时传 stdin，不靠关闭自动探测规避。
+
+验证包含请求长度/完整 stdin 的回归测试，以及实际应用中自动探测后继续输入。仅验证 ssh2 握手或提前主动退出 shell，会漏掉渲染进程稍后发起的目录探测。
+
 ## CLI 宿主绑定会话
 
 ### 1. 范围 / 触发
