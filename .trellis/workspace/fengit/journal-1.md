@@ -171,3 +171,26 @@ FEATURE-346 已 done 且 PR #5 已合入 main。核验单测 AC 后归档 input/
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: FEATURE-942 发布包算法守卫与应用回归
+<!-- trellis-session: v=2 fp=a3faeb10a4511370 -->
+
+**Date**: 2026-10-26
+**Task**: FEATURE-942 发布包算法守卫与应用回归
+**Package**: desktop
+**Branch**: `agent/agent/a62e6ce604e4`
+
+### Summary
+
+补齐包内Electron cipher/KEX/签名守卫及CI上传前门槛；arm64实际包23项应用检查通过，涵盖代理、转发、信任及认证。产品代码和全库测试结果保持不变。原路由器完整登录待1Password允许签名；Windows/Linux和完整React验证码弹窗未实测。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8c977337` | build: 检查发布包 SSH 算法能力 (FEATURE-942) |
+
+### Status
+
+[OK] **Completed**
