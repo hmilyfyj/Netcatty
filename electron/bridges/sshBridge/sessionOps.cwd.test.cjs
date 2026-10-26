@@ -11,10 +11,11 @@ function quoteShellArg(value) {
   return "'" + String(value).replace(/'/g, "'\\''") + "'";
 }
 
-function makePwdStream(cwd, loginPid) {
+function makePwdStream(cwd, loginPid, onStdin) {
   const stream = new EventEmitter();
   stream.stderr = new EventEmitter();
   stream.close = () => {};
+  stream.end = (input) => onStdin?.(input);
   setImmediate(() => {
     stream.emit("data", Buffer.from(`${cwd}\n`));
     stream.stderr.emit("data", Buffer.from(`NETCATTY_LOGIN_PID=${loginPid}\n`));
@@ -37,6 +38,26 @@ function makeApi(session, siblingSessions = [], overrides = {}) {
   });
 }
 
+test("cwd probe keeps Dropbear's exec request short and sends its script through stdin", async () => {
+  let input = "";
+  const api = makeApi({
+    connRef: { count: 1 },
+    stream: {},
+    conn: {
+      exec(command, callback) {
+        assert.ok(Buffer.byteLength(command, "utf8") <= 9000, "Dropbear closes the transport for an oversized command");
+        assert.equal(command, "exec sh -s");
+        callback(null, makePwdStream("/root", "4242", (data) => { input = data; }));
+      },
+    },
+  });
+
+  assert.deepEqual(await api.getSessionPwd(null, { sessionId: "session-1" }), { success: true, cwd: "/root" });
+  assert.match(input, /export NC_SSHD_PPID=\$PPID/);
+  assert.match(input, /read_shell_cwd\(\)/);
+  assert.ok(input.endsWith("\n"), "the input script must finish before stdin reaches EOF");
+});
+
 test("shared terminal cwd probe refuses to guess without a shell pid", async () => {
   let execCalls = 0;
   const connRef = { count: 2 };
@@ -56,15 +77,14 @@ test("shared terminal cwd probe refuses to guess without a shell pid", async () 
 });
 
 test("shared terminal cwd probe targets the shell pid assigned to that tab", async () => {
-  let command = "";
+  let script = "";
   const session = {
     shellPid: "4242",
     connRef: { count: 2 },
     stream: {},
     conn: {
-      exec(nextCommand, callback) {
-        command = nextCommand;
-        callback(null, makePwdStream("/srv/copied-tab", "4242"));
+      exec(_command, callback) {
+        callback(null, makePwdStream("/srv/copied-tab", "4242", (input) => { script = input; }));
       },
     },
   };
@@ -73,10 +93,10 @@ test("shared terminal cwd probe targets the shell pid assigned to that tab", asy
   const result = await api.getSessionPwd(null, { sessionId: "session-1" });
 
   assert.deepEqual(result, { success: true, cwd: "/srv/copied-tab" });
-  assert.match(command, /TARGET_LOGIN=4242/);
-  assert.ok(command.includes("sub(/^.*\\//"));
-  assert.ok(command.includes("$3 !~ /^\\?+$/"));
-  assert.match(command, /LC_ALL=C lsof/);
+  assert.match(script, /TARGET_LOGIN=4242/);
+  assert.ok(script.includes("sub(/^.*\\//"));
+  assert.ok(script.includes("$3 !~ /^\\?+$/"));
+  assert.match(script, /LC_ALL=C lsof/);
   assert.equal(session.shellPid, "4242");
 });
 
@@ -194,6 +214,7 @@ test("session cwd probe closes a remote command that exceeds its timeout", async
   stream.stderr = new EventEmitter();
   let closed = false;
   stream.close = () => { closed = true; };
+  stream.end = () => {};
   const session = {
     shellPid: "4242",
     connRef: { count: 1 },
@@ -241,6 +262,7 @@ test("session cwd probe closes a stream returned after its timeout", async () =>
   stream.stderr = new EventEmitter();
   let closed = false;
   stream.close = () => { closed = true; };
+  stream.end = () => {};
   const session = {
     shellPid: "4242",
     connRef: { count: 1 },
@@ -278,14 +300,14 @@ test("an unshared terminal remembers the shell pid discovered by its cwd probe",
 });
 
 test("cwd probe forces POSIX sh, captures sshd PPID, and keeps the watchdog", async () => {
-  let command = "";
+  let script = "";
   const session = {
     connRef: { count: 1 },
     stream: {},
     conn: {
       exec(nextCommand, callback) {
-        command = nextCommand;
-        callback(null, makePwdStream("/home/alice/project", "3131"));
+        assert.equal(nextCommand, "exec sh -s");
+        callback(null, makePwdStream("/home/alice/project", "3131", (input) => { script = input; }));
       },
     },
   };
@@ -294,13 +316,12 @@ test("cwd probe forces POSIX sh, captures sshd PPID, and keeps the watchdog", as
   const result = await api.getSessionPwd(null, { sessionId: "session-1" });
 
   assert.deepEqual(result, { success: true, cwd: "/home/alice/project" });
-  assert.ok(command.startsWith("exec sh -c "), command.slice(0, 80));
-  assert.ok(command.includes("export NC_SSHD_PPID=$PPID"));
-  assert.ok(command.includes("( sleep 5 &&"), "cwd watchdog bound must match the 5s default timeout");
-  assert.ok(command.includes('kill -9 $nc_tree "$$"'));
-  assert.ok(command.includes(") </dev/null >/dev/null 2>&1 & nc_watchdog_pid=$!"));
-  assert.ok(command.includes('kill -9 $nc_kids "$nc_watchdog_pid"'));
-  assert.ok(command.includes('find_login_shell "${NC_SSHD_PPID:-$PPID}"'));
+  assert.ok(script.includes("export NC_SSHD_PPID=$PPID"));
+  assert.ok(script.includes("( sleep 5 &&"), "cwd watchdog bound must match the 5s default timeout");
+  assert.ok(script.includes('kill -9 $nc_tree "$$"'));
+  assert.ok(script.includes(") </dev/null >/dev/null 2>&1 & nc_watchdog_pid=$!"));
+  assert.ok(script.includes('kill -9 $nc_kids "$nc_watchdog_pid"'));
+  assert.ok(script.includes('find_login_shell "${NC_SSHD_PPID:-$PPID}"'));
 });
 
 test("immediate parked reconnect does not guess cwd from an exiting shell", async () => {
@@ -345,8 +366,7 @@ test("parked reconnect recovers cwd only after the new shell is unambiguous", as
           return;
         }
         targetedPwdCalls += 1;
-        assert.match(command, /TARGET_LOGIN=222/);
-        callback(null, makePwdStream("/new/cwd", "222"));
+        callback(null, makePwdStream("/new/cwd", "222", (input) => assert.match(input, /TARGET_LOGIN=222/)));
       },
     },
   };
@@ -564,6 +584,7 @@ test("a late cwd request joins recovery after PID scan but before targeted pwd c
         targetedStream = new EventEmitter();
         targetedStream.stderr = new EventEmitter();
         targetedStream.close = () => {};
+        targetedStream.end = () => {};
         callback(null, targetedStream);
       },
     },
@@ -614,6 +635,7 @@ test("targeted recovery ignores cwd returned after the session is replaced", asy
         targetedStream = new EventEmitter();
         targetedStream.stderr = new EventEmitter();
         targetedStream.close = () => {};
+        targetedStream.end = () => {};
         callback(null, targetedStream);
       },
     },
@@ -665,6 +687,7 @@ test("a sibling close during targeted pwd invalidates the recovery result", asyn
         targetedStream = new EventEmitter();
         targetedStream.stderr = new EventEmitter();
         targetedStream.close = () => {};
+        targetedStream.end = () => {};
         callback(null, targetedStream);
       },
     },
@@ -788,15 +811,14 @@ test("cwd probe keeps login-shell fallback when home fallback is disabled (#2886
   // exec channel. preferFreshBackend disables home guessing, but must still
   // fall back to the same-uid login shell cwd so terminal drag-drop SFTP
   // uploads land in a writable directory instead of failing closed.
-  let command = "";
+  let script = "";
   const session = {
     shellPid: "4242",
     connRef: { count: 1 },
     stream: {},
     conn: {
-      exec(nextCommand, callback) {
-        command = nextCommand;
-        callback(null, makePwdStream("/home/alice", "4242"));
+      exec(_command, callback) {
+        callback(null, makePwdStream("/home/alice", "4242", (input) => { script = input; }));
       },
     },
   };
@@ -809,13 +831,13 @@ test("cwd probe keeps login-shell fallback when home fallback is disabled (#2886
   });
 
   assert.deepEqual(result, { success: true, cwd: "/home/alice" });
-  assert.match(command, /ALLOW_HOME_FALLBACK=0/);
-  assert.match(command, /ALLOW_LOGIN_FALLBACK=1/);
+  assert.match(script, /ALLOW_HOME_FALLBACK=0/);
+  assert.match(script, /ALLOW_LOGIN_FALLBACK=1/);
   assert.match(
-    command,
+    script,
     /if \[ -z "\$cwd" \] && \[ "\$pid" != "\$login" \] && \[ "\$ALLOW_LOGIN_FALLBACK" = "1" \]; then/,
   );
-  assert.match(command, /\[ "\$ALLOW_HOME_FALLBACK" = "1" \] \|\| exit 1/);
+  assert.match(script, /\[ "\$ALLOW_HOME_FALLBACK" = "1" \] \|\| exit 1/);
 });
 
 test("cwd probe couples login-shell fallback to home fallback when unset", async () => {
@@ -823,15 +845,14 @@ test("cwd probe couples login-shell fallback to home fallback when unset", async
   // login-shell fallback; the backend must keep ALLOW_LOGIN_FALLBACK=0 so a
   // failed active-shell probe fails closed and the caller can fall through to
   // lastCwd instead of inheriting the parent login shell directory after sudo.
-  let command = "";
+  let script = "";
   const session = {
     shellPid: "4242",
     connRef: { count: 1 },
     stream: {},
     conn: {
-      exec(nextCommand, callback) {
-        command = nextCommand;
-        callback(null, makePwdStream("/home/alice", "4242"));
+      exec(_command, callback) {
+        callback(null, makePwdStream("/home/alice", "4242", (input) => { script = input; }));
       },
     },
   };
@@ -842,8 +863,8 @@ test("cwd probe couples login-shell fallback to home fallback when unset", async
     allowHomeFallback: false,
   });
 
-  assert.match(command, /ALLOW_HOME_FALLBACK=0/);
-  assert.match(command, /ALLOW_LOGIN_FALLBACK=0/);
+  assert.match(script, /ALLOW_HOME_FALLBACK=0/);
+  assert.match(script, /ALLOW_LOGIN_FALLBACK=0/);
 });
 
 test("getSessionPwd skips extra exec when singleChannelSsh is set", async () => {

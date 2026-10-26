@@ -555,7 +555,7 @@ function createSessionOpsApi(ctx) {
         //      same-uid login shell cwd when allowed.
         //   5. Falls back to the user's home directory if the caller allows it.
         //
-        // Outer `exec sh -c` replaces the login shell (fish/zsh/...) so the
+        // Outer `exec sh -s` replaces the login shell (fish/zsh/...) so the
         // POSIX sh's $PPID is sshd. That pid is exported as NC_SSHD_PPID
         // because the watchdog wrapper would otherwise become $PPID of the
         // inner posixScript (and macOS/BSD have no /proc fallback).
@@ -747,14 +747,14 @@ function createSessionOpsApi(ctx) {
         // Capture sshd's pid in the exec'd POSIX sh (`$PPID` is sshd because
         // `exec` replaced the login shell). Do not `exec` the inner posixScript:
         // that would skip the watchdog cleanup after it.
-        const cmd = `exec sh -c ${quoteShellArg(
-          `export NC_SSHD_PPID=$PPID; ${withRemoteWatchdog(
-            `sh -c ${quoteShellArg(posixScript)}`,
-            timeoutMs,
-          )}`
-        )}`;
+        const script = `export NC_SSHD_PPID=$PPID; ${withRemoteWatchdog(
+          `sh -c ${quoteShellArg(posixScript)}`,
+          timeoutMs,
+        )}\n`;
 
-        void executeBoundedSshCommand(session.conn, cmd, {
+        // Dropbear closes the transport for exec requests over 9000 bytes.
+        void executeBoundedSshCommand(session.conn, "exec sh -s", {
+          onStream: (stream) => stream.end(script),
           // Do not shorten channel opening: a timeout there invalidates the
           // shared SSH transport. Only bound the best-effort command itself.
           openingTimeoutMs: 5000,
