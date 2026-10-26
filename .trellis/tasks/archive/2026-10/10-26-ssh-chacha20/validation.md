@@ -15,7 +15,7 @@
 | AC-2 | 28 个 OpenSSL 对照包，双向加解密、0/1/大序号/回绕、空包至32KiB、长度/包体/MAC分片、错误长度/篡改/截断 | GREEN |
 | AC-3 | ChaCha-only 本地 SSH shell、64KiB exec/SFTP、server rekey；真实构建包连接 OpenSSH | GREEN |
 | AC-4 | host key 匹配登录、换 key 拒绝；AES/ChaCha 两向跳板和 forwardOut；实际应用验证 | GREEN |
-| AC-5 | 真实 Electron、ASAR、arm64包、原路由器 | 包及路由器握手 GREEN；路由器登录待 1Password 签名放行 |
+| AC-5 | 真实 Electron、ASAR、arm64包、原路由器 | GREEN；用户允许1Password签名后，路由器shell及只读SFTP通过 |
 | AC-6 | focused test/lint；全库检查、构建及PR | 测试/lint/构建 GREEN；tsc 与基线相同；自有 fork main 的 PR #15 |
 | AC-7 | 包内6种cipher、4种密钥交换、6种签名；缺依赖拒绝；CI上传前门槛 | macOS arm64实际包 GREEN；Windows/Linux路径与失败传播夹具 GREEN，未实机 |
 
@@ -113,7 +113,9 @@ node scripts/verify-packaged-ssh-crypto.cjs release/FEATURE-942
 
 使用真实新构建包的主进程、ssh2和共享算法列表，与原 Dropbear 2024.86 路由器完成握手：双向均协商 `chacha20-poly1305@openssh.com`，且与已知主机密钥指纹匹配。原 cipher 不匹配问题已消失。
 
-本次握手探测未尝试认证。现有1Password SSH agent此前拒绝签名，完整路由器 shell/只读 SFTP 登录待用户解锁并允许签名；不得把握手成功写成登录成功。没有更改路由器配置或文件。
+最初探测只做握手，1Password SSH agent此前拒绝签名。2026-10-26收到用户「已同意」后，用同一个独立arm64构建包的Electron主进程、包内ssh2和共享算法列表重新验证：既有1Password agent签名成功，实际登录原路由器；终端执行`uname -a`及标记输出，正常退出；同一SSH连接打开SFTP，只读列出根目录18项。已知主机密钥匹配，双向均使用ChaCha20。结果断言确认`login=true`、`verifiedHostKey=true`及SFTP目录读取成功。未修改路由器配置，未上传或写入SFTP文件。
+
+首次登录探针因目标没有`stty`而在尺寸断言失败，实际认证和命令当时已成功。调整探针以明确报告该环境限制后复验通过；没有安装工具或修改产品代码。已发送window-change，但无法在该路由器读取实际终端尺寸；尺寸变化已在独立OpenSSH应用验收中验证。探针仅从包内主进程调用ssh2，真实preload/IPC/terminal worker路径的完整行为由前述独立OpenSSH回归覆盖。应用及连接均已收尾。
 
 ### 独立复核与边界
 
@@ -123,6 +125,6 @@ Windows/Linux、Intel Mac 未实机验证。未安装到日用应用、未发布
 
 原始日志和夹具留在任务工作区；不提交安装包提取源码、密钥、profile或本机用户路径。公开交付仅包含脱敏结果及必要的维护说明。
 
-产品实现提交：`f1bfd6ec`；发布包守卫提交：`8c977337`；PR：<https://github.com/hmilyfyj/Netcatty/pull/15>（base `main`，head `agent/agent/a62e6ce604e4`）。完整路由器登录仍待用户允许签名，未将握手结果当作验收完成。
+产品实现提交：`f1bfd6ec`；发布包守卫提交：`8c977337`；PR：<https://github.com/hmilyfyj/Netcatty/pull/15>（base `main`，head `agent/agent/a62e6ce604e4`）。原路由器shell及只读SFTP验收已通过，等待用户审阅PR。
 
 独立arm64测试包已生成并通过ZIP完整性检查；150MB附件上传返回Multica服务器错误，确认没有发布评论，不反复上传大包。最终评论交付PR及小型验证报告，不声称安装包已成功交付。

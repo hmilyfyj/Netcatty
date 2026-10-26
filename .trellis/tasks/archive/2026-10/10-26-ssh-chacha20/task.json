@@ -2,7 +2,7 @@
   "id": "ssh-chacha20",
   "name": "ssh-chacha20",
   "title": "补齐 SSH ChaCha20",
-  "description": "按已批准评估补齐Electron SSH ChaCha20后备和发布包算法守卫，保留共享连接路径、主机校验和算法顺序，完成隔离测试及macOS arm64包验证；原路由器完整登录待签名。",
+  "description": "按已批准评估补齐Electron SSH ChaCha20后备和发布包算法守卫，保留共享连接路径、主机校验和算法顺序；完成隔离测试、macOS arm64包以及原路由器shell和只读SFTP验证。",
   "status": "completed",
   "dev_type": null,
   "scope": null,
@@ -21,6 +21,6 @@
   "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "PR #15补齐SSH ChaCha20及发布包算法守卫，macOS arm64实际包23项应用检查通过。原路由器完整登录仍待1Password签名；Windows/Linux和完整React验证码弹窗未实测；大测试包上传失败，交付小型验证报告。",
+  "notes": "PR #15补齐SSH ChaCha20及发布包算法守卫，macOS arm64实际包23项应用检查通过。收到用户允许签名后，原路由器shell及只读SFTP验证通过；路由器缺stty，实际尺寸未核验。Windows/Linux和完整React验证码弹窗未实测；大测试包上传失败，交付小型验证报告。",
   "meta": {}
 }
