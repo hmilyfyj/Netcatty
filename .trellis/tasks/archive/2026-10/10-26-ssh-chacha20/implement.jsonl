@@ -1,0 +1,5 @@
+{"file":".trellis/spec/desktop/app/index.md","reason":"桌面规范入口"}
+{"file":".trellis/spec/desktop/app/electron-guidelines.md","reason":"共享 SSH bridge 与安全边界"}
+{"file":".trellis/spec/desktop/app/quality-guidelines.md","reason":"依赖脚本、测试和交付要求"}
+{"file":".trellis/spec/guides/tdd-thinking-guide.md","reason":"先失败后修复并记录证据"}
+{"file":".trellis/tasks/10-26-ssh-chacha20/design.md","reason":"已确认的密码原语接入和调用范围"}

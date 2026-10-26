@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
-- **Last Active**: 2026-10-02
+- **Total Sessions**: 8
+- **Last Active**: 2026-10-26
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~150 | Active |
+| `journal-1.md` | ~219 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,9 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 8 | 2026-10-26 | FEATURE-942 原路由器登录验收 | `356c93f8` | `agent/agent/a62e6ce604e4` |
+| 7 | 2026-10-26 | FEATURE-942 发布包算法守卫与应用回归 | `8c977337` | `agent/agent/a62e6ce604e4` |
+| 6 | 2026-10-26 | FEATURE-942：补齐 SSH ChaCha20 | `f1bfd6ec` | `agent/agent/a62e6ce604e4` |
 | 5 | 2026-10-02 | FEATURE-346 十月上游同步 | `37b49f9e` | `agent/agent/e6de7a5e5448` |
 | 4 | 2026-09-05 | FEATURE-441 核验并归档 FEATURE-346 主仓集成任务 | `8d4e25c3`, `00b9db26`, `4a34d818`, `e5cd133f` | `feature/FEATURE-346-main-integration` |
 | 3 | 2026-08-18 | FEATURE-359 归档 FEATURE-346 剩余任务 | `ce2aa139`, `c00ee0fe`, `145b4a38` | `feature/FEATURE-346-upstream-sync` |

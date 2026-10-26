@@ -1,4 +1,5 @@
 const crypto = require("node:crypto");
+const { CHACHA20_SUPPORTED } = require("ssh2/lib/protocol/crypto.js");
 
 const FIXED_DH_GROUP_BY_KEX = Object.freeze({
   "diffie-hellman-group1-sha1": "modp2",
@@ -79,6 +80,7 @@ function supportedCiphers() {
 function filterRuntimeUnsupportedCiphers(cipherAlgorithms) {
   const ciphers = supportedCiphers();
   return cipherAlgorithms.filter((algo) => {
+    if (algo === "chacha20-poly1305@openssh.com") return CHACHA20_SUPPORTED;
     const sslName = CIPHER_SSL_NAME_BY_ALGORITHM[algo];
     return !sslName || ciphers.has(sslName);
   });

@@ -148,3 +148,72 @@ FEATURE-346 已 done 且 PR #5 已合入 main。核验单测 AC 后归档 input/
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: FEATURE-942：补齐 SSH ChaCha20
+<!-- trellis-session: v=2 fp=b025ea6fedda48c3 -->
+
+**Date**: 2026-10-26
+**Task**: FEATURE-942：补齐 SSH ChaCha20
+**Package**: desktop
+**Branch**: `agent/agent/a62e6ce604e4`
+
+### Summary
+
+通过锁定 noble 依赖和既有 ssh2 补丁补齐 Electron ChaCha20，保留 AES 和主机校验。46项针对性及全库13052项通过，lint/build/arm64包及真实OpenSSH应用验证通过；tsc与基线同为747项。PR #15；原路由器握手通过，完整登录待1Password签名，其他平台未实机验证。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f1bfd6ec` | fix: 补齐 Electron SSH ChaCha20 支持 (FEATURE-942) |
+
+### Status
+
+[OK] **Completed**
+
+
+## Session 7: FEATURE-942 发布包算法守卫与应用回归
+<!-- trellis-session: v=2 fp=a3faeb10a4511370 -->
+
+**Date**: 2026-10-26
+**Task**: FEATURE-942 发布包算法守卫与应用回归
+**Package**: desktop
+**Branch**: `agent/agent/a62e6ce604e4`
+
+### Summary
+
+补齐包内Electron cipher/KEX/签名守卫及CI上传前门槛；arm64实际包23项应用检查通过，涵盖代理、转发、信任及认证。产品代码和全库测试结果保持不变。原路由器完整登录待1Password允许签名；Windows/Linux和完整React验证码弹窗未实测。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8c977337` | build: 检查发布包 SSH 算法能力 (FEATURE-942) |
+
+### Status
+
+[OK] **Completed**
+
+
+## Session 8: FEATURE-942 原路由器登录验收
+<!-- trellis-session: v=2 fp=9d1758f9779d4fd6 -->
+
+**Date**: 2026-10-26
+**Task**: FEATURE-942 原路由器登录验收
+**Package**: desktop
+**Branch**: `agent/agent/a62e6ce604e4`
+
+### Summary
+
+用户允许1Password签名后，实际arm64包内ssh2成功登录原Dropbear路由器；主机密钥、双向ChaCha20、shell命令/正常退出及只读SFTP目录验证通过。目标缺stty，未核验实际尺寸；没有修改产品代码或路由器配置，PR验证记录已更新。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `356c93f8` | docs: 验证原路由器 ChaCha20 登录 (FEATURE-942) |
+
+### Status
+
+[OK] **Completed**
