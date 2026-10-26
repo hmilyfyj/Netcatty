@@ -5,6 +5,7 @@
 - `npm run lint`、`npm run build`、arm64 打包、包内算法自检和代码签名校验通过。
 - 在实际 arm64 包及 `/Applications/Netcatty.app` 安装位置分别运行完整 React 终端：等待自动初始化、继续输入、系统查询、cwd `/root` 与同一连接 SFTP 根目录 18 项读取均通过；终端保持连接。
 - 本机应用已更新，原用户数据保留，替换前版本保留独立备份。新包 ASAR SHA-256 为 `c0501e27f66e0722aa0866aa11223d421520e399a3301b3775debcaa0e2a85db`。
+- 原配置日常启动曾等待 macOS 钥匙串授权；授权等待解除后主窗口与 renderer 正常运行，无需改动凭据或用户配置。
 
 ## 未验证及独立问题
 

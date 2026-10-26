@@ -247,4 +247,4 @@ FEATURE-942 截图问题已定位为 cwd 超长 exec 触发 Dropbear String too 
 
 ### Next Steps
 
-- 等待 PR #16 验收；原配置日用启动的 macOS 钥匙串读取需确认，未修改凭据或路由器配置。
+- 等待 PR #16 验收；原配置日用启动的 macOS 钥匙串等待已解除，主窗口和 renderer 正常，未修改凭据或路由器配置。
